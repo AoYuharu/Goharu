@@ -459,6 +459,15 @@ async def run_agent(
                 # Reflection Agent 拥有最终决策权
                 if "可以给出最终回答" in reflection:
                     consecutive_rejections = 0
+                    # 如果当前 action 是 tool call，说明 Actor 还在调用工具
+                    # 需要告诉 Actor：Reflection 已经同意，不要再调用工具了
+                    if action.get("type") == "tool":
+                        memory_manager.append({
+                            "role": "user",
+                            "content": f"[Reflection] {reflection}\n\n✓ 信息已充分，现在请基于以上所有信息给出完整的最终回答。禁止继续调用工具。",
+                        })
+                        continue  # 让 Actor 再执行一轮，这次应该输出答案
+                    # 如果当前 action 是 answer，直接 break
                     break
                 elif "需要继续调用工具" in reflection:
                     consecutive_rejections += 1
@@ -570,6 +579,15 @@ async def run_agent(
                 # Reflection Agent 拥有最终决策权
                 if "可以给出最终回答" in reflection:
                     consecutive_rejections = 0
+                    # 如果当前 action 是 tool call，说明 Actor 还在调用工具
+                    # 需要告诉 Actor：Reflection 已经同意，不要再调用工具了
+                    if action.get("type") == "tool":
+                        memory_manager.append({
+                            "role": "user",
+                            "content": f"[Reflection] {reflection}\n\n✓ 信息已充分，现在请基于以上所有信息给出完整的最终回答。禁止继续调用工具。",
+                        })
+                        continue  # 让 Actor 再执行一轮，这次应该输出答案
+                    # 如果当前 action 是 answer，直接 break
                     break
                 elif "需要继续调用工具" in reflection:
                     consecutive_rejections += 1
@@ -692,7 +710,18 @@ async def main():
             if should_exit(question):
                 break
 
-            result = await run_agent(actor, reflector, question, memory_manager)
+            # 根据配置选择执行模式
+            reflection_mode = config.get("mcp.reflection_mode", "adaptive")
+
+            if reflection_mode == "answer_review":
+                # 使用新的答案审核模式
+                from Agent.answer_review_flow import run_agent_with_answer_review
+                result = await run_agent_with_answer_review(
+                    actor, reflector, question, memory_manager, logger, console
+                )
+            else:
+                # 使用旧的模式
+                result = await run_agent(actor, reflector, question, memory_manager)
 
             # 检查是否被中断或死锁
             if result.get("interrupted"):
@@ -711,8 +740,20 @@ async def main():
 
             if RICH_AVAILABLE and console:
                 console.print(Panel(result["final_answer"], title="[bold green]Assistant[/bold green]", border_style="green"))
+
+                # 如果是答案审核模式，显示审核统计
+                if reflection_mode == "answer_review" and result.get("review_cycles") is not None:
+                    review_cycles = result.get("review_cycles", 0)
+                    file_stats = result.get("file_state_stats", {})
+                    console.print(f"[dim]审核循环: {review_cycles} 次 | 读取文件: {file_stats.get('files_count', 0)} 个 | 工具调用: {file_stats.get('tool_calls_count', 0)} 次[/dim]")
             else:
                 print(format_block("assistant", result["final_answer"]))
+
+                # 如果是答案审核模式，显示审核统计
+                if reflection_mode == "answer_review" and result.get("review_cycles") is not None:
+                    review_cycles = result.get("review_cycles", 0)
+                    file_stats = result.get("file_state_stats", {})
+                    print(f"[审核循环: {review_cycles} 次 | 读取文件: {file_stats.get('files_count', 0)} 个 | 工具调用: {file_stats.get('tool_calls_count', 0)} 次]")
 
             show_memory = config.get("ui.show_memory_events", False)
             if show_memory:
@@ -726,4 +767,19 @@ async def main():
         await runtime.close()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        # 尝试获取当前事件循环
+        try:
+            loop = asyncio.get_running_loop()
+            # 如果能获取到运行中的循环，说明在 Jupyter 等环境中
+            import nest_asyncio
+            nest_asyncio.apply()
+            asyncio.run(main())
+        except RuntimeError:
+            # 没有运行中的循环，正常启动
+            asyncio.run(main())
+    except Exception as e:
+        print(f"Error starting application: {e}")
+        import traceback
+        traceback.print_exc()

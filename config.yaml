@@ -117,7 +117,8 @@ mcp:
   args:
     - E:\TableHelper\MCP\MCP.py
   maxDepth: 8
-  reflection_mode: adaptive
+  reflection_mode: answer_review  # adaptive, always, never, answer_review
+  max_review_cycles: 3  # 最多审核循环次数
 
 ui:
   verbose: false

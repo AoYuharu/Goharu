@@ -13,3 +13,4 @@ pymilvus
 tqdm
 nltk
 rich
+nest_asyncio
