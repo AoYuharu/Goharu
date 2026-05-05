@@ -81,10 +81,21 @@ class InProcessToolRuntime:
         return list(self.last_tool_definitions)
 
     async def call_tool(self, name, arguments=None):
+        """
+        调用工具（沙箱化）
+
+        工具调用失败不会抛出异常，而是返回错误信息
+        """
         if not self._initialized:
             await self.initialize()
-        result = await registry.dispatch(name, arguments or {})
-        return ToolResult(content=result)
+
+        try:
+            result = await registry.dispatch(name, arguments or {})
+            return ToolResult(content=result)
+        except Exception as e:
+            # 沙箱化：捕获所有异常，返回错误信息而不是崩溃
+            error_msg = f"工具执行异常: {type(e).__name__}: {str(e)}"
+            return ToolResult(content={"error": error_msg, "tool": name, "arguments": arguments})
 
     async def close(self):
         return None
@@ -125,10 +136,21 @@ class MCPToolRuntime:
         return list(self.last_tool_definitions)
 
     async def call_tool(self, name, arguments=None):
+        """
+        调用MCP工具（沙箱化）
+
+        工具调用失败不会抛出异常，而是返回错误信息
+        """
         if not self._initialized:
             await self.initialize()
-        result = await self.session.call_tool(name, arguments or {})
-        return ToolResult(content=_normalize_tool_result_content(result))
+
+        try:
+            result = await self.session.call_tool(name, arguments or {})
+            return ToolResult(content=_normalize_tool_result_content(result))
+        except Exception as e:
+            # 沙箱化：捕获所有异常，返回错误信息而不是崩溃
+            error_msg = f"MCP工具执行异常: {type(e).__name__}: {str(e)}"
+            return ToolResult(content={"error": error_msg, "tool": name, "arguments": arguments})
 
     async def close(self):
         if self._exit_stack is not None:

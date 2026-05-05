@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import time
+from typing import Optional
 
 from configurationLoader import config
 from Memory.ToolCall import ToolCall
@@ -179,13 +181,15 @@ class LLMCore:
         for raw_message in messages:
             message = self._normalize_provider_message(raw_message)
             role = message.get("role")
-            content = self._stringify_content(message.get("content", "")).strip()
-            if not content:
-                continue
+            content = message.get("content", "")
 
             if role == "system":
                 # 构建系统消息块，支持缓存
-                block = {"type": "text", "text": content}
+                content_str = self._stringify_content(content).strip()
+                if not content_str:
+                    continue
+
+                block = {"type": "text", "text": content_str}
 
                 # 如果消息包含 cache_control，添加到块中
                 cache_control = message.get("cache_control")
@@ -196,15 +200,38 @@ class LLMCore:
                 continue
 
             if role in {"user", "assistant"}:
-                remote_messages.append({"role": role, "content": content})
+                # 支持原生格式的 content（可以是字符串或块数组）
+                if isinstance(content, list):
+                    # 原生格式：content 是块数组
+                    # 过滤掉空块
+                    filtered_content = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text" and block.get("text", "").strip():
+                                filtered_content.append(block)
+                            elif block.get("type") in {"tool_use", "tool_result"}:
+                                filtered_content.append(block)
+                        elif isinstance(block, str) and block.strip():
+                            filtered_content.append({"type": "text", "text": block})
+
+                    if filtered_content:
+                        remote_messages.append({"role": role, "content": filtered_content})
+                else:
+                    # 文本格式：content 是字符串
+                    content_str = self._stringify_content(content).strip()
+                    if content_str:
+                        remote_messages.append({"role": role, "content": content_str})
                 continue
 
             if role == "tool":
+                # 向后兼容：将旧的 tool 角色转换为 user 消息
                 tool_name = message.get("name") or "unknown_tool"
-                remote_messages.append({
-                    "role": "user",
-                    "content": f"工具调用结果（{tool_name}）:\n{content}",
-                })
+                content_str = self._stringify_content(content).strip()
+                if content_str:
+                    remote_messages.append({
+                        "role": "user",
+                        "content": f"工具调用结果（{tool_name}）:\n{content_str}",
+                    })
 
         if not remote_messages:
             remote_messages.append({"role": "user", "content": "请继续。"})
@@ -222,11 +249,14 @@ class LLMCore:
             config.get("model.large-language-model.local_hf.device_map", "cuda")
         )
 
+        # 初始 max_new_tokens
+        initial_max_tokens = gen_kwargs.pop(
+            "max_new_tokens",
+            self.llm_config.get("local_hf", {}).get("max_new_tokens", self.llm_config.get("max_tokens", 1024)),
+        )
+
         generation_kwargs = {
-            "max_new_tokens": gen_kwargs.pop(
-                "max_new_tokens",
-                self.llm_config.get("local_hf", {}).get("max_new_tokens", self.llm_config.get("max_tokens", 1024)),
-            ),
+            "max_new_tokens": initial_max_tokens,
             "do_sample": gen_kwargs.pop("do_sample", True),
             "temperature": gen_kwargs.pop("temperature", self.llm_config.get("temperature", 0.7)),
             "top_p": gen_kwargs.pop("top_p", self.llm_config.get("top_p", 0.9)),
@@ -237,17 +267,66 @@ class LLMCore:
             **gen_kwargs,
         }
 
-        with self.torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                **generation_kwargs,
-            )
+        # 指数退避重试策略：最多10次
+        max_api_retries = 10
+        # 输出截断重试：最多3次，逐步拉大 max_new_tokens (1024 -> 2048 -> 4096)
+        max_truncation_retries = 3
+        truncation_retry_count = 0
 
-        response = self.tokenizer.decode(
-            outputs[0][inputs.input_ids.shape[-1]:],
-            skip_special_tokens=True,
-        ).strip()
-        return self._strip_json_fence(response)
+        for retry_attempt in range(max_api_retries):
+            try:
+                with self.torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        **generation_kwargs,
+                    )
+
+                response = self.tokenizer.decode(
+                    outputs[0][inputs.input_ids.shape[-1]:],
+                    skip_special_tokens=True,
+                ).strip()
+
+                # 检测输出是否被截断（简单启发式：以不完整的句子结尾）
+                is_truncated = (
+                    len(response) > 100 and
+                    not response.endswith(("。", ".", "!", "！", "?", "？", "\n", "}", "]", "```"))
+                )
+
+                if is_truncated and truncation_retry_count < max_truncation_retries:
+                    truncation_retry_count += 1
+                    # 逐步拉大：1024 -> 2048 -> 4096
+                    new_max_tokens = initial_max_tokens * (2 ** truncation_retry_count)
+                    generation_kwargs["max_new_tokens"] = new_max_tokens
+                    print(f"[本地模型输出截断] 检测到输出可能被截断，拉大 max_new_tokens 至 {new_max_tokens}（第 {truncation_retry_count}/{max_truncation_retries} 次）")
+                    continue
+
+                return self._strip_json_fence(response)
+
+            except Exception as e:
+                error_str = str(e).lower()
+
+                # 检测输出截断错误
+                is_truncation_error = any(keyword in error_str for keyword in [
+                    "truncat", "incomplet", "max_tokens", "length", "too long", "exceeded"
+                ])
+
+                if is_truncation_error and truncation_retry_count < max_truncation_retries:
+                    truncation_retry_count += 1
+                    new_max_tokens = initial_max_tokens * (2 ** truncation_retry_count)
+                    generation_kwargs["max_new_tokens"] = new_max_tokens
+                    print(f"[本地模型输出截断] 检测到输出截断错误，拉大 max_new_tokens 至 {new_max_tokens}（第 {truncation_retry_count}/{max_truncation_retries} 次）")
+                    continue
+
+                # 最后一次重试失败，直接抛出异常
+                if retry_attempt == max_api_retries - 1:
+                    raise RuntimeError(
+                        f"本地模型推理失败（已重试 {max_api_retries} 次）: {type(e).__name__}: {str(e)}"
+                    ) from e
+
+                # 指数退避：1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 512s
+                delay = 2 ** retry_attempt
+                print(f"[本地模型] 推理失败，{delay}秒后重试（第 {retry_attempt + 1}/{max_api_retries} 次）: {type(e).__name__}: {str(e)}")
+                time.sleep(delay)
 
     @staticmethod
     def _extract_response_text(response):
@@ -286,12 +365,15 @@ class LLMCore:
     def _generate_anthropic_compatible(self, messages, **gen_kwargs):
         system_blocks, remote_messages = self._prepare_anthropic_messages(messages)
 
+        # 初始 max_tokens
+        initial_max_tokens = gen_kwargs.pop(
+            "max_tokens",
+            gen_kwargs.pop("max_new_tokens", self.llm_config.get("max_tokens", 1024)),
+        )
+
         request_kwargs = {
             "model": gen_kwargs.pop("model", self.llm_config.get("model")),
-            "max_tokens": gen_kwargs.pop(
-                "max_tokens",
-                gen_kwargs.pop("max_new_tokens", self.llm_config.get("max_tokens", 1024)),
-            ),
+            "max_tokens": initial_max_tokens,
             "temperature": gen_kwargs.pop("temperature", self.llm_config.get("temperature", 0.7)),
             "top_p": gen_kwargs.pop("top_p", self.llm_config.get("top_p", 0.9)),
             "messages": remote_messages,
@@ -301,24 +383,77 @@ class LLMCore:
         if system_blocks:
             request_kwargs["system"] = system_blocks
 
-        last_response = None
-        for _ in range(2):
-            last_response = self.client.messages.create(**request_kwargs)
-            response_text = self._extract_response_text(last_response)
-            if response_text:
-                return self._strip_json_fence(response_text)
-            request_kwargs["temperature"] = 0
+        # 支持工具定义（Anthropic 原生格式）
+        tools = gen_kwargs.pop("tools", None)
+        if tools:
+            request_kwargs["tools"] = tools
 
-        response_payload = None
-        if hasattr(last_response, "model_dump"):
-            response_payload = last_response.model_dump()
-        elif hasattr(last_response, "dict"):
-            response_payload = last_response.dict()
+        # 支持 tool_choice 参数
+        tool_choice = gen_kwargs.pop("tool_choice", None)
+        if tool_choice:
+            request_kwargs["tool_choice"] = tool_choice
 
-        raise ValueError(
-            "Anthropic-compatible provider returned no text content: "
-            f"{self._stringify_content(response_payload or last_response)}"
-        )
+        # 指数退避重试策略：最多10次，延迟 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 512s
+        max_api_retries = 10
+        # 输出截断重试：最多3次，逐步拉大 max_tokens (1024 -> 2048 -> 4096)
+        max_truncation_retries = 3
+        truncation_retry_count = 0
+
+        for retry_attempt in range(max_api_retries):
+            try:
+                last_response = None
+                for _ in range(2):
+                    last_response = self.client.messages.create(**request_kwargs)
+
+                    # 如果使用了工具，返回完整的响应对象（包含 tool_use 块）
+                    if tools:
+                        return last_response
+
+                    # 否则提取文本内容（向后兼容）
+                    response_text = self._extract_response_text(last_response)
+                    if response_text:
+                        return self._strip_json_fence(response_text)
+                    request_kwargs["temperature"] = 0
+
+                response_payload = None
+                if hasattr(last_response, "model_dump"):
+                    response_payload = last_response.model_dump()
+                elif hasattr(last_response, "dict"):
+                    response_payload = last_response.dict()
+
+                raise ValueError(
+                    "Anthropic-compatible provider returned no text content: "
+                    f"{self._stringify_content(response_payload or last_response)}"
+                )
+
+            except Exception as e:
+                error_str = str(e).lower()
+
+                # 检测输出截断错误（常见关键词：truncated, incomplete, max_tokens, length）
+                is_truncation_error = any(keyword in error_str for keyword in [
+                    "truncat", "incomplet", "max_tokens", "length", "too long", "exceeded"
+                ])
+
+                # 如果是截断错误且还有重试次数，拉大 max_tokens
+                if is_truncation_error and truncation_retry_count < max_truncation_retries:
+                    truncation_retry_count += 1
+                    # 逐步拉大：1024 -> 2048 -> 4096
+                    new_max_tokens = initial_max_tokens * (2 ** truncation_retry_count)
+                    request_kwargs["max_tokens"] = new_max_tokens
+                    print(f"[LLM 输出截断] 检测到输出截断，拉大 max_tokens 至 {new_max_tokens}（第 {truncation_retry_count}/{max_truncation_retries} 次）")
+                    # 立即重试，不等待
+                    continue
+
+                # 最后一次重试失败，直接抛出异常
+                if retry_attempt == max_api_retries - 1:
+                    raise RuntimeError(
+                        f"LLM API调用失败（已重试 {max_api_retries} 次）: {type(e).__name__}: {str(e)}"
+                    ) from e
+
+                # 指数退避：1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 512s
+                delay = 2 ** retry_attempt
+                print(f"[LLM API] 调用失败，{delay}秒后重试（第 {retry_attempt + 1}/{max_api_retries} 次）: {type(e).__name__}: {str(e)}")
+                time.sleep(delay)
 
     def generate(self, messages, **gen_kwargs):
         if self.provider == "local_hf":
