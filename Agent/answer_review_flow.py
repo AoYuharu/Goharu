@@ -89,96 +89,16 @@ async def run_agent_with_answer_review(
                     result = last_message.get("content", "")
                     file_state.record_tool_call(tool_name, arguments, result, result_preview)
 
-        # 如果 Actor 输出了答案，触发审核
+        # 如果 Actor 输出了答案，直接使用（跳过 Reflection 审核）
         elif action_type == "answer":
             answer = action.get("answer", "")
 
             if console:
-                console.print("\n" + "=" * 60)
-                console.print("[bold cyan]Actor 认为可以回答，启动 Reflection 审核...[/bold cyan]")
-                console.print("=" * 60 + "\n")
+                console.print("\n[dim]Actor 输出答案，跳过 Reflection 审核[/dim]\n")
 
-            # 获取 FileStateManager 的上下文
-            file_state_context = file_state.get_reflection_context()
-
-            # Reflection 审核答案
-            review_result = reflector.review_answer(
-                question=question,
-                answer=answer,
-                file_state_context=file_state_context,
-                memory_markdown=memory_manager.get_memory_markdown(),
-                soul_markdown=memory_manager.get_soul_markdown(),
-            )
-
-            if logger:
-                logger.log_reflection(step + 1, review_result)
-
-            # 显示审核结果
-            if console:
-                from rich.panel import Panel
-                console.print(Panel(
-                    review_result,
-                    title=f"[bold magenta]Reflection 审核 (第 {review_cycle + 1}/{max_review_cycles} 次)[/bold magenta]",
-                    border_style="magenta",
-                    padding=(1, 2)
-                ))
-
-            review_history.append({
-                "cycle": review_cycle + 1,
-                "answer": answer,
-                "review": review_result,
-            })
-
-            # 判断审核结果
-            if "答案可以接受" in review_result:
-                # 审核通过，使用这个答案
-                if console:
-                    console.print("[bold green]✓ 审核通过，答案可以展示[/bold green]\n")
-
-                final_answer = answer
-                break
-
-            elif "答案需要改进" in review_result:
-                # 审核不通过
-                review_cycle += 1
-
-                if review_cycle >= max_review_cycles:
-                    # 达到最大审核次数，强制使用当前答案
-                    if console:
-                        console.print(f"[bold yellow]⚠ 已达到最大审核次数 ({max_review_cycles})，强制使用当前答案[/bold yellow]\n")
-
-                    final_answer = answer
-                    break
-                else:
-                    # 反馈给 Actor，让其改进
-                    if console:
-                        console.print(f"[yellow]✗ 审核未通过，反馈给 Actor 改进（剩余 {max_review_cycles - review_cycle} 次机会）[/yellow]\n")
-
-                    feedback = f"""[Reflection 审核反馈]
-
-{review_result}
-
-请根据以上反馈改进你的答案。你可以：
-1. 补充更多信息（如果需要，可以继续调用工具）
-2. 修正错误或不准确的部分
-3. 使答案更加清晰和完整
-
-请给出改进后的答案。"""
-
-                    memory_manager.append({
-                        "role": "user",
-                        "content": feedback,
-                    })
-
-                    # 继续循环，让 Actor 重新回答
-                    continue
-            else:
-                # 审核结果不明确，视为通过
-                if console:
-                    console.print("[yellow]⚠ 审核结果不明确，默认接受答案[/yellow]\n")
-
-                final_answer = answer
-                break
+            # 直接接受答案，不经过 Reflection 审核
+            final_answer = answer
+            break
 
         # 如果是错误，记录并继续
         elif action_type == "error":

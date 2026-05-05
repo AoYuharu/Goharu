@@ -111,3 +111,35 @@ The `reflection_mode: answer_review` in `config.yaml` is the current default. In
 - 创建独立的测试文件（如 `test_xxx.py`）测试核心函数
 - 或说明代码已完成，建议用户手动测试
 - 示例：对于包含 `input()` 的计算器，创建测试文件测试 `add()`, `subtract()` 等核心函数，而不测试交互式的 `calculator()` 函数
+
+## Gateway 管理
+
+Gateway 是连接 QQ 机器人的网关服务，支持 QQ 私聊和群聊消息处理。
+
+**重启 Gateway**：
+```bash
+./restart_gateway.sh
+```
+
+该脚本执行以下操作：
+1. 杀死旧 Gateway 进程
+2. 记录重启日志
+3. 启动新的 Gateway 进程
+4. 检查启动状态
+
+**手动重启 Gateway**：
+```bash
+cd /root/TableHelper
+pkill -f "Gateway/run_gateway" 2>/dev/null
+sleep 2
+source venv/bin/activate
+export CONFIG_FILE=config_gateway.yaml
+export ANTHROPIC_API_KEY=你的API_KEY
+nohup python3 -u Gateway/run_gateway.py >> logs/gateway.log 2>&1 &
+sleep 8 && tail -20 logs/gateway.log
+```
+
+**查看 Gateway 日志**：
+```bash
+tail -100 logs/gateway.log
+```
