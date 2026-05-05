@@ -106,6 +106,31 @@ def makeClaudeSession(path: str) -> str:
         return f"Error: {str(e)}"
 
 
+def closeClaudeSession(window_name: str = None) -> str:
+    """
+    关闭 tmux 窗口。
+
+    当用户说"关闭工作"、"结束工作"、"关闭窗口"等时调用此工具。
+    如果指定 window_name 则关闭指定窗口，否则关闭当前窗口。
+    """
+    import subprocess
+
+    if window_name:
+        cmd = f'tmux kill-window -t "{window_name}"'
+    else:
+        cmd = 'tmux kill-window'
+
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode == 0:
+            target = window_name or "current window"
+            return f"Success: Closed tmux {target}"
+        else:
+            return f"Error: {result.stderr or result.stdout}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
 registry.register(
     name="run_cmd",
     description="""Run shell command on Windows (cmd.exe).
@@ -209,5 +234,30 @@ registry.register(
         "required": ["path"],
     },
     handler=makeClaudeSession,
+    group="core",
+)
+
+registry.register(
+    name="closeClaudeSession",
+    description="""关闭 tmux 窗口。
+
+当用户说"关闭工作"、"结束工作"、"关闭窗口"等类似表达时，调用此工具。
+
+参数：
+- window_name (可选): 要关闭的窗口名称，不指定则关闭当前窗口
+
+示例调用：
+{"tool": "closeClaudeSession", "arguments": {}}
+{"tool": "closeClaudeSession", "arguments": {"window_name": "work"}}""",
+    arguments_schema={
+        "type": "object",
+        "properties": {
+            "window_name": {
+                "type": "string",
+                "description": "要关闭的 tmux 窗口名称（可选，不指定则关闭当前窗口）",
+            },
+        },
+    },
+    handler=closeClaudeSession,
     group="core",
 )

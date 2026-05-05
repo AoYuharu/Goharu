@@ -92,10 +92,4 @@ def Edit(
     )
 
 
-@mcp.tool()
-def makeClaudeSession(path: str) -> str:
-    """在指定目录下打开 tmux 窗口并执行 happy 命令。"""
-    return registry.dispatch_sync("makeClaudeSession", {"path": path})
-
-
 mcp.run(show_banner=False, log_level="CRITICAL")
