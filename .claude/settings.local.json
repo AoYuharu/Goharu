@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(head -c 100 \"E:/TableHelper/Qwen2.5-7B-Instruct/.git/lfs/objects/1a/72/1a72d403cdf0c1ec3cb7f289f17b394a01e64394c2e9b3c0f94dbce3faf879bd\")",
+      "Bash(xxd:*)",
+      "Bash(test:*)",
+      "Bash(python3:*)",
+      "Bash(D:/MyAnaconda/envs/llm/python.exe -c:*)",
+      "Bash(D:/MyAnaconda/envs/llm/python.exe -m py_compile:*)",
+      "Bash(conda run -n llm pip:*)",
+      "Bash(conda run -n llm python -c:*)",
+      "Bash(set:*)",
+      "Bash(conda run -n llm python:*)",
+      "Bash(conda run:*)",
+      "Bash(PYTHONIOENCODING=utf-8 conda run:*)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONIOENCODING=utf-8 PYTHONIOENCODING=utf-8 conda run:*)",
+      "Bash(D:/MyAnaconda/envs/llm/python.exe:*)",
+      "Bash(tasklist:*)",
+      "Bash(lftp:*)",
+      "Bash(python:*)",
+      "Bash(expect:*)"
+    ]
+  }
+}
