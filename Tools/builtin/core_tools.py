@@ -66,6 +66,46 @@ def getKnowledge(query: str) -> str:
     return f"Knowledge about '{query}' is not implemented yet."
 
 
+def makeClaudeSession(path: str) -> str:
+    """
+    在指定目录下打开 tmux 窗口并执行 happy 命令。
+
+    当用户说"在某个目录下开始工作"时调用此工具。
+    """
+    import subprocess
+
+    path = path.strip()
+    if not path:
+        return "Error: path cannot be empty"
+
+    # 检查 tmux 是否可用
+    tmux_check = subprocess.run(["which", "tmux"], capture_output=True)
+    if tmux_check.returncode != 0:
+        return "Error: tmux is not installed"
+
+    # 检查目录是否存在
+    import os
+    if not os.path.isdir(path):
+        return f"Error: directory '{path}' does not exist"
+
+    # 获取绝对路径
+    abs_path = os.path.abspath(path)
+
+    # 构建命令：在指定目录打开 tmux 窗口并执行 happy
+    # -c "cd to path" 确保在正确的目录
+    # happy 命令需要在新的 shell 中执行以加载环境
+    cmd = f'tmux new-window -c "{abs_path}" "happy"'
+
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode == 0:
+            return f"Success: Opened tmux session in '{abs_path}' and started happy"
+        else:
+            return f"Error: {result.stderr or result.stdout}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
 registry.register(
     name="run_cmd",
     description="""Run shell command on Windows (cmd.exe).
@@ -144,5 +184,30 @@ registry.register(
         "required": ["query"],
     },
     handler=getKnowledge,
+    group="core",
+)
+
+registry.register(
+    name="makeClaudeSession",
+    description="""在指定目录下打开 tmux 窗口并执行 happy 命令。
+
+当用户说"在某个目录下开始工作"、"我要开始工作了"、"开始工作吧"等类似表达时，调用此工具。
+
+参数：
+- path: 工作目录的绝对路径
+
+示例调用：
+{"tool": "makeClaudeSession", "arguments": {"path": "/root/TableHelper"}}""",
+    arguments_schema={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "工作目录的绝对路径",
+            },
+        },
+        "required": ["path"],
+    },
+    handler=makeClaudeSession,
     group="core",
 )
