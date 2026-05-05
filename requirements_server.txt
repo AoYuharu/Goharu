@@ -1,0 +1,7 @@
+pyyaml
+python-dotenv
+anthropic
+aiohttp
+httpx
+rich
+nest_asyncio

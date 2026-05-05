@@ -1,0 +1,158 @@
+memory:
+  root_dir: ./runtime_memory
+  daily:
+    dir: ./runtime_memory/daily
+    retention_days: 7
+  index:
+    path: ./runtime_memory/MEMORY.md
+  user:
+    path: ./runtime_memory/USER.md
+    review_enabled: true
+    review_interval: 10
+  topic:
+    dir: ./runtime_memory/topic
+    merge_every_n_summaries: 3
+    merge_min_count: 4
+
+prompt:
+  system:
+    shared: []
+    actor:
+      - ./prompts/actor/base.md
+    reflection:
+      - ./prompts/reflection/base.md
+    summarizer:
+      - ./prompts/summarizer/base.md
+    reviewer:
+      - ./prompts/reviewer/base.md
+      - ./prompts/reviewer/contract.md
+
+model:
+  large-language-model:
+    provider: anthropic_compatible
+    model: MiniMax-M2.7
+    api_key_env: ANTHROPIC_API_KEY
+    base_url: https://api.minimaxi.com/anthropic
+    max_tokens: 1024
+    temperature: 0.7
+    top_p: 0.9
+    # 是否使用 Anthropic 原生工具调用格式（tool_use/tool_result）
+    # 注意：MiniMax 模型返回文本 JSON 格式，应设置为 false
+    # 如果使用官方 Claude API，可以设置为 true
+    use_native_tools: false  # MiniMax 使用文本 JSON 格式
+    local_hf:
+      name: Qwen2.5-7B-Instruct
+      path: E:\TableHelper\Qwen2.5-7B-Instruct
+      device_map: cuda
+      trust_remote_code: true
+      load_in_4bit: true
+      bnb_4bit_quant_type: nf4
+      bnb_4bit_compute_dtype: float16
+      bnb_4bit_use_double_quant: true
+      max_new_tokens: 1024
+      repetition_penalty: 1.1
+
+  embedding:
+    name: Qwen3-Embedding-0.6B
+    path: E:\TableHelper\models\embedding_model\Qwen3-Embedding-0.6B
+
+  rerank:
+    name: bge-reranker-v2-m3
+    path: E:\TableHelper\models\rerank_model\bge-reranker-v2-m3
+
+tools:
+  runtime: in_process
+  builtin_modules:
+    - Tools.builtin.core_tools
+    - Tools.builtin.file_tools
+    - Tools.builtin.glob_tool
+    - Tools.builtin.agent_delegate
+  security:
+    # 危险命令黑名单（Windows + Unix）
+    dangerous_commands:
+      # 系统关机/重启
+      - shutdown
+      - restart
+      - reboot
+      - poweroff
+      - halt
+      # 危险删除操作
+      - "rm -rf"
+      - "del /s"
+      - "del /q"
+      - "rmdir /s"
+      - format
+      - diskpart
+      # 磁盘操作
+      - fdisk
+      - mkfs
+      - dd
+      # 权限提升
+      - sudo
+      - runas
+      # 进程终止（批量）
+      - "taskkill /f"
+      - killall
+      - pkill
+      # 注册表危险操作
+      - "reg delete"
+      - "reg add"
+      # 网络攻击
+      - nmap
+      - metasploit
+      - hydra
+      # 系统配置修改
+      - bcdedit
+      - bcdboot
+      # 危险脚本执行
+      - "powershell -encodedcommand"
+      - "powershell -enc"
+    # 需要用户确认的命令模式
+    require_confirmation:
+      - del
+      - rmdir
+      - taskkill
+      - "reg "
+    # 是否启用安全检查
+    enabled: true
+    # 是否允许交互式确认（false 则直接拒绝）
+    allow_confirmation: false
+
+mcp:
+  executor: D:\MyAnaconda\envs\llm\python.exe
+  args:
+    - E:\TableHelper\MCP\MCP.py
+  maxDepth: 8
+  reflection_mode: answer_review  # adaptive, always, never, answer_review
+  max_review_cycles: 3  # 最多审核循环次数
+
+agent_delegate:
+  explore:
+    max_concurrent: 3  # Explore类型子agent的最大并发数
+  plan:
+    max_concurrent: 2  # Plan类型子agent的最大并发数
+  timeout: 300  # 单个子agent超时时间（秒）
+  max_iterations: 20  # 子agent的最大ReAct循环次数（已从8调整到20）
+  max_history_turns: 3  # 保留的最大历史轮数（避免上下文过长）
+
+ui:
+  verbose: false
+  show_reflections: false
+  show_memory_events: false
+  show_actor_output: true  # 显示 Actor 的原始输出（思考过程）
+
+gateway:
+  session:
+    storage_path: ./runtime_memory/gateway/sessions.json
+    group_sessions_per_user: true
+    thread_sessions_per_user: false
+    reset_mode: idle
+    reset_at_hour: 4
+    reset_idle_minutes: 1440
+
+  platforms:
+    qq:
+      enabled: true
+      app_id: "102839705"
+      client_secret: "YOUR_CLIENT_SECRET_HERE"
+      markdown_support: false
