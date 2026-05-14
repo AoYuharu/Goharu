@@ -76,7 +76,6 @@ The `reflection_mode: never` in `config.yaml` is the current default. Other mode
   - Expected benefits: ~85-90% cost reduction on cached tokens, faster first-token latency
   - Implementation: `cache_control: {"type": "ephemeral"}` on PromptSection `→` PromptRenderer `→` LLMCore (Anthropic path only)
   - Test: Run `python test_multilevel_cache.py` to verify caching strategy
-  - Documentation: See `docs/multilevel_cache.md` for detailed implementation guide
 
 - Retrieval/RAG code exists, but it is not integrated into the main agent flow.
   - `MCP/RAG.py` contains standalone embedding, Milvus, and reranking code.
