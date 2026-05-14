@@ -141,6 +141,5 @@ gateway:
     qq:
       enabled: true
       app_id: '102839705'
-      client_secret: YOUR_CLIENT_SECRET_HERE
       markdown_support: false
 test: {}
