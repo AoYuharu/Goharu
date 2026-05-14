@@ -18,19 +18,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-# Set UTF-8 encoding for stdout/stderr on Windows
-if sys.platform == 'win32':
-    import codecs
-    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
-    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+# Add project root to path BEFORE importing project modules
+project_root = Path(__file__).parent.parent.resolve()
+sys.path.insert(0, str(project_root))
+
+# Set UTF-8 encoding for stdout/stderr (platform-aware, no-op on Linux)
+from Tools.platform_utils import setup_stdio_encoding
+setup_stdio_encoding()
 
 # Real stdout for JSON-RPC (AFTER encoding setup)
 _real_stdout = sys.stdout
 _stdout_lock = threading.Lock()
-
-# Add project root to path
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
 
 from Agent.ActorAgent import ActorAgent
 from Agent.ReflectionAgent import ReflectionAgent

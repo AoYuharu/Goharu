@@ -15,6 +15,8 @@ from typing import Optional, Dict, Any
 import aiohttp
 import httpx
 
+from Tools.platform_utils import get_platform_name
+
 from .base import (
     BasePlatformAdapter,
     Platform,
@@ -145,7 +147,7 @@ class QQAdapter(BasePlatformAdapter):
                     "intents": self._calculate_intents(),
                     "shard": [0, 1],
                     "properties": {
-                        "$os": "Windows",
+                        "$os": get_platform_name(),
                         "$browser": "TableHelper",
                         "$device": "TableHelper",
                     },

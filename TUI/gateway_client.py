@@ -89,19 +89,25 @@ class GatewayClient:
                 self.process = None
 
     def force_kill(self):
-        """Force kill gateway subprocess and all children via taskkill"""
+        """Force kill gateway subprocess and all children (cross-platform)"""
         if not self.process:
             return
         self._killed_intentionally = True
         self._running = False
         pid = self.process.pid
         try:
-            subprocess.run(
-                ['taskkill', '/F', '/T', '/PID', str(pid)],
-                capture_output=True, timeout=5
-            )
+            self.process.stdin.close()
         except Exception:
             pass
+        try:
+            # Try the platform-specific subprocess tree kill first
+            from Tools.platform_utils import kill_process_tree
+            kill_process_tree(pid)
+        except Exception:
+            try:
+                self.process.kill()
+            except Exception:
+                pass
         try:
             self.process.wait(timeout=3)
         except Exception:

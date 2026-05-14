@@ -6,8 +6,8 @@ On interrupt, enables precise kill of all active tool subprocesses
 without killing the Gateway itself.
 """
 
-import subprocess
 import threading
+from Tools.platform_utils import kill_pid_list
 
 
 class ToolProcessTracker:
@@ -28,19 +28,12 @@ class ToolProcessTracker:
             self._pids.discard(pid)
 
     def kill_all(self):
-        """Force kill all tracked PIDs via taskkill"""
+        """Kill all tracked subprocess trees (cross-platform)"""
         with self._lock:
             pids = list(self._pids)
             self._pids.clear()
 
-        for pid in pids:
-            try:
-                subprocess.run(
-                    ['taskkill', '/F', '/T', '/PID', str(pid)],
-                    capture_output=True, timeout=5
-                )
-            except Exception:
-                pass
+        kill_pid_list(pids)
 
 
 # Module-level singleton

@@ -5,6 +5,12 @@ import json
 from Tools.registry import registry
 from Tools.security import check_command_safety
 from Tools.tool_process_tracker import tool_process_tracker
+from Tools.platform_utils import (
+    get_subprocess_env,
+    get_system_encoding,
+    get_subprocess_creation_flags,
+    kill_process_tree,
+)
 
 # 导入 file_tools 以注册文件操作工具
 import Tools.builtin.file_tools
@@ -76,24 +82,20 @@ Please use the dedicated tools instead:
 
 DO NOT retry with run_cmd. Use the dedicated tools."""
 
-    # 执行命令（带超时，默认30s，进程中组确保超时能杀死子进程树）
-    # PYTHONUNBUFFERED=1 强制 Python 子进程无缓冲输出，避免管道缓冲吞掉 print 内容
-    import os as _os
-    import locale as _locale
-    env = {**_os.environ, "PYTHONUNBUFFERED": "1"}
-    # 使用系统代码页解码（中文Windows → cp936/gbk），避免中文字符乱码
-    sys_encoding = _locale.getpreferredencoding(do_setlocale=False) or 'utf-8'
+    # 执行命令（带超时，默认30s；平台适配的进程组确保超时能杀死子进程树）
+    env = get_subprocess_env()
+    sys_encoding = get_system_encoding()
     try:
         p = subprocess.Popen(
             cmd,
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,  # 防止子进程等待 stdin 而卡住
+            stdin=subprocess.DEVNULL,
             encoding=sys_encoding,
-            errors='replace',  # 容忍解码错误，避免个别字符导致整段输出丢失
+            errors='replace',
             env=env,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            creationflags=get_subprocess_creation_flags(),
         )
         tool_process_tracker.register(p.pid)
         try:
@@ -103,21 +105,12 @@ DO NOT retry with run_cmd. Use the dedicated tools."""
                 output = (stderr or "").strip()
             return output if output else "(no output)"
         except asyncio.CancelledError:
-            # 被用户中断，强杀子进程
-            subprocess.run(
-                ['taskkill', '/F', '/T', '/PID', str(p.pid)],
-                capture_output=True, timeout=5
-            )
+            kill_process_tree(p.pid)
             raise
         finally:
             tool_process_tracker.unregister(p.pid)
     except subprocess.TimeoutExpired:
-        # 杀死整个进程树
-        subprocess.run(
-            ['taskkill', '/F', '/T', '/PID', str(p.pid)],
-            capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        kill_process_tree(p.pid)
         try:
             stdout, stderr = await asyncio.to_thread(p.communicate, timeout=5)
         except subprocess.TimeoutExpired:
@@ -134,13 +127,13 @@ DO NOT retry with run_cmd. Use the dedicated tools."""
 
 registry.register(
     name="run_cmd",
-    description="Execute a shell command on Windows (cmd.exe). ONLY for system operations that dedicated file tools (Write/Read/Edit/Grep) cannot handle.",
+    description="Execute a shell command. ONLY for system operations that dedicated file tools (Write/Read/Edit/Grep) cannot handle. Use the native shell for the current platform.",
     arguments_schema={
         "type": "object",
         "properties": {
             "cmd": {
                 "type": "string",
-                "description": "Windows shell command. Examples: 'dir /b', 'mkdir new_folder', 'python script.py', 'pip install requests'. BLOCKED: shutdown, rm -rf, format, diskpart, del /s, reg delete, sudo. BLOCKED file ops: echo >, cat, sed, awk, type | (use Write/Read/Edit/Grep instead). Use Windows syntax, not Unix.",
+                "description": "Shell command. Use the native shell for the current OS. Examples (cross-platform): 'python script.py', 'pip install requests', 'mkdir new_folder'. Use 'ls' / 'dir' depending on platform. BLOCKED: shutdown, rm -rf, format, diskpart, del /s, reg delete, sudo. BLOCKED file ops: echo >, cat, sed, awk, type | (use Write/Read/Edit/Grep instead).",
             },
         },
         "required": ["cmd"],
