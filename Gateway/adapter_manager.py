@@ -68,15 +68,6 @@ class AdapterManager:
 
         self.adapters.clear()
 
-    def get_connected_platforms(self) -> list:
-        """
-        获取已连接的平台列表
-
-        Returns:
-            list: 平台名称列表
-        """
-        return [p.value for p in self.adapters.keys()]
-
     def _create_adapter(
         self,
         platform_name: str,

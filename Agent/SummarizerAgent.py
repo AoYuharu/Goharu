@@ -1,5 +1,5 @@
 from Agent.LargeLanguageModel import LargeLanguageModel
-import json
+from Agent.json_parser import JSONParser
 
 from Prompting.PromptAssembler import PromptAssembler
 from Prompting.PromptRenderer import PromptRenderer
@@ -11,27 +11,14 @@ class SummarizeAgent(LargeLanguageModel):
         self.prompt_assembler = PromptAssembler()
         self.prompt_renderer = PromptRenderer()
 
-    @staticmethod
-    def _coerce_json(text):
-        cleaned = text.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.strip("`")
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:].strip()
-        return cleaned
-
     def _query_json(self, messages):
         while True:
             ans = self.query(messages)
-
             try:
-                return json.loads(ans)
+                return JSONParser.parse_with_retry(ans)
             except Exception:
-                try:
-                    return json.loads(self._coerce_json(ans))
-                except Exception:
-                    print("[-]JSON解析失败，重新生成摘要:" + ans)
-                    continue
+                print("[-]JSON解析失败，重新生成摘要:" + ans)
+                continue
 
     def summarize_day(self, history, old_memory):
         print("[*]对过期 daily 记忆进行摘要:" + str(history))
@@ -44,6 +31,3 @@ class SummarizeAgent(LargeLanguageModel):
         document = self.prompt_assembler.build_topic_merge_document(memory_index, topic_docs)
         messages = self.prompt_renderer.render_document(document)
         return self._query_json(messages)
-
-    def summarize(self, history, old_memory):
-        return self.summarize_day(history, old_memory)

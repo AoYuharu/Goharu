@@ -61,26 +61,46 @@ class ToolCall:
         return None
 
     @classmethod
-    def _try_from_minimax_syntax(cls, text):
+    def _convert_arrow_syntax(cls, text):
         """
-        支持 MiniMax 模型的特殊格式（容错机制）
-        Format: <minimax:tool_call>{"tool": "...", "arguments": {...}}</minimax:tool_call>
+        将箭头语法转换为标准 JSON
+        {tool => "Read", args => {--path "test.txt", --mode "r"}}
+        ->
+        {"tool": "Read", "arguments": {"path": "test.txt", "mode": "r"}}
         """
-        match = re.search(
-            r'<minimax:tool_call>\s*(\{.*?\})\s*</minimax:tool_call>',
-            text,
-            re.DOTALL
-        )
-        if match:
-            try:
-                payload = json.loads(match.group(1))
-                tool_call = cls._from_payload(payload)
-                if tool_call is not None:
-                    return tool_call
-            except (TypeError, ValueError, json.JSONDecodeError):
-                pass
+        try:
+            # 1. 替换 => 为 :
+            text = re.sub(r'\s*=>\s*', ': ', text)
 
-        return None
+            # 2. 替换 args 为 arguments
+            text = re.sub(r'\bargs\b', 'arguments', text)
+
+            # 3. 给 tool 和 arguments 键加引号
+            text = re.sub(r'\btool\b(?=\s*:)', '"tool"', text)
+            text = re.sub(r'\barguments\b(?=\s*:)', '"arguments"', text)
+
+            # 4. 处理 --参数名 "值" 格式
+            # 找到所有 --param "value" 或 --param 'value' 模式
+            def replace_dash_param(match):
+                return f'"{match.group(1)}": {match.group(2)}'
+
+            # 匹配 --参数名 后跟引号开始的字符串
+            text = re.sub(r'--(\w+)\s+(["\'][^"\']*["\'])', replace_dash_param, text)
+
+            # 5. 在参数之间添加逗号（如果缺失）
+            # 匹配 "value" 后面直接跟 "key": 的情况
+            text = re.sub(r'(["\'])\s+("[\w_]+"\s*:)', r'\1, \2', text)
+
+            # 6. 处理换行和多余空格
+            text = re.sub(r'\s+', ' ', text)
+
+            # 7. 清理多余的逗号
+            text = re.sub(r',\s*}', ' }', text)
+            text = re.sub(r',\s*]', ' ]', text)
+
+            return text
+        except Exception as e:
+            return None
 
     @classmethod
     def try_from_text(cls, text):
@@ -89,7 +109,6 @@ class ToolCall:
 
         支持的格式：
         1. 标准 JSON（推荐）: {"tool": "...", "arguments": {...}}
-        2. MiniMax 标签（容错）: <minimax:tool_call>{"tool": "...", ...}</minimax:tool_call>
         """
         if not isinstance(text, str):
             return None
@@ -97,11 +116,6 @@ class ToolCall:
         stripped = text.strip()
         if not stripped:
             return None
-
-        # 优先尝试 MiniMax 特殊格式（某些模型会自动添加）
-        minimax_call = cls._try_from_minimax_syntax(stripped)
-        if minimax_call is not None:
-            return minimax_call
 
         # 标准 JSON 格式解析
         candidates = [stripped]

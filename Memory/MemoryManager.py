@@ -128,23 +128,6 @@ class MemoryManager:
             events.append("No user profile changes extracted from current turn")
         return events
 
-    def get_prompt_context(self, base_system_prompt=None, extra_system_prompt=None, tool_definitions=None):
-        from Prompting.PromptAssembler import PromptAssembler
-        from Prompting.PromptRenderer import PromptRenderer
-
-        assembler = PromptAssembler()
-        renderer = PromptRenderer()
-        document = assembler.build_actor_document(
-            history=self.get_context(),
-            soul_markdown=self.get_soul_markdown(),
-            user_profile_markdown=self.get_user_profile_markdown(),
-            memory_markdown=self.get_memory_markdown(),
-            extra_system_prompt=extra_system_prompt,
-            legacy_system_prompt=base_system_prompt,
-            tool_definitions=tool_definitions,
-        )
-        return renderer.render_document(document)
-
     def get_memory_markdown(self):
         return self.long_term.read_memory_markdown()
 

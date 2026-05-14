@@ -2,14 +2,30 @@
 SubAgent - 子agent执行模块
 
 负责执行特定类型的子任务（Explore、Plan等），具有受限的工具权限和独立的执行上下文。
+支持 Anthropic 原生 tool_use/tool_result 调用格式。
 """
 
 import json
 import time
+from pathlib import Path
 from typing import Dict, List, Any, Optional
 
+from Agent.ContextCompactor import ContextCompactor
 from Agent.LargeLanguageModel import LargeLanguageModel
+from Agent.TokenEstimator import TokenEstimator
+from Memory.ToolCall import ToolCall
 from configurationLoader import config
+
+
+def _write_agent_jsonl(log_dir: Path, agent_id: str, entry: Dict[str, Any]):
+    """向 JSONL 文件追加一条日志记录"""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"{agent_id}.jsonl"
+    try:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
 
 
 class SubAgentConfig:
@@ -116,17 +132,33 @@ class SubAgentConfig:
 
 记住：你只能探索和规划。你不能也不得写入、编辑或修改任何文件。"""
 
-    # 只读命令白名单
+    # 只读命令白名单（Linux + Windows 兼容）
     READONLY_COMMANDS = {
-        'ls', 'dir', 'pwd', 'cd', 'cat', 'head', 'tail', 'less', 'more',
-        'find', 'tree', 'git status', 'git log', 'git diff', 'git show',
-        'git branch', 'git remote', 'grep', 'awk', 'sed -n', 'wc'
+        # Linux / macOS
+        'ls', 'pwd', 'cd', 'cat', 'head', 'tail', 'less', 'more',
+        'find', 'tree', 'grep', 'awk', 'sed -n', 'wc', 'sort',
+        # Windows (只读)
+        'dir', 'type', 'where', 'set', 'ver', 'echo', 'date', 'time',
+        'findstr', 'tasklist', 'systeminfo', 'whoami', 'hostname',
+        # 脚本/工具 (只读子命令)
+        'python', 'pip', 'powershell', 'cmd',
+        # Git
+        'git status', 'git log', 'git diff', 'git show',
+        'git branch', 'git remote', 'git stash list', 'git tag',
+        'git rev-parse', 'git config --list', 'git blame', 'git whatchanged',
+        'git shortlog', 'git describe', 'git ls-files', 'git ls-tree',
     }
 
-    # 禁止的命令模式（包含重定向、文件写入等）
+    # 禁止的命令模式（包含重定向、文件写入、删除等）
     FORBIDDEN_PATTERNS = [
-        '>', '>>', '<<', 'rm ', 'del ', 'mkdir', 'touch',
-        'mv ', 'move ', 'cp ', 'copy ', 'chmod', 'chown'
+        '>', '>>', '<<',  # 重定向
+        '2>', '1>', '&>',  # fd 重定向
+        'rm ', 'del ', 'rmdir', 'rd ',  # 删除
+        'mkdir', 'touch', 'edit ', 'rename', 'ren ',  # 创建/修改
+        'mv ', 'move ', 'cp ', 'copy ',  # 移动/复制
+        'chmod', 'chown', 'attrib', 'icacls', 'cacls', 'takeown',  # 权限
+        'pip install', 'pip uninstall', 'pip download',  # pip 写操作
+        'python -m pip install',  # pip 间接写操作
     ]
 
     @classmethod
@@ -168,7 +200,7 @@ class SubAgentConfig:
 class SubAgent:
     """子agent执行器"""
 
-    def __init__(self, agent_type: str, task: str, agent_id: str, tools_registry, output_callback=None):
+    def __init__(self, agent_type: str, task: str, agent_id: str, tools_registry, output_callback=None, shared_state=None):
         """
         初始化子agent
 
@@ -178,12 +210,15 @@ class SubAgent:
             agent_id: agent唯一标识符
             tools_registry: 工具注册表实例
             output_callback: 输出回调函数
+            shared_state: 跨线程共享状态 dict，用于超时后提取最后文本
         """
         self.agent_type = agent_type
         self.task = task
         self.agent_id = agent_id
         self.tools_registry = tools_registry
         self.output_callback = output_callback
+        self.shared_state = shared_state or {}
+        self.last_text_answer = self.shared_state.get("last_text_answer", None)
 
         # 获取系统提示词
         self.system_prompt = SubAgentConfig.get_system_prompt(agent_type)
@@ -194,19 +229,41 @@ class SubAgent:
         # 初始化LLM
         self.llm = LargeLanguageModel()
 
+        # 判断是否使用 Anthropic 原生工具调用
+        llm_config = config.get("model.large-language-model", {}) or {}
+        self.provider = llm_config.get("provider", "local_hf")
+        self.use_native_tools = llm_config.get("use_native_tools", True)
+
         # 执行统计
         self.start_time = None
         self.end_time = None
         self.token_count = 0
         self.tool_calls = []
 
+        # JSONL 日志
+        self._log_dir = Path("runtime_memory/logs/agents/sub")
+
     def _notify(self, message: str, level: str = "info"):
         """通知输出消息"""
         if self.output_callback:
             self.output_callback(message, level)
 
+    def _build_anthropic_tools(self) -> List[Dict[str, Any]]:
+        """构建 Anthropic 原生格式的工具定义"""
+        tools = []
+        for tool_name in self.allowed_tools:
+            entry = self.tools_registry.get_entry(tool_name)
+            if entry:
+                tool_def = {
+                    "name": entry.name,
+                    "description": entry.description,
+                    "input_schema": dict(entry.arguments_schema or {}),
+                }
+                tools.append(tool_def)
+        return tools
+
     def _build_tools_schema(self) -> str:
-        """构建工具schema描述"""
+        """构建工具schema描述（文本格式，用于 local_hf 回退）"""
         tools_desc = []
 
         for tool_name in self.allowed_tools:
@@ -215,7 +272,6 @@ class SubAgent:
                 tools_desc.append(f"## {tool_name}")
                 tools_desc.append(f"描述: {tool_entry.description}")
 
-                # 添加参数schema
                 schema = tool_entry.arguments_schema
                 if schema:
                     tools_desc.append(f"参数: {json.dumps(schema, ensure_ascii=False, indent=2)}")
@@ -232,27 +288,128 @@ class SubAgent:
         system_message = {
             "role": "system",
             "content": self.system_prompt,
-            "cache_control": {"type": "ephemeral"}  # 标记为可缓存
+            "cache_control": {"type": "ephemeral"}
         }
         messages.append(system_message)
 
         # 工具schema（Level 1缓存 - 总是缓存）
+        # 对于 Anthropic 原生工具，这仅作为文本回退；工具定义通过 API tools 参数传递
         tools_schema = self._build_tools_schema()
         tools_message = {
             "role": "system",
             "content": f"# 可用工具\n\n{tools_schema}",
-            "cache_control": {"type": "ephemeral"}  # 标记为可缓存
+            "cache_control": {"type": "ephemeral"}
         }
         messages.append(tools_message)
 
         # 用户任务（不缓存 - 每次都不同）
+        max_iter = config.get("agent_delegate.max_iterations", 8)
         task_message = {
             "role": "user",
-            "content": self.task
+            "content": (
+                f"⚠️ 这是你的第1次执行。你最多有{max_iter}次工具调用机会，每次机会都很宝贵。\n"
+                f"请高效规划：优先使用并行工具调用，专注于最关键的信息收集。\n\n"
+                f"任务:\n{self.task}"
+            )
         }
         messages.append(task_message)
 
         return messages
+
+    def _compact_messages(self, messages, system_messages_count=2):
+        """上下文超限时自动摘要，失败时回退到硬截断"""
+        if not config.get("agent.context_compact.enabled", False):
+            return self._hard_truncate(messages, system_messages_count)
+
+        threshold = int(config.get("agent.context_compact.threshold_tokens", 80000))
+        estimator = TokenEstimator()
+        estimated = estimator.estimate(str(messages))
+
+        if estimated < threshold:
+            return messages
+
+        try:
+            compactor = ContextCompactor()
+            summary = compactor.compact(messages)
+            if not summary or len(summary) < 20:
+                raise ValueError("Compaction empty")
+            self._notify(f"  📦 [{self.agent_id}] 上下文已自动压缩 ({len(messages)} msg → {len(summary)} chars)", "info")
+            return messages[:system_messages_count] + [
+                {"role": "user", "content": f"[自动上下文摘要]\n\n{summary}"}
+            ]
+        except Exception as e:
+            self._notify(f"  ⚠ [{self.agent_id}] 压缩失败，回退到硬截断: {e}", "warning")
+            return self._hard_truncate(messages, system_messages_count)
+
+    def _hard_truncate(self, messages, system_messages_count=2):
+        """硬截断：保留 system 消息 + 最后 N 对完整轮次"""
+        max_turns = int(config.get("agent_delegate.max_history_turns", 3))
+        keep = system_messages_count + max_turns * 2
+        truncated = messages[:system_messages_count] + messages[-keep + system_messages_count:]
+        if len(truncated) > system_messages_count and truncated[system_messages_count].get("role") == "assistant":
+            offset = max_turns * 2 + 1
+            truncated = messages[:system_messages_count] + messages[-(offset):]
+        return truncated
+
+    def _should_use_native_tools(self) -> bool:
+        """判断是否应该使用 Anthropic 原生工具调用"""
+        return (
+            self.provider == "anthropic_compatible"
+            and self.use_native_tools
+            and bool(self.allowed_tools)
+        )
+
+    def _is_native_response(self, response) -> bool:
+        """判断响应是否为 Anthropic 原生响应对象（而非纯文本）"""
+        return hasattr(response, "content")
+
+    def _parse_native_tool_calls(self, response) -> List[Dict[str, Any]]:
+        """从 Anthropic 原生响应中解析 tool_use 块"""
+        tool_calls = []
+        content = getattr(response, "content", [])
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "tool_use":
+                    tool_calls.append({
+                        "id": block.get("id"),
+                        "tool": block.get("name"),
+                        "args": block.get("input", {}),
+                    })
+            else:
+                if getattr(block, "type", None) == "tool_use":
+                    tool_calls.append({
+                        "id": getattr(block, "id"),
+                        "tool": getattr(block, "name"),
+                        "args": getattr(block, "input", {}),
+                    })
+        return tool_calls
+
+    def _extract_native_text(self, response) -> str:
+        """从 Anthropic 原生响应中提取 text 块内容"""
+        text_parts = []
+        content = getattr(response, "content", [])
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+            else:
+                if getattr(block, "type", None) == "text":
+                    text_parts.append(getattr(block, "text", ""))
+        return "\n".join(part for part in text_parts if part).strip()
+
+    def _extract_native_thinking(self, response) -> Optional[str]:
+        """从 Anthropic 原生响应中提取 thinking 内容"""
+        thinking_parts = []
+        content = getattr(response, "content", [])
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "thinking":
+                    thinking_parts.append(block.get("thinking", ""))
+            else:
+                if getattr(block, "type", None) == "thinking":
+                    thinking_parts.append(getattr(block, "thinking", ""))
+        combined = "\n".join(part for part in thinking_parts if part).strip()
+        return combined or None
 
     def _execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
         """
@@ -274,7 +431,7 @@ class SubAgent:
 
         # 特殊处理run_cmd - 检查命令白名单
         if tool_name == "run_cmd":
-            command = tool_args.get("command", "")
+            command = tool_args.get("cmd", "")
             if not SubAgentConfig.is_command_allowed(command):
                 return json.dumps({
                     "error": f"命令 '{command}' 不在只读白名单中",
@@ -302,21 +459,46 @@ class SubAgent:
                 "timestamp": time.time()
             })
 
-            # 执行工具（同步调用）
+            # 获取超时时间（默认60s，子agent自身无超时）
+            timeout = config.get("tools.timeout", 60)
+            if not isinstance(timeout, (int, float)) or timeout <= 0:
+                timeout = None
+
             import asyncio
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
+            # 执行工具（同步或异步，带超时）
             if asyncio.iscoroutinefunction(handler):
-                # 如果是异步函数，在新的事件循环中运行
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
-                    result = loop.run_until_complete(handler(**tool_args))
+                    if timeout:
+                        result = loop.run_until_complete(
+                            asyncio.wait_for(handler(**tool_args), timeout=timeout)
+                        )
+                    else:
+                        result = loop.run_until_complete(handler(**tool_args))
                 finally:
                     loop.close()
             else:
-                result = handler(**tool_args)
+                if timeout:
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(handler, **tool_args)
+                        try:
+                            result = future.result(timeout=timeout)
+                        except FutureTimeoutError:
+                            return json.dumps({
+                                "error": f"Tool '{tool_name}' timed out after {timeout}s"
+                            }, ensure_ascii=False)
+                else:
+                    result = handler(**tool_args)
 
             return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
 
+        except asyncio.TimeoutError:
+            return json.dumps({
+                "error": f"Tool '{tool_name}' timed out after {timeout}s"
+            }, ensure_ascii=False)
         except Exception as e:
             return json.dumps({
                 "error": f"工具执行失败: {str(e)}"
@@ -324,7 +506,7 @@ class SubAgent:
 
     def _parse_tool_calls(self, response: str) -> List[Dict[str, Any]]:
         """
-        从LLM响应中解析工具调用
+        从LLM响应中解析工具调用（文本格式，仅用于 local_hf 回退）
 
         支持多种格式：
         1. {"tool": "tool_name", "args": {...}}
@@ -344,7 +526,6 @@ class SubAgent:
                 try:
                     tool_call = json.loads(match)
                     if "tool" in tool_call:
-                        # 统一参数字段名
                         args = tool_call.get("args") or tool_call.get("arguments") or {}
                         tool_calls.append({
                             "tool": tool_call["tool"],
@@ -359,8 +540,6 @@ class SubAgent:
 
             for tool_name, args_str in arrow_matches:
                 try:
-                    # 尝试解析args部分
-                    # 将 --key "value" 格式转换为 JSON
                     args = {}
                     arg_pattern = r'--(\w+)\s+"([^"]+)"'
                     arg_matches = re.findall(arg_pattern, args_str)
@@ -368,7 +547,6 @@ class SubAgent:
                         args[key] = value
 
                     if not args:
-                        # 如果没有匹配到--格式，尝试直接解析JSON
                         args = json.loads(args_str)
 
                     tool_calls.append({
@@ -383,6 +561,26 @@ class SubAgent:
 
         return tool_calls
 
+    def _scan_messages_for_last_text(self, messages: List[Dict], use_native: bool) -> Optional[str]:
+        """扫描消息列表，返回最后一条 assistant 的 text/thinking 内容（排除纯 tool_use 消息）"""
+        for msg in reversed(messages):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if use_native and isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") in ("text", "thinking"):
+                            text_parts.append(block.get("text", "") or block.get("thinking", ""))
+                    elif hasattr(block, "type") and getattr(block, "type") in ("text", "thinking"):
+                        text_parts.append(getattr(block, "text", "") or getattr(block, "thinking", ""))
+                if text_parts:
+                    return "\n".join(text_parts)
+            elif isinstance(content, str) and content.strip():
+                return content.strip()
+        return None
+
     def execute(self) -> Dict[str, Any]:
         """
         执行子agent任务（多轮ReAct循环）
@@ -391,6 +589,14 @@ class SubAgent:
             执行结果字典，包含status, content, error等字段
         """
         self.start_time = time.time()
+
+        # JSONL start 事件
+        _write_agent_jsonl(self._log_dir, self.agent_id, {
+            "event": "start",
+            "agent_type": self.agent_type,
+            "task": self.task,
+            "timestamp": self.start_time,
+        })
 
         try:
             # 构建初始提示消息
@@ -402,78 +608,226 @@ class SubAgent:
             # 保留的历史轮数（避免上下文过长）
             max_history_turns = config.get("agent_delegate.max_history_turns", 3)
 
+            # 判断是否使用 Anthropic 原生工具调用
+            use_native = self._should_use_native_tools()
+            anthropic_tools = self._build_anthropic_tools() if use_native else None
+
             final_answer = None
+            is_first_iteration = True
 
             # ReAct循环
             for iteration in range(max_iterations):
                 # 通知当前迭代
                 self._notify(f"  🔄 [{self.agent_id}] 迭代 {iteration + 1}/{max_iterations}", "info")
 
-                # 调用LLM
-                response = self.llm.query(messages)
+                # 调用LLM（原生工具模式传递 tools 参数）
+                if use_native:
+                    response = self.llm.query(messages, tools=anthropic_tools)
+                else:
+                    response = self.llm.query(messages)
 
                 # 累加token数量
-                self.token_count += self.llm.getTokenSize(str(messages[-1:]) + response)
+                response_text_for_count = str(response) if not isinstance(response, str) else response
+                self.token_count += self.llm.getTokenSize(str(messages[-1:]) + response_text_for_count)
 
-                # 显示思考过程（截断显示）
-                thinking_preview = response[:200] + "..." if len(response) > 200 else response
-                self._notify(f"  💭 [{self.agent_id}] 思考: {thinking_preview}", "debug")
-
-                # 解析工具调用
-                tool_calls = self._parse_tool_calls(response)
-
-                if tool_calls:
-                    # 有工具调用 - 执行工具并继续循环
-                    # 将assistant的响应加入消息历史
-                    messages.append({
-                        "role": "assistant",
-                        "content": response
+                # JSONL 迭代事件
+                if use_native and self._is_native_response(response):
+                    native_text = self._extract_native_text(response)
+                    native_thinking = self._extract_native_thinking(response)
+                    native_tc = self._parse_native_tool_calls(response)
+                    _write_agent_jsonl(self._log_dir, self.agent_id, {
+                        "event": "iteration",
+                        "iteration": iteration + 1,
+                        "native": True,
+                        "text_preview": (native_text[:200] if native_text else None),
+                        "thinking_preview": (native_thinking[:200] if native_thinking else None),
+                        "tool_use_count": len(native_tc),
+                        "tool_names": [tc["tool"] for tc in native_tc],
+                        "timestamp": time.time(),
                     })
-
-                    # 执行所有工具调用
-                    tool_results_text = []
-                    for tool_call in tool_calls:
-                        tool_name = tool_call.get("tool")
-                        tool_args = tool_call.get("args", {})
-
-                        # 通知工具调用
-                        args_str = json.dumps(tool_args, ensure_ascii=False)[:100]
-                        self._notify(f"  🔧 [{self.agent_id}] 调用工具: {tool_name}({args_str}...)", "info")
-
-                        result = self._execute_tool(tool_name, tool_args)
-
-                        # 显示工具结果预览
-                        result_preview = result[:150] + "..." if len(result) > 150 else result
-                        self._notify(f"  ✓ [{self.agent_id}] 工具结果: {result_preview}", "debug")
-
-                        tool_results_text.append(f"### {tool_name}\n{result}")
-
-                    # 将工具结果作为user消息加入历史
-                    messages.append({
-                        "role": "user",
-                        "content": "## 工具执行结果\n\n" + "\n\n".join(tool_results_text)
-                    })
-
-                    # 保持上下文窗口在合理范围内
-                    # 保留：系统提示词(2条) + 最近N轮对话
-                    if len(messages) > 2 + max_history_turns * 2:
-                        # 保留前2条（系统提示词和工具schema）+ 最近N轮
-                        messages = messages[:2] + messages[-(max_history_turns * 2):]
-
-                    # 继续下一轮循环
-                    continue
                 else:
-                    # 没有工具调用 - 这是最终答案
-                    self._notify(f"  ✅ [{self.agent_id}] 得出最终结论", "info")
-                    final_answer = response
-                    break
+                    response_text = response if isinstance(response, str) else str(response)
+                    tool_calls = self._parse_tool_calls(response_text)
+                    _write_agent_jsonl(self._log_dir, self.agent_id, {
+                        "event": "iteration",
+                        "iteration": iteration + 1,
+                        "native": False,
+                        "text_preview": response_text[:200],
+                        "tool_use_count": len(tool_calls),
+                        "tool_names": [tc.get("tool") for tc in tool_calls],
+                        "timestamp": time.time(),
+                    })
 
-            # 如果达到最大迭代次数仍未给出最终答案
+                # 处理 Anthropic 原生响应格式
+                if use_native and self._is_native_response(response):
+                    tool_use_blocks = self._parse_native_tool_calls(response)
+                    text_content = self._extract_native_text(response)
+                    thinking_content = self._extract_native_thinking(response)
+
+                    # 通知思考内容
+                    preview = text_content[:200] if text_content else (
+                        thinking_content[:200] if thinking_content else "(no text)"
+                    )
+                    self._notify(f"  💭 [{self.agent_id}] 思考: {preview}", "debug")
+
+                    # 持久化最后一条文本/思考（用于超时/超轮后回传给主agent）
+                    if text_content or thinking_content:
+                        self.last_text_answer = text_content or thinking_content
+                        self.shared_state["last_text_answer"] = self.last_text_answer
+
+                    # 仅 thinking 块，无文本无工具 → 模型还在思考，继续循环
+                    if thinking_content and not text_content and not tool_use_blocks:
+                        messages.append({"role": "assistant", "content": thinking_content.strip()})
+                        continue
+
+                    if tool_use_blocks:
+                        # 构建 assistant 消息（含 tool_use 块）
+                        assistant_content = []
+                        if text_content:
+                            assistant_content.append({"type": "text", "text": text_content})
+                        for tb in tool_use_blocks:
+                            assistant_content.append({
+                                "type": "tool_use",
+                                "id": tb["id"],
+                                "name": tb["tool"],
+                                "input": tb["args"],
+                            })
+                        messages.append({"role": "assistant", "content": assistant_content})
+
+                        # 执行所有工具，构建 tool_result 块
+                        remaining = max_iterations - (iteration + 1)
+                        user_content = [
+                            {"type": "text", "text": (
+                                f"⚠️ 剩余可执行次数: {remaining}/{max_iterations}。"
+                                f"用完将强制结束。请高效利用剩余机会。" if remaining > 0 else
+                                f"⚠️ 最后机会！本次执行后将被强制结束，必须输出文本答案，不能再调用工具。"
+                            )},
+                        ]
+                        for tb in tool_use_blocks:
+                            args_str = json.dumps(tb["args"], ensure_ascii=False)[:100]
+                            self._notify(f"  🔧 [{self.agent_id}] 调用工具: {tb['tool']}({args_str}...)", "info")
+
+                            result = self._execute_tool(tb["tool"], tb["args"])
+
+                            result_preview = result[:150] + "..." if len(result) > 150 else result
+                            self._notify(f"  ✓ [{self.agent_id}] 工具结果: {result_preview}", "debug")
+
+                            # 正确设置 is_error（与 ActorAgent 一致）
+                            error_flag = False
+                            if isinstance(result, str):
+                                try:
+                                    rj = json.loads(result)
+                                    error_flag = "error" in rj and rj.get("error")
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
+
+                            user_content.append(
+                                ToolCall.create_anthropic_tool_result(tb["id"], result, is_error=error_flag)
+                            )
+
+                            # 记录工具调用
+                            self.tool_calls.append({
+                                "tool": tb["tool"],
+                                "args": tb["args"],
+                                "result_preview": result_preview,
+                                "is_error": error_flag,
+                                "timestamp": time.time(),
+                            })
+
+                        messages.append({"role": "user", "content": user_content})
+
+                        # 上下文超限时自动摘要（替代硬截断）
+                        if len(messages) > 4 + max_history_turns * 2:
+                            messages = self._compact_messages(messages)
+
+                        continue
+                    else:
+                        # 无工具调用 → 最终答案
+                        self._notify(f"  ✅ [{self.agent_id}] 得出最终结论", "info")
+                        final_answer = text_content or response_text_for_count
+                        break
+
+                else:
+                    # 文本格式（local_hf 回退）- 原有逻辑
+                    thinking_preview = response[:200] + "..." if len(response) > 200 else response
+                    self._notify(f"  💭 [{self.agent_id}] 思考: {thinking_preview}", "debug")
+
+                    # 持久化最后一条文本（用于超时/超轮后回传给主agent）
+                    if isinstance(response, str) and response.strip():
+                        self.last_text_answer = response.strip()
+                        self.shared_state["last_text_answer"] = self.last_text_answer
+
+                    tool_calls = self._parse_tool_calls(response)
+
+                    if tool_calls:
+                        messages.append({
+                            "role": "assistant",
+                            "content": response
+                        })
+
+                        remaining = max_iterations - (iteration + 1)
+                        tool_results_text = [
+                            f"⚠️ 剩余可执行次数: {remaining}/{max_iterations}。用完将强制结束。请高效利用剩余机会。"
+                        ]
+                        for tool_call in tool_calls:
+                            tool_name = tool_call.get("tool")
+                            tool_args = tool_call.get("args", {})
+
+                            args_str = json.dumps(tool_args, ensure_ascii=False)[:100]
+                            self._notify(f"  🔧 [{self.agent_id}] 调用工具: {tool_name}({args_str}...)", "info")
+
+                            result = self._execute_tool(tool_name, tool_args)
+
+                            result_preview = result[:150] + "..." if len(result) > 150 else result
+                            self._notify(f"  ✓ [{self.agent_id}] 工具结果: {result_preview}", "debug")
+
+                            tool_results_text.append(f"### {tool_name}\n{result}")
+
+                            # 记录工具调用
+                            self.tool_calls.append({
+                                "tool": tool_name,
+                                "args": tool_args,
+                                "result_preview": result_preview,
+                                "timestamp": time.time(),
+                            })
+
+                        messages.append({
+                            "role": "user",
+                            "content": "\n\n".join(tool_results_text)
+                        })
+
+                        if len(messages) > 4 + max_history_turns * 2:
+                            messages = self._compact_messages(messages)
+
+                        continue
+                    else:
+                        self._notify(f"  ✅ [{self.agent_id}] 得出最终结论", "info")
+                        final_answer = response
+                        break
+
+            # 如果达到最大迭代次数仍未给出最终答案，返回最后一条文本/思考内容
             if final_answer is None:
-                self._notify(f"  ⚠️ [{self.agent_id}] 达到最大迭代次数", "warning")
-                final_answer = f"[达到最大迭代次数 {max_iterations}]\n\n" + response
+                self._notify(f"  ⚠️ [{self.agent_id}] 达到最大迭代次数，提取最后文本内容", "warning")
+                if self.last_text_answer:
+                    final_answer = self.last_text_answer
+                else:
+                    # 兜底：扫描 messages 中的最后一条 assistant text/thinking
+                    final_answer = self._scan_messages_for_last_text(messages, use_native)
+                if not final_answer:
+                    final_answer = f"子Agent [{self.agent_id}] 在 {max_iterations} 轮内未能生成文本答案（已执行 {len(self.tool_calls)} 次工具调用）"
 
             self.end_time = time.time()
+
+            # JSONL end 事件
+            _write_agent_jsonl(self._log_dir, self.agent_id, {
+                "event": "end",
+                "status": "success",
+                "iterations": iteration + 1,
+                "tool_calls_count": len(self.tool_calls),
+                "token_count": self.token_count,
+                "duration_ms": int((self.end_time - self.start_time) * 1000),
+                "timestamp": self.end_time,
+            })
 
             return {
                 "agent_id": self.agent_id,
@@ -489,6 +843,17 @@ class SubAgent:
         except Exception as e:
             self.end_time = time.time()
             self._notify(f"  ❌ [{self.agent_id}] 执行失败: {str(e)}", "error")
+
+            # JSONL end 事件（错误）
+            _write_agent_jsonl(self._log_dir, self.agent_id, {
+                "event": "end",
+                "status": "error",
+                "error": str(e),
+                "tool_calls_count": len(self.tool_calls),
+                "token_count": self.token_count,
+                "duration_ms": int((self.end_time - self.start_time) * 1000) if self.end_time else 0,
+                "timestamp": self.end_time,
+            })
 
             return {
                 "agent_id": self.agent_id,

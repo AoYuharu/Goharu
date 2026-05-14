@@ -53,9 +53,7 @@ class MessageRouter:
         print(f"[Router] Chat: {source.chat_id} ({source.chat_type})")
         print(f"[Router] Text: {event.text}")
 
-        # 1. 用户鉴权
-        if not self._is_user_authorized(source):
-            return self._handle_unauthorized(source)
+        # 1. 用户鉴权（当前允许所有用户）
 
         # 2. 命令拦截
         if event.text.startswith("/"):
@@ -91,33 +89,6 @@ class MessageRouter:
         finally:
             if session_key in self._active_sessions:
                 del self._active_sessions[session_key]
-
-    def _is_user_authorized(self, source: SessionSource) -> bool:
-        """
-        用户鉴权
-
-        Args:
-            source: 消息来源
-
-        Returns:
-            bool: 是否授权
-        """
-        # 简化版：允许所有用户
-        # 可以扩展为白名单/黑名单机制
-        return True
-
-    def _handle_unauthorized(self, source: SessionSource) -> Optional[str]:
-        """
-        处理未授权用户
-
-        Args:
-            source: 消息来源
-
-        Returns:
-            Optional[str]: 响应内容
-        """
-        print(f"[Router] Unauthorized user: {source.user_id}")
-        return None
 
     def _handle_busy_session(self, session_key: str) -> str:
         """

@@ -1,98 +1,29 @@
 import json
+from pathlib import Path
 
 from Memory.ToolCall import ToolCall
 from Prompting.PromptDocument import PromptDocument
 from Prompting.PromptLoader import PromptLoader
 from Prompting.PromptSection import PromptSection
 
-SOUL_SECTION_PROMPT = "以下是稳定角色设定 SOUL.md，请将其视为高优先级的长期风格与行为边界指导。"
-USER_PROFILE_PROMPT = "以下是当前用户画像 USER.md。它是主用户画像来源；若与 MEMORY.md 中的用户信息冲突，优先参考 USER.md。"
-LONGTERM_MEMORY_PROMPT = "以下是共享长期记忆索引 MEMORY.md，请将其中信息视为长期上下文，仅在相关时使用。"
-LONGTERM_MEMORY_BACKGROUND_PROMPT = "以下是共享长期记忆索引 MEMORY.md，仅作为补充背景，不是用户画像主来源。"
-TOOL_DIRECTORY_PROMPT = "以下是当前运行时实际可用的工具目录。只有这些工具可以调用；如需调用工具，参数必须严格匹配对应 schema。"
-
-REFLECTION_QUESTION_PROMPT = "以下是用户的原始问题，请围绕它判断当前信息是否已经足够。"
-REFLECTION_HISTORY_PROMPT = "以下是最近对话与工具调用历史的结构化 JSON。"
-REFLECTION_TASK_PROMPT = """
-请判断：
-1. 当前信息是否足以回答原始问题？
-2. 是否存在明显错误、遗漏或不合理的工具使用？
-3. 下一步建议：
-- 如果信息不足，请明确输出短语“需要继续调用工具”，并说明原因
-- 如果信息足够，请明确输出短语“可以给出最终回答”
-
-你必须原样保留以下两个短语之一：
-- 需要继续调用工具
-- 可以给出最终回答
-
-请用简洁、理性的自然语言回答，不要省略上述关键短语。
-""".strip()
-
-DAY_SUMMARY_CONTRACT_PROMPT = """
-你的任务是把“某一天已经过期的对话记录”压缩成可以写入长期记忆系统的严格 JSON。
-请只保留长期有价值、可复用、可检索的信息，忽略寒暄和一次性噪声。
-
-请严格输出且仅输出 JSON，格式必须为：
-{
-  "profile_updates": {"字段": "值"},
-  "important_facts": ["事实1", "事实2"],
-  "conversation_summary": "不超过 120 字的摘要",
-  "topics": [
-    {
-      "slug": "topic-slug",
-      "title": "Topic Title",
-      "action": "create",
-      "summary": "该话题的长期摘要",
-      "keywords": ["关键词1", "关键词2"],
-      "facts": ["关键事实1", "关键事实2"],
-      "open_questions": ["未解决问题"]
-    }
-  ]
-}
-
-约束：
-1. action 只能是 create、update、ignore 之一
-2. topics 中只保留值得进入长期主题记忆的话题
-3. 不要输出重复事实
-4. 不要输出 markdown 代码块
-5. 不要在 JSON 前后添加任何解释文字
-6. 输出结果必须可以被 json.loads 直接解析
-""".strip()
-
-TOPIC_MERGE_CONTRACT_PROMPT = """
-你的任务是识别高度重叠、应该合并的 topic 文档，并输出严格 JSON。
-如果没有需要合并的 topic，也必须输出合法 JSON。
-
-请严格输出且仅输出 JSON，格式必须为：
-{
-  "merge_groups": [
-    {
-      "canonical_slug": "保留的 slug",
-      "merged_slugs": ["待合并 slug"],
-      "title": "合并后的标题",
-      "summary": "合并后的摘要",
-      "keywords": ["关键词1", "关键词2"],
-      "facts": ["需要补充保留的事实"],
-      "open_questions": ["合并后仍未解决的问题"]
-    }
-  ]
-}
-
-约束：
-1. 只有在两个或更多 topic 明显属于同一长期主题时才输出 merge group
-2. canonical_slug 不能同时出现在 merged_slugs 中
-3. 如果没有任何应该合并的 topic，输出 {"merge_groups": []}
-4. 不要输出 markdown 代码块
-5. 不要在 JSON 前后添加任何解释文字
-6. 输出结果必须可以被 json.loads 直接解析
-""".strip()
-
-REVIEW_TURN_PROMPT = "请根据以上内容，输出本轮用户画像复盘 JSON。"
-
 
 class PromptAssembler:
+    """提示词组装器 - 从外部文件加载所有提示词"""
+
     def __init__(self, prompt_loader=None):
         self.prompt_loader = prompt_loader or PromptLoader()
+        self._prompts_cache = {}
+        self._prompts_dir = Path(__file__).parent.parent / "prompts" / "system"
+
+    def _load_prompt(self, filename: str) -> str:
+        """从文件加载提示词并缓存"""
+        if filename not in self._prompts_cache:
+            prompt_path = self._prompts_dir / filename
+            try:
+                self._prompts_cache[filename] = prompt_path.read_text(encoding='utf-8')
+            except FileNotFoundError:
+                raise FileNotFoundError(f"提示词文件未找到: {prompt_path}")
+        return self._prompts_cache[filename]
 
     @staticmethod
     def _json_text(value):
@@ -112,10 +43,11 @@ class PromptAssembler:
         soul_text = self._normalize_text(soul_markdown)
         if not soul_text:
             return None
+        prompt = self._load_prompt("soul_section.md")
         return PromptSection(
             kind="system",
             title="soul",
-            content=f"{SOUL_SECTION_PROMPT}\n\n{soul_text}",
+            content=f"{prompt}\n\n{soul_text}",
             metadata={"section_name": "soul"},
             cache_control={"type": "ephemeral"},  # 缓存 SOUL
         )
@@ -124,10 +56,11 @@ class PromptAssembler:
         user_text = self._normalize_text(user_profile_markdown)
         if not user_text:
             return None
+        prompt = self._load_prompt("user_profile.md")
         section_kwargs = {
             "kind": "system",
             "title": "user_profile",
-            "content": f"{USER_PROFILE_PROMPT}\n\n{user_text}",
+            "content": f"{prompt}\n\n{user_text}",
             "metadata": {"section_name": "user_profile"},
         }
         if enable_cache:
@@ -138,7 +71,8 @@ class PromptAssembler:
         memory_text = self._normalize_text(memory_markdown)
         if not memory_text:
             return None
-        prompt = LONGTERM_MEMORY_BACKGROUND_PROMPT if background_only else LONGTERM_MEMORY_PROMPT
+        prompt_file = "memory_background.md" if background_only else "memory.md"
+        prompt = self._load_prompt(prompt_file)
         section_kwargs = {
             "kind": "system",
             "title": "long_term_memory",
@@ -152,10 +86,11 @@ class PromptAssembler:
     def _build_tool_directory_section(self, tool_definitions):
         if not tool_definitions:
             return None
+        prompt = self._load_prompt("tool_directory.md")
         return PromptSection(
             kind="system",
             title="tool_directory",
-            content=f"{TOOL_DIRECTORY_PROMPT}\n\n{self._json_text(tool_definitions)}",
+            content=f"{prompt}\n\n{self._json_text(tool_definitions)}",
             metadata={"section_name": "tool_directory"},
             cache_control={"type": "ephemeral"},  # 缓存工具定义
         )
@@ -264,30 +199,11 @@ class PromptAssembler:
         if memory_section is not None:
             document.add_system(memory_section)
 
-        tool_directory_section = self._build_tool_directory_section(tool_definitions)
-        if tool_directory_section is not None:
-            document.add_system(tool_directory_section)
-
-        # 处理历史对话：除最新一轮外都缓存
-        history_list = list(history or [])
-        if history_list:
-            # 找到最后一个用户消息的位置，作为最新一轮的起点
-            last_user_idx = -1
-            for i in range(len(history_list) - 1, -1, -1):
-                record = history_list[i]
-                role = record.get("role") if isinstance(record, dict) else getattr(record, "role", None)
-                if role == "user":
-                    last_user_idx = i
-                    break
-
-            # 最新一轮之前的所有消息都缓存
-            for i, record in enumerate(history_list):
-                enable_cache = (last_user_idx >= 0 and i < last_user_idx)
-                section = self.record_to_section(record, enable_cache=enable_cache)
-                if section is not None:
-                    document.add_conversation(section)
-        else:
-            document.extend_conversation(self.record_to_section(record) for record in (history or []))
+        # Actor 路径仅缓存稳定 system 前缀；所有历史消息保持原顺序但不打缓存标记。
+        for record in history or []:
+            section = self.record_to_section(record)
+            if section is not None:
+                document.add_conversation(section)
 
         extra_prompt = self._normalize_text(extra_system_prompt)
         if extra_prompt:
@@ -312,23 +228,27 @@ class PromptAssembler:
         if memory_section is not None:
             document.add_system(memory_section)
 
+        reflection_question_prompt = self._load_prompt("reflection_question.md")
+        reflection_history_prompt = self._load_prompt("reflection_history.md")
+        reflection_task_prompt = self._load_prompt("reflection_task.md")
+
         document.extend_conversation([
             PromptSection(
                 kind="user",
                 title="original_question",
-                content=f"{REFLECTION_QUESTION_PROMPT}\n\n{self._normalize_text(question)}",
+                content=f"{reflection_question_prompt}\n\n{self._normalize_text(question)}",
                 metadata={"section_name": "original_question"},
             ),
             PromptSection(
                 kind="user",
                 title="recent_history",
-                content=f"{REFLECTION_HISTORY_PROMPT}\n\n{self._json_text(history or [])}",
+                content=f"{reflection_history_prompt}\n\n{self._json_text(history or [])}",
                 metadata={"section_name": "recent_history"},
             ),
             PromptSection(
                 kind="user",
                 title="reflection_task",
-                content=REFLECTION_TASK_PROMPT,
+                content=reflection_task_prompt,
                 metadata={"section_name": "reflection_task"},
             ),
         ])
@@ -337,10 +257,12 @@ class PromptAssembler:
     def build_day_summary_document(self, history, old_memory):
         document = PromptDocument()
         document.extend_system(self._load_agent_system_sections("summarizer"))
+
+        day_summary_contract_prompt = self._load_prompt("day_summary_contract.md")
         document.add_system(PromptSection(
             kind="system",
             title="day_summary_contract",
-            content=DAY_SUMMARY_CONTRACT_PROMPT,
+            content=day_summary_contract_prompt,
             metadata={"section_name": "day_summary_contract"},
         ))
         document.extend_conversation([
@@ -368,10 +290,12 @@ class PromptAssembler:
     def build_topic_merge_document(self, memory_index, topic_docs):
         document = PromptDocument()
         document.extend_system(self._load_agent_system_sections("summarizer"))
+
+        topic_merge_contract_prompt = self._load_prompt("topic_merge_contract.md")
         document.add_system(PromptSection(
             kind="system",
             title="topic_merge_contract",
-            content=TOPIC_MERGE_CONTRACT_PROMPT,
+            content=topic_merge_contract_prompt,
             metadata={"section_name": "topic_merge_contract"},
         ))
         document.extend_conversation([
@@ -396,12 +320,54 @@ class PromptAssembler:
         ])
         return document
 
+    def build_context_compact_document(self, conversation, system_prompt=None):
+        """构建上下文压缩 prompt 文档 — 按 9 点框架摘要对话历史"""
+        document = PromptDocument()
+        # 复用 summarizer 的 system sections
+        document.extend_system(self._load_agent_system_sections("summarizer"))
+
+        compact_prompt = self._load_prompt("context_compact.md")
+        document.add_system(PromptSection(
+            kind="system",
+            title="context_compact_contract",
+            content=compact_prompt,
+            metadata={"section_name": "context_compact_contract"},
+        ))
+
+        sections = [
+            PromptSection(
+                kind="user",
+                title="conversation_history",
+                content="以下是需要压缩的对话历史：\n\n" + self._json_text(conversation),
+                metadata={"section_name": "conversation_history"},
+            ),
+        ]
+
+        if system_prompt:
+            sections.append(PromptSection(
+                kind="user",
+                title="current_system_prompt",
+                content="当前系统提示词（仅做背景参考，不需要重复摘要）：\n\n" + system_prompt,
+                metadata={"section_name": "current_system_prompt"},
+            ))
+
+        sections.append(PromptSection(
+            kind="user",
+            title="compact_task",
+            content="请按上述 9 点框架输出结构化摘要，直接作为最终输出。",
+            metadata={"section_name": "compact_task"},
+        ))
+
+        document.extend_conversation(sections)
+        return document
+
     def build_review_document(self, turn_context, user_profile_markdown="", memory_markdown=""):
         document = PromptDocument()
         document.extend_system(self._load_agent_system_sections("reviewer"))
 
         user_profile_text = self._normalize_text(user_profile_markdown)
         memory_text = self._normalize_text(memory_markdown)
+        review_turn_prompt = self._load_prompt("review_turn.md")
 
         document.extend_conversation([
             PromptSection(
@@ -429,7 +395,7 @@ class PromptAssembler:
         document.add_conversation(PromptSection(
             kind="user",
             title="review_task",
-            content=REVIEW_TURN_PROMPT,
+            content=review_turn_prompt,
             metadata={"section_name": "review_task"},
         ))
         return document

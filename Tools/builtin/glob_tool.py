@@ -130,41 +130,17 @@ async def Glob(pattern: str, path: Optional[str] = None) -> str:
 # 注册工具
 registry.register(
     name="Glob",
-    description="""Fast file pattern matching tool that works with any codebase size.
-
-Usage:
-- Supports glob patterns like "**/*.py" or "src/**/*.ts"
-- Returns matching file paths sorted by modification time (newest first)
-- Use this tool when you need to find files by name patterns
-- When you are doing an open-ended search that may require multiple rounds of globbing and grepping, use the Task tool instead
-
-Pattern Examples:
-- "**/*.py" - Find all Python files recursively
-- "src/**/*.ts" - Find all TypeScript files in src directory
-- "test_*.py" - Find all test files in current directory
-- "**/*.{js,ts}" - Find all JavaScript and TypeScript files (note: Python glob may not support brace expansion)
-
-Important Notes:
-- Results are limited to 100 files by default to prevent context bloat
-- Files are sorted by modification time (most recently modified first)
-- Automatically excludes version control directories (.git, .svn, etc.) and cache directories
-- Returns relative paths from the search directory
-- If results are truncated, consider using a more specific pattern or path
-
-Performance:
-- Fast for any codebase size (uses native filesystem operations)
-- More efficient than recursive grep for finding files by name
-- Suitable for exploratory searches and file discovery""",
+    description="Find files by glob pattern matching. Returns paths sorted by modification time (newest first). Skips .git, __pycache__, node_modules, etc.",
     arguments_schema={
         "type": "object",
         "properties": {
             "pattern": {
                 "type": "string",
-                "description": "The glob pattern to match files against (e.g., '**/*.py', 'src/**/*.ts')",
+                "description": "Glob pattern. Examples: '**/*.py' (all Python), 'src/**/*.ts' (TS in src), 'test_*.py' (test files).",
             },
             "path": {
                 "type": "string",
-                "description": "The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter 'undefined' or 'null' - simply omit it for the default behavior. Must be a valid directory path if provided.",
+                "description": "Root directory to search in. Default: current directory.",
             },
         },
         "required": ["pattern"],

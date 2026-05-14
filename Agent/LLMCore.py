@@ -19,8 +19,6 @@ class LLMCore:
         if self.__class__._initialized:
             return
 
-
-
         self.model = None
         self.tokenizer = None
         self.client = None
@@ -28,6 +26,8 @@ class LLMCore:
 
         self.llm_config = config.get("model.large-language-model", {}) or {}
         self.provider = self.llm_config.get("provider", "local_hf")
+        self._last_thinking = None
+        self._last_usage = None
 
         try:
             if self.provider == "local_hf":
@@ -73,6 +73,8 @@ class LLMCore:
             model_path,
             trust_remote_code=local_config.get("trust_remote_code", True),
         )
+        from Agent.TokenEstimator import TokenEstimator
+        TokenEstimator().set_tokenizer(self.tokenizer)
 
     def _init_anthropic_compatible(self):
         try:
@@ -98,6 +100,11 @@ class LLMCore:
         if base_url:
             client_kwargs["base_url"] = base_url
 
+        # 设置 HTTP 超时避免 API 调用无限挂死
+        api_timeout = self.llm_config.get("api_timeout", 120)
+        if api_timeout:
+            client_kwargs["timeout"] = float(api_timeout)
+
         self.client = Anthropic(**client_kwargs)
 
     def _resolve_torch_dtype(self, dtype_name):
@@ -121,6 +128,10 @@ class LLMCore:
             return message.to_prompt_message()
 
         if isinstance(message, dict):
+            # 如果 content 已经是 Anthropic 原生块数组格式，保持原样
+            content = message.get("content")
+            if isinstance(content, list):
+                return dict(message)
             tool_call = ToolCall.from_record(message)
             if tool_call is not None:
                 return tool_call.to_prompt_message()
@@ -141,6 +152,15 @@ class LLMCore:
         except TypeError:
             return str(content).encode("utf-8", errors="replace").decode("utf-8")
 
+    @staticmethod
+    def _is_retryable_error(error):
+        """判断 API 错误是否可重试（5xx / 429 rate limit）"""
+        status = getattr(error, "status_code", None)
+        if status is not None:
+            return status >= 500 or status == 429
+        msg = str(error).lower()
+        return any(kw in msg for kw in ("server error", "internal error", "rate limit", "timeout", "503", "502", "500", "504", "429"))
+
     @classmethod
     def _strip_json_fence(cls, text):
         stripped = text.strip()
@@ -150,10 +170,8 @@ class LLMCore:
         return stripped
 
     def get_token_size(self, text):
-        if self.tokenizer is not None:
-            tokens = self.tokenizer(text)
-            return len(tokens["input_ids"])
-        return len(self._stringify_content(text).split())
+        from Agent.TokenEstimator import TokenEstimator
+        return TokenEstimator().estimate(text)
 
     def _prepare_local_messages(self, messages):
         prepared = []
@@ -172,6 +190,93 @@ class LLMCore:
             prepared.append(prepared_message)
         return prepared
 
+    @staticmethod
+    def _try_convert_legacy_content(role, content_str):
+        """将旧版文本格式的工具调用/工具结果转换为 Anthropic 块数组。
+
+        assistant 消息: 如果以 { 或 [ 开头，尝试解析为工具调用 → [tool_use 块]
+        user 消息:    如果以 [ 开头，尝试解析为工具结果数组 → [tool_result 块]
+        不匹配则返回原字符串。
+        """
+        stripped = content_str.strip()
+        if not stripped:
+            return None
+
+        if role == "assistant":
+            if stripped.startswith(("{", "[")):
+                # 1. 检查是否已是序列化的原生 tool_use 块数组 → 直接提取保留 ID
+                try:
+                    parsed = json.loads(stripped)
+                except (TypeError, json.JSONDecodeError):
+                    parsed = None
+                if isinstance(parsed, list):
+                    native_blocks = []
+                    for item in parsed:
+                        if isinstance(item, dict) and item.get("type") == "tool_use" and item.get("name"):
+                            native_blocks.append(item)
+                        elif isinstance(item, dict) and item.get("type") == "text":
+                            native_blocks.append(item)
+                    if native_blocks:
+                        return native_blocks
+                # 2. 尝试通过 ToolCall 解析旧格式
+                tool_calls = ToolCall.try_all_from_text(stripped)
+                if tool_calls:
+                    return [tc.to_anthropic_tool_use() for tc in tool_calls]
+            return stripped
+
+        if role == "user":
+            if stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                except (TypeError, json.JSONDecodeError):
+                    return stripped
+
+                if isinstance(parsed, list):
+                    blocks = []
+                    for item in parsed:
+                        if isinstance(item, dict) and item.get("type") == "tool_result":
+                            blocks.append(item)
+                    if blocks:
+                        return blocks
+
+            return stripped
+
+        return stripped
+
+    @staticmethod
+    def _align_converted_ids(remote_messages):
+        """修正从旧格式转换时的 tool_use_id 对齐问题。
+
+        当 assistant 消息被转换为 tool_use 块，但后续 user 消息的 tool_result
+        使用了不同的原始 ID（如 call_function_xxx）时，将 tool_use 的 id
+        替换为对应 tool_result 中的 tool_use_id，确保配对正确。
+        """
+        for i in range(len(remote_messages) - 1):
+            cur = remote_messages[i]
+            nxt = remote_messages[i + 1]
+            if cur.get("role") != "assistant" or nxt.get("role") != "user":
+                continue
+            cur_content = cur.get("content")
+            nxt_content = nxt.get("content")
+            if not isinstance(cur_content, list) or not isinstance(nxt_content, list):
+                continue
+            # Find tool_use blocks in assistant and tool_result blocks in user
+            tool_use_blocks = [b for b in cur_content if isinstance(b, dict) and b.get("type") == "tool_use"]
+            tool_result_blocks = [b for b in nxt_content if isinstance(b, dict) and b.get("type") == "tool_result"]
+            if not tool_use_blocks or not tool_result_blocks:
+                continue
+            # Check if IDs are already aligned (tool_use.id == any tool_result.tool_use_id)
+            result_ids = {b["tool_use_id"] for b in tool_result_blocks if "tool_use_id" in b}
+            already_aligned = any(b.get("id") in result_ids for b in tool_use_blocks)
+            if not already_aligned and len(tool_use_blocks) <= len(tool_result_blocks):
+                # Replace generated tool_use IDs with the actual tool_result tool_use_ids
+                for j, tu_block in enumerate(tool_use_blocks):
+                    if j < len(tool_result_blocks):
+                        tu_block["id"] = tool_result_blocks[j]["tool_use_id"]
+            elif not already_aligned and len(tool_use_blocks) == len(tool_result_blocks):
+                for j, tu_block in enumerate(tool_use_blocks):
+                    tu_block["id"] = tool_result_blocks[j]["tool_use_id"]
+
     def _prepare_anthropic_messages(self, messages):
         system_blocks = []
         remote_messages = []
@@ -189,7 +294,6 @@ class LLMCore:
 
                 block = {"type": "text", "text": content_str}
 
-                # 如果消息包含 cache_control，添加到块中
                 cache_control = message.get("cache_control")
                 if cache_control:
                     block["cache_control"] = cache_control
@@ -201,9 +305,11 @@ class LLMCore:
                 # 支持原生格式的 content（可以是字符串或块数组）
                 if isinstance(content, list):
                     # 原生格式：content 是块数组
-                    # 过滤掉空块
                     filtered_content = []
                     for block in content:
+                        # 将 Pydantic/SDK 对象转为纯 dict（保留原生 tool_use_id）
+                        if not isinstance(block, dict) and hasattr(block, "model_dump"):
+                            block = block.model_dump()
                         if isinstance(block, dict):
                             if block.get("type") == "text" and block.get("text", "").strip():
                                 filtered_content.append(block)
@@ -215,10 +321,14 @@ class LLMCore:
                     if filtered_content:
                         remote_messages.append({"role": role, "content": filtered_content})
                 else:
-                    # 文本格式：content 是字符串
+                    # 文本格式：尝试转换为原生块格式
                     content_str = self._stringify_content(content).strip()
                     if content_str:
-                        remote_messages.append({"role": role, "content": content_str})
+                        converted = self._try_convert_legacy_content(role, content_str)
+                        if isinstance(converted, list):
+                            remote_messages.append({"role": role, "content": converted})
+                        elif converted is not None:
+                            remote_messages.append({"role": role, "content": converted})
                 continue
 
             if role == "tool":
@@ -232,11 +342,16 @@ class LLMCore:
                     })
 
         if not remote_messages:
-            remote_messages.append({"role": "user", "content": "请继续。"})
+            remote_messages.append({"role": "user", "content": "Continue."})
+
+        # 修正从旧格式转换时的 tool_use_id 对齐问题
+        self._align_converted_ids(remote_messages)
 
         return system_blocks, remote_messages
 
     def _generate_local_hf(self, messages, **gen_kwargs):
+        self._last_thinking = None
+        self._last_usage = None
         prepared_messages = self._prepare_local_messages(messages)
         text = self.tokenizer.apply_chat_template(
             prepared_messages,
@@ -275,40 +390,62 @@ class LLMCore:
         return self._strip_json_fence(response)
 
     @staticmethod
+    def _extract_usage(response):
+        """Extract usage dict from Anthropic-compatible response."""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        return {
+            "input_tokens": getattr(usage, "input_tokens", 0),
+            "output_tokens": getattr(usage, "output_tokens", 0),
+            "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", 0),
+            "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", 0),
+        }
+
+    @staticmethod
     def _extract_response_text(response):
+        """
+        Extract text content from Anthropic response.
+        Returns the combined text from all 'text' blocks.
+        """
         text_parts = []
-        thinking_parts = []
+        content = getattr(response, "content", None)
 
-        for block in getattr(response, "content", None) or []:
+        for block in content or []:
             if isinstance(block, dict):
-                if block.get("type") == "text":
+                block_type = block.get("type")
+                if block_type == "text":
                     text_parts.append(block.get("text", ""))
-                elif block.get("type") == "thinking":
-                    # MiniMax 的 thinking 字段可能包含工具调用
+            else:
+                block_type = getattr(block, "type", None)
+                if block_type == "text":
+                    text_parts.append(getattr(block, "text", ""))
+
+        return "\n".join(part for part in text_parts if part).strip()
+
+    @staticmethod
+    def _extract_thinking_text(response):
+        """
+        Extract thinking content from Anthropic response.
+        Returns the combined thinking from all 'thinking' blocks, or None.
+        """
+        thinking_parts = []
+        content = getattr(response, "content", None)
+
+        for block in content or []:
+            if isinstance(block, dict):
+                if block.get("type") == "thinking":
                     thinking_parts.append(block.get("thinking", ""))
-                continue
-            if getattr(block, "type", None) == "text":
-                text_parts.append(getattr(block, "text", ""))
-            elif getattr(block, "type", None) == "thinking":
-                thinking_parts.append(getattr(block, "thinking", ""))
+            else:
+                if getattr(block, "type", None) == "thinking":
+                    thinking_parts.append(getattr(block, "thinking", ""))
 
-        response_text = "\n".join(part for part in text_parts if part).strip()
-        if response_text:
-            return response_text
-
-        # 如果没有 text 内容，尝试从 thinking 中提取
-        thinking_text = "\n".join(part for part in thinking_parts if part).strip()
-        if thinking_text:
-            return thinking_text
-
-        for attribute_name in ("text", "completion"):
-            fallback_text = getattr(response, attribute_name, None)
-            if isinstance(fallback_text, str) and fallback_text.strip():
-                return fallback_text.strip()
-
-        return ""
+        combined = "\n".join(part for part in thinking_parts if part).strip()
+        return combined or None
 
     def _generate_anthropic_compatible(self, messages, **gen_kwargs):
+        self._last_thinking = None
+        self._last_usage = None
         system_blocks, remote_messages = self._prepare_anthropic_messages(messages)
 
         request_kwargs = {
@@ -328,7 +465,7 @@ class LLMCore:
 
         # 支持工具定义（Anthropic 原生格式）
         tools = gen_kwargs.pop("tools", None)
-        if tools:
+        if tools is not None:
             request_kwargs["tools"] = tools
 
         # 支持 tool_choice 参数
@@ -337,18 +474,57 @@ class LLMCore:
             request_kwargs["tool_choice"] = tool_choice
 
         last_response = None
-        for _ in range(2):
-            last_response = self.client.messages.create(**request_kwargs)
 
-            # 如果使用了工具，返回完整的响应对象（包含 tool_use 块）
-            if tools:
-                return last_response
+        # 记录API请求
+        try:
+            from Agent.LLMResponseLogger import llm_response_logger
+            call_id = llm_response_logger.log_request(
+                messages=remote_messages,
+                system_blocks=system_blocks,
+                tools=request_kwargs.get("tools"),
+                model=request_kwargs.get("model"),
+                max_tokens=request_kwargs.get("max_tokens"),
+                temperature=request_kwargs.get("temperature"),
+                top_p=request_kwargs.get("top_p"),
+            )
+        except Exception:
+            call_id = None
 
-            # 否则提取文本内容（向后兼容）
-            response_text = self._extract_response_text(last_response)
-            if response_text:
-                return self._strip_json_fence(response_text)
-            request_kwargs["temperature"] = 0
+        try:
+            for _ in range(2):
+                try:
+                    last_response = self.client.messages.create(**request_kwargs)
+                except Exception as api_error:
+                    # 瞬态错误重试（HTTP 5xx, 429 rate limit）
+                    if self._is_retryable_error(api_error):
+                        import time as _time
+                        _time.sleep(1.0)
+                        last_response = self.client.messages.create(**request_kwargs)
+                    else:
+                        raise
+
+
+                # 记录API响应
+                if call_id is not None:
+                    try:
+                        llm_response_logger.log_response(call_id, last_response)
+                    except Exception:
+                        pass
+
+                self._last_usage = self._extract_usage(last_response)
+
+                # 如果使用了工具，返回完整的响应对象（包含 tool_use 块）
+                if tools:
+                    return last_response
+
+                # 否则提取文本内容和 thinking（向后兼容）
+                self._last_thinking = self._extract_thinking_text(last_response)
+                response_text = self._extract_response_text(last_response)
+                if response_text:
+                    return self._strip_json_fence(response_text)
+                request_kwargs["temperature"] = 0
+        except Exception:
+            raise
 
         response_payload = None
         if hasattr(last_response, "model_dump"):

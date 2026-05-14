@@ -3,7 +3,6 @@ import importlib
 from configurationLoader import config
 
 DEFAULT_BUILTIN_MODULES = ["Tools.builtin.core_tools"]
-_LOADED_MODULES = set()
 
 
 def _coerce_module_names(raw_value):
@@ -28,6 +27,5 @@ def load_builtin_tools(modules=None):
     imported_modules = []
     for module_name in get_builtin_module_names(modules):
         importlib.import_module(module_name)
-        _LOADED_MODULES.add(module_name)
         imported_modules.append(module_name)
     return imported_modules

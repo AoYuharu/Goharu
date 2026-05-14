@@ -14,18 +14,12 @@ from typing import Optional, List, Callable, Awaitable, Dict, Any
 class Platform(Enum):
     """支持的平台类型"""
     QQBOT = "qqbot"
-    TELEGRAM = "telegram"
-    DISCORD = "discord"
     LOCAL = "local"  # 用于测试
 
 
 class MessageType(Enum):
     """消息类型"""
     TEXT = "text"
-    IMAGE = "image"
-    VOICE = "voice"
-    VIDEO = "video"
-    DOCUMENT = "document"
     MIXED = "mixed"
 
 

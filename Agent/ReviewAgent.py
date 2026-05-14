@@ -1,5 +1,5 @@
 from Agent.LargeLanguageModel import LargeLanguageModel
-import json
+from Agent.json_parser import JSONParser
 
 from Prompting.PromptAssembler import PromptAssembler
 from Prompting.PromptRenderer import PromptRenderer
@@ -11,27 +11,14 @@ class ReviewAgent(LargeLanguageModel):
         self.prompt_assembler = PromptAssembler()
         self.prompt_renderer = PromptRenderer()
 
-    @staticmethod
-    def _coerce_json(text):
-        cleaned = text.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.strip("`")
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:].strip()
-        return cleaned
-
     def _query_json(self, messages):
         while True:
             ans = self.query(messages)
-
             try:
-                return json.loads(ans)
+                return JSONParser.parse_with_retry(ans)
             except Exception:
-                try:
-                    return json.loads(self._coerce_json(ans))
-                except Exception:
-                    print("[-]JSON解析失败，重新生成 review:" + ans)
-                    continue
+                print("[-]JSON解析失败，重新生成 review:" + ans)
+                continue
 
     def review_turn(self, turn_context, user_profile_context="", memory_markdown=""):
         print("[*]对本轮用户画像进行复盘:")

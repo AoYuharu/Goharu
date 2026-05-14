@@ -1,4 +1,5 @@
 from Agent.LargeLanguageModel import LargeLanguageModel
+import asyncio
 import json
 
 from Memory.ToolCall import ToolCall
@@ -23,17 +24,6 @@ class ActorAgent(LargeLanguageModel):
         llm_config = config.get("model.large-language-model", {}) or {}
         self.provider = llm_config.get("provider", "local_hf")
         self.use_native_tools = llm_config.get("use_native_tools", True)  # 默认启用原生工具调用
-
-    @staticmethod
-    def is_tool_call(text: str) -> bool:
-        return ToolCall.try_from_text(text) is not None
-
-    @staticmethod
-    def parse_tool_call(text: str):
-        call = ToolCall.try_from_text(text)
-        if call is None:
-            raise ValueError("Invalid tool call payload")
-        return call.to_payload()
 
     @staticmethod
     def _stringify_tool_result(result):
@@ -61,6 +51,9 @@ class ActorAgent(LargeLanguageModel):
         return ActorAgent._preview_text(rendered, max_length=max_length)
 
     def build_messages(self, extra_system_prompt=None):
+        return self.build_messages_with_document(extra_system_prompt)["messages"]
+
+    def build_messages_with_document(self, extra_system_prompt=None):
         tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
 
         # 初始化防护器（首次调用时）
@@ -75,7 +68,12 @@ class ActorAgent(LargeLanguageModel):
             extra_system_prompt=extra_system_prompt,
             tool_definitions=tool_definitions,
         )
-        return self.prompt_renderer.render_document(document)
+        messages = self.prompt_renderer.render_document(document)
+        return {
+            "document": document,
+            "messages": messages,
+            "tool_definitions": tool_definitions,
+        }
 
     def _convert_tools_to_anthropic_format(self, tool_definitions):
         """
@@ -106,6 +104,20 @@ class ActorAgent(LargeLanguageModel):
 
         return anthropic_tools
 
+    @staticmethod
+    def _extract_usage(response, fallback_usage=None):
+        if fallback_usage is not None:
+            return fallback_usage
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        return {
+            "input_tokens": getattr(usage, "input_tokens", 0),
+            "output_tokens": getattr(usage, "output_tokens", 0),
+            "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", 0),
+            "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", 0),
+        }
+
     def _should_use_native_tools(self):
         """判断是否应该使用 Anthropic 原生工具调用"""
         # 获取工具定义
@@ -118,26 +130,80 @@ class ActorAgent(LargeLanguageModel):
             and bool(tool_definitions)
         )
 
-    async def act(self, max_retries=3, on_tool_call_start=None):
+    @staticmethod
+    async def _run_tasks_with_interrupt(tasks: list, interrupt_check):
+        """执行一组 asyncio.Task，每隔 0.1s 检查中断标志。
+        如果中断触发，取消所有未完成任务，返回 None。
+        否则等待全部完成，返回有序结果列表。
+        """
+        remaining = list(tasks)
+        completed = {}  # task → result
+        try:
+            while remaining:
+                done, remaining = await asyncio.wait(
+                    remaining, timeout=0.1, return_when=asyncio.FIRST_COMPLETED
+                )
+                if interrupt_check and interrupt_check():
+                    for t in remaining:
+                        t.cancel()
+                    return None  # 中断，不返回结果
+                for t in done:
+                    try:
+                        completed[id(t)] = t.result()
+                    except asyncio.CancelledError:
+                        completed[id(t)] = {"error": "AbortError: User aborted"}
+                    except Exception as exc:
+                        completed[id(t)] = {"error": f"Tool execution failed: {type(exc).__name__}: {exc}"}
+            # 按原始顺序返回结果
+            return [completed[id(t)] for t in tasks]
+        except Exception:
+            for t in remaining:
+                t.cancel()
+            raise
+
+    async def act(self, max_retries=3, on_tool_call_start=None, on_thinking=None, on_tool_result=None, _interrupt_check=None):
         """
         执行一次推理，支持工具调用重试和并发执行多个工具
 
         Args:
             max_retries: 工具调用失败时的最大重试次数（防线5）
             on_tool_call_start: 工具调用开始时的回调函数，接收(tool_name, args)
+            on_thinking: 收到 thinking 块时立即回调，接收(thinking_text)，在工具执行前触发
+            on_tool_result: 单个工具执行完成时立即回调，接收(tool_name, result_text)，不等其他工具
+            _interrupt_check: 可选中断检查回调，返回 True 表示用户请求了中断
         """
+        # 确保工具定义已加载（防止首次调用来不及加载）
+        tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
+        if not tool_definitions:
+            try:
+                await self.tool_runtime.list_tools()
+                tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
+            except Exception:
+                pass
+
         # 先构建消息（这会触发工具定义的加载）
-        messages = self.build_messages()
+        build_result = self.build_messages_with_document()
+        messages = build_result["messages"]
+        tool_definitions = build_result["tool_definitions"]
 
         # 判断是否使用 Anthropic 原生工具调用
         use_native = self._should_use_native_tools()
 
         if use_native:
-            return await self._act_with_native_tools(max_retries, on_tool_call_start, messages)
+            anthropic_tools = self._convert_tools_to_anthropic_format(tool_definitions)
+            return await self._act_with_native_tools(
+                max_retries, on_tool_call_start, messages, anthropic_tools,
+                on_thinking=on_thinking, on_tool_result=on_tool_result,
+                _interrupt_check=_interrupt_check
+            )
         else:
-            return await self._act_with_text_tools(max_retries, on_tool_call_start, messages)
+            return await self._act_with_text_tools(
+                max_retries, on_tool_call_start, messages,
+                on_thinking=on_thinking, on_tool_result=on_tool_result,
+                _interrupt_check=_interrupt_check
+            )
 
-    async def _act_with_native_tools(self, max_retries=3, on_tool_call_start=None, messages=None):
+    async def _act_with_native_tools(self, max_retries=3, on_tool_call_start=None, messages=None, _reuse_tools=None, on_thinking=None, on_tool_result=None, _auto_continue_count=0, _interrupt_check=None):
         """
         使用 Anthropic 原生工具调用格式
 
@@ -146,12 +212,18 @@ class ActorAgent(LargeLanguageModel):
         - tool_choice 参数引导
         - 结构化 JSON 验证
         - 失败重试机制
+        - on_thinking / on_tool_result 回调实现实时 UI 更新
+        - max_tokens 截断自动续写（最多 2 次）
         """
         if messages is None:
             messages = self.build_messages()
 
-        tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
-        anthropic_tools = self._convert_tools_to_anthropic_format(tool_definitions)
+        # 优先使用调用方传入的工具定义（避免 TOCTOU 重复读取 last_tool_definitions）
+        if _reuse_tools is not None:
+            anthropic_tools = _reuse_tools
+        else:
+            tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
+            anthropic_tools = self._convert_tools_to_anthropic_format(tool_definitions)
 
         # 构建生成参数
         gen_kwargs = {"tools": anthropic_tools}
@@ -160,42 +232,100 @@ class ActorAgent(LargeLanguageModel):
         if max_retries == 3 and len(anthropic_tools) == 1:
             gen_kwargs["tool_choice"] = {"type": "tool", "name": anthropic_tools[0]["name"]}
 
+        # ── 中断检查：调用 LLM 之前 ──
+        if _interrupt_check and _interrupt_check():
+            return {"type": "interrupted"}
+
         # 调用 LLM
         response = self.query(messages, **gen_kwargs)
+
+        # 提取usage信息
+        usage = self._extract_usage(response)
 
         # 解析响应
         if not hasattr(response, "content"):
             # 降级到文本模式
             return await self._act_with_text_tools(max_retries, on_tool_call_start)
 
-        # 提取所有 tool_use 块
+        # 提取所有 tool_use、text、thinking 块
         tool_use_blocks = []
         text_content = []
+        thinking_content = []
 
         for block in response.content:
             block_dict = block if isinstance(block, dict) else (
                 block.model_dump() if hasattr(block, "model_dump") else {}
             )
 
-            if block_dict.get("type") == "tool_use":
+            block_type = block_dict.get("type")
+            if block_type == "tool_use":
                 tool_use_blocks.append(block_dict)
-            elif block_dict.get("type") == "text":
+            elif block_type == "text":
                 text_content.append(block_dict.get("text", ""))
+            elif block_type == "thinking":
+                thinking_content.append(block_dict.get("thinking", ""))
+
+        # 立即通过回调发出 thinking（在工具执行之前）
+        if thinking_content and on_thinking:
+            thinking_text = "\n".join(thinking_content).strip()
+            if thinking_text:
+                on_thinking(thinking_text)
+
+        # ── max_tokens 截断自动续写 ──────────────────────
+        MAX_AUTO_CONTINUE = 2
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "max_tokens" and not tool_use_blocks and _auto_continue_count < MAX_AUTO_CONTINUE:
+            # 记录截断的输出
+            if thinking_content:
+                thinking_text = "\n".join(thinking_content).strip()
+                self.working.append({"role": "assistant", "content": thinking_text})
+            if text_content:
+                self.working.append({"role": "assistant", "content": "\n".join(text_content).strip()})
+            # 注入续写指令
+            self.working.append({
+                "role": "user",
+                "content": "Continue exactly where you stopped. Do not repeat previous content."
+            })
+            new_messages = self.build_messages()
+            return await self._act_with_native_tools(
+                max_retries, on_tool_call_start, new_messages,
+                _reuse_tools=_reuse_tools,
+                on_thinking=on_thinking, on_tool_result=on_tool_result,
+                _auto_continue_count=_auto_continue_count + 1,
+                _interrupt_check=_interrupt_check
+            )
+
+        # 仅包含 thinking 块 → 模型还在思考，继续循环
+        if thinking_content and not text_content and not tool_use_blocks:
+            thinking_text = "\n".join(thinking_content).strip()
+            if thinking_text:
+                self.working.append({"role": "assistant", "content": thinking_text})
+                return {
+                    "type": "continue",
+                    "content": thinking_text,
+                    "content_preview": self._preview_text(thinking_text),
+                    "raw_reply": str(response),
+                    "usage": usage
+                }
 
         # 如果没有工具调用，返回文本答案
         if not tool_use_blocks:
             answer = "\n".join(text_content).strip()
             if answer:
                 self.working.append({"role": "assistant", "content": answer})
-                return {
+                result = {
                     "type": "answer",
                     "answer": answer,
                     "answer_preview": self._preview_text(answer),
                     "raw_reply": answer,
+                    "usage": usage
                 }
+                if thinking_content:
+                    result["thinking"] = "\n".join(thinking_content).strip()
+                return result
             # 空响应，重试
             if max_retries > 0:
-                return await self._act_with_native_tools(max_retries - 1, on_tool_call_start)
+                return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check)
             raise ValueError("模型返回空响应")
 
         # 并发执行所有工具调用
@@ -235,8 +365,18 @@ class ActorAgent(LargeLanguageModel):
                 on_tool_call_start(tool_name, args, str(tool_use_block), guard_result)
 
             # 执行工具调用
-            result = await self.tool_runtime.call_tool(tool_name, args)
+            try:
+                result = await self.tool_runtime.call_tool(tool_name, args)
+            except asyncio.CancelledError:
+                return {
+                    "error": "AbortError: User aborted",
+                    "tool_use_id": tool_use_block.get("id"),
+                }
             result_text = self._stringify_tool_result(result)
+
+            # 立即通过回调发出单个工具结果（不等其他工具）
+            if on_tool_result:
+                on_tool_result(tool_name, self._preview_text(result_text))
 
             return {
                 "tool_use_id": tool_use_block.get("id"),
@@ -247,8 +387,15 @@ class ActorAgent(LargeLanguageModel):
                 "guard_result": guard_result,
             }
 
-        # 并发执行所有工具调用
-        results = await asyncio.gather(*[execute_single_tool(block) for block in tool_use_blocks])
+        # ── 中断检查：LLM 已返回工具调用，但用户要求停止 ──
+        if _interrupt_check and _interrupt_check():
+            return {"type": "interrupted"}
+
+        # 并发执行所有工具调用（可中断）
+        tool_tasks = [asyncio.create_task(execute_single_tool(block)) for block in tool_use_blocks]
+        results = await self._run_tasks_with_interrupt(tool_tasks, _interrupt_check)
+        if results is None:
+            return {"type": "interrupted"}
 
         # 检查是否有错误
         errors = [r for r in results if "error" in r]
@@ -282,12 +429,19 @@ class ActorAgent(LargeLanguageModel):
                 }],
             })
 
-            return await self._act_with_native_tools(max_retries - 1, on_tool_call_start)
+            return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check)
 
         # 记录所有成功的工具调用到 working memory
         assistant_content = []
         user_content = []
 
+        # 1. 如果有 text 内容，先添加 text 块（保留 LLM 的说明文字）
+        if text_content:
+            text_str = "\n".join(text_content).strip()
+            if text_str:
+                assistant_content.append({"type": "text", "text": text_str})
+
+        # 2. 添加所有 tool_use 块
         for i, result in enumerate(results):
             if "error" not in result:
                 # 添加 tool_use 块
@@ -316,7 +470,7 @@ class ActorAgent(LargeLanguageModel):
             })
 
         # 返回多个工具调用的结果
-        return {
+        result = {
             "type": "tool_batch",
             "tool_calls": [
                 {
@@ -329,9 +483,14 @@ class ActorAgent(LargeLanguageModel):
                 for r in results if "error" not in r
             ],
             "raw_reply": str(response),
+            "usage": usage
         }
+        if thinking_content:
+            thinking_text = "\n".join(thinking_content).strip()
+            result["thinking"] = thinking_text
+        return result
 
-    async def _act_with_text_tools(self, max_retries=3, on_tool_call_start=None, messages=None):
+    async def _act_with_text_tools(self, max_retries=3, on_tool_call_start=None, messages=None, on_thinking=None, on_tool_result=None, _interrupt_check=None):
         """
         使用文本 JSON 格式的工具调用（向后兼容）
 
@@ -340,7 +499,17 @@ class ActorAgent(LargeLanguageModel):
         if messages is None:
             messages = self.build_messages()
 
+        # ── 中断检查：调用 LLM 之前 ──
+        if _interrupt_check and _interrupt_check():
+            return {"type": "interrupted"}
+
         reply = self.query(messages)
+        thinking = self.get_last_thinking()
+        usage = self.get_last_usage()
+
+        # 立即通过回调发出 thinking
+        if thinking and on_thinking:
+            on_thinking(thinking)
 
         # 尝试解析多个工具调用
         tool_calls = ToolCall.try_all_from_text(reply)
@@ -376,8 +545,19 @@ class ActorAgent(LargeLanguageModel):
                     on_tool_call_start(tool_name, args, reply, guard_result)
 
                 # 执行工具调用
-                result = await self.tool_runtime.call_tool(tool_name, args)
+                try:
+                    result = await self.tool_runtime.call_tool(tool_name, args)
+                except asyncio.CancelledError:
+                    return {
+                        "tool_call": tool_call_obj,
+                        "error": "AbortError: User aborted",
+                        "guard_result": guard_result
+                    }
                 result_text = self._stringify_tool_result(result)
+
+                # 立即通过回调发出单个工具结果
+                if on_tool_result:
+                    on_tool_result(tool_name, self._preview_text(result_text))
 
                 return {
                     "tool_call": tool_call_obj,
@@ -388,8 +568,15 @@ class ActorAgent(LargeLanguageModel):
                     "guard_result": guard_result
                 }
 
-            # 并发执行所有工具调用
-            results = await asyncio.gather(*[execute_single_tool(tc) for tc in tool_calls])
+            # ── 中断检查：LLM 已返回工具调用，但用户要求停止 ──
+            if _interrupt_check and _interrupt_check():
+                return {"type": "interrupted"}
+
+            # 并发执行所有工具调用（可中断）
+            tool_tasks = [asyncio.create_task(execute_single_tool(tc)) for tc in tool_calls]
+            results = await self._run_tasks_with_interrupt(tool_tasks, _interrupt_check)
+            if results is None:
+                return {"type": "interrupted"}
 
             # 检查是否有错误
             errors = [r for r in results if "error" in r]
@@ -404,7 +591,7 @@ class ActorAgent(LargeLanguageModel):
                     "role": "user",
                     "content": f"部分工具调用失败: {'; '.join(error_msgs)}\n请重新生成正确的工具调用。",
                 })
-                return await self.act(max_retries=max_retries - 1, on_tool_call_start=on_tool_call_start)
+                return await self.act(max_retries=max_retries - 1, on_tool_call_start=on_tool_call_start, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check)
 
             # 记录所有成功的工具调用到 working memory
             for result in results:
@@ -417,7 +604,7 @@ class ActorAgent(LargeLanguageModel):
                     })
 
             # 返回多个工具调用的结果
-            return {
+            result = {
                 "type": "tool_batch",
                 "tool_calls": [
                     {
@@ -430,7 +617,11 @@ class ActorAgent(LargeLanguageModel):
                     for r in results if "error" not in r
                 ],
                 "raw_reply": reply,
+                "usage": usage,
             }
+            if thinking:
+                result["thinking"] = thinking
+            return result
 
         # 尝试解析单个工具调用（向后兼容）
         tool_call = ToolCall.try_from_text(reply)
@@ -458,7 +649,7 @@ class ActorAgent(LargeLanguageModel):
                             "role": "user",
                             "content": f"工具调用失败: {error_msg}\n请重新生成正确的工具调用。",
                         })
-                        return await self.act(max_retries=max_retries - 1, on_tool_call_start=on_tool_call_start)
+                        return await self.act(max_retries=max_retries - 1, on_tool_call_start=on_tool_call_start, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check)
                     else:
                         # 重试次数耗尽，返回错误
                         error_response = f"工具调用失败（已重试 3 次）: {error_msg}"
@@ -467,6 +658,7 @@ class ActorAgent(LargeLanguageModel):
                             "type": "error",
                             "error": error_response,
                             "raw_reply": reply,
+                            "usage": usage,
                         }
 
             # 使用修复后的工具名和参数
@@ -477,8 +669,12 @@ class ActorAgent(LargeLanguageModel):
             if on_tool_call_start:
                 on_tool_call_start(tool_name, args, reply, guard_result)
 
-            # 执行工具调用
-            result = await self.tool_runtime.call_tool(tool_name, args)
+            # 执行工具调用（可中断）
+            tool_task = asyncio.create_task(self.tool_runtime.call_tool(tool_name, args))
+            results = await self._run_tasks_with_interrupt([tool_task], _interrupt_check)
+            if results is None:
+                return {"type": "interrupted"}
+            result = results[0]
             result_text = self._stringify_tool_result(result)
 
             # 检查工具执行结果是否为错误
@@ -495,7 +691,7 @@ class ActorAgent(LargeLanguageModel):
                         "role": "user",
                         "content": f"工具执行失败: {result_text}\n请检查参数并重新调用。",
                     })
-                    return await self.act(max_retries=max_retries - 1, on_tool_call_start=on_tool_call_start)
+                    return await self.act(max_retries=max_retries - 1, on_tool_call_start=on_tool_call_start, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check)
 
             # 成功执行，记录到 working memory
             self.working.append(tool_call)
@@ -514,20 +710,28 @@ class ActorAgent(LargeLanguageModel):
                         "content": warning,
                     })
 
-            return {
+            result = {
                 "type": "tool",
                 "tool_name": tool_name,
                 "arguments": args,
                 "arguments_summary": self._summarize_arguments(args),
                 "result_preview": self._preview_text(result_text),
                 "raw_reply": reply,
+                "usage": usage,
                 "guard_logs": guard_result.get("logs") if guard_result else None,
             }
+            if thinking:
+                result["thinking"] = thinking
+            return result
 
         self.working.append({"role": "assistant", "content": reply})
-        return {
+        result = {
             "type": "answer",
             "answer": reply,
             "answer_preview": self._preview_text(reply),
             "raw_reply": reply,
+            "usage": usage,
         }
+        if thinking:
+            result["thinking"] = thinking
+        return result

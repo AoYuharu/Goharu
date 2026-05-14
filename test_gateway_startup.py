@@ -1,50 +1,73 @@
+#!/usr/bin/env python3
+"""
+Simple Gateway startup test
+"""
+
 import sys
-import os
-import asyncio
+import subprocess
+import time
+from pathlib import Path
 
-sys.path.insert(0, '/root/TableHelper')
-os.chdir('/root/TableHelper')
+def test_gateway_ready():
+    """Test that gateway can start and send ready event"""
+    print("Testing Gateway startup...")
 
-print('[Test] Starting Gateway test...')
-print('[Test] Loading environment...')
+    gateway_entry = Path(__file__).parent / "TUI" / "gateway_entry.py"
 
-# Load .env
-from dotenv import load_dotenv
-load_dotenv('.env')
+    # Start gateway
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(gateway_entry)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        cwd=str(Path(__file__).parent)
+    )
 
-api_key = os.getenv('ANTHROPIC_API_KEY')
-if api_key:
-    print(f'[OK] API Key loaded: {api_key[:20]}...')
-else:
-    print('[ERROR] API Key not found')
-    sys.exit(1)
-
-print('[Test] Loading configuration...')
-from configurationLoader import Configuration
-config = Configuration('config_server.yaml')
-print(f'[OK] Config loaded')
-print(f'[OK] QQ enabled: {config.get("gateway.platforms.qq.enabled")}')
-print(f'[OK] LLM provider: {config.get("model.large-language-model.provider")}')
-
-print('[Test] Creating Gateway instance...')
-from Gateway.gateway_runner import GatewayRunner
-gateway = GatewayRunner(config)
-print('[OK] Gateway instance created')
-
-print('[Test] Starting Gateway...')
-async def test_start():
     try:
-        await gateway.start()
-        print('[OK] Gateway started successfully!')
-        print('[INFO] Waiting 10 seconds to test stability...')
-        await asyncio.sleep(10)
-        print('[OK] Gateway is stable')
-        await gateway.stop()
-        print('[OK] Gateway stopped')
-    except Exception as e:
-        print(f'[ERROR] Gateway start failed: {e}')
-        import traceback
-        traceback.print_exc()
+        # Wait for gateway.ready event (with timeout)
+        print("Waiting for gateway.ready event...")
+        start_time = time.time()
+        ready = False
 
-asyncio.run(test_start())
-print('[Test] Test complete')
+        while time.time() - start_time < 10:
+            line = proc.stdout.readline()
+            if not line:
+                time.sleep(0.1)
+                continue
+
+            print(f"Gateway: {line.strip()}")
+
+            if '"type": "gateway.ready"' in line or '"type":"gateway.ready"' in line:
+                ready = True
+                print("\n[SUCCESS] Gateway is ready!")
+                break
+
+        if not ready:
+            print("\n[FAILED] Gateway did not send ready event within 10 seconds")
+            # Print stderr
+            print("\nStderr output:")
+            while True:
+                line = proc.stderr.readline()
+                if not line:
+                    break
+                print(f"  {line.strip()}")
+            return False
+
+        return True
+
+    finally:
+        # Cleanup
+        print("\nTerminating gateway...")
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        print("Done")
+
+
+if __name__ == "__main__":
+    success = test_gateway_ready()
+    sys.exit(0 if success else 1)

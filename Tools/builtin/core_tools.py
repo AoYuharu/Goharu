@@ -1,15 +1,34 @@
 import subprocess
 import re
+import json
 
 from Tools.registry import registry
 from Tools.security import check_command_safety
+from Tools.tool_process_tracker import tool_process_tracker
+
+# 导入 file_tools 以注册文件操作工具
+import Tools.builtin.file_tools
+
+# 导入 pdf_tools 以注册 PDF 解析工具
+import Tools.builtin.pdf_tools
+
+# 导入 knowledge_tools 以注册知识管理工具
+from Tools.builtin.knowledge_tools import (
+    add_insight,
+    read_insight,
+    list_insights,
+    add_module,
+    read_module,
+    list_modules
+)
 
 
-def run_cmd(cmd: str) -> str:
+async def run_cmd(cmd: str) -> str:
     """
     Execute shell command with strict file operation restrictions and security checks.
     Blocks dangerous commands and guides to use dedicated tools.
     """
+    import asyncio
     cmd_lower = cmd.lower().strip()
 
     # 🔒 安全检查：拦截危险命令
@@ -57,136 +76,71 @@ Please use the dedicated tools instead:
 
 DO NOT retry with run_cmd. Use the dedicated tools."""
 
-    # 执行命令
-    output = subprocess.getoutput(cmd)
-    return output if output.strip() else "(no output)"
-
-
-def getKnowledge(query: str) -> str:
-    return f"Knowledge about '{query}' is not implemented yet."
-
-
-def makeClaudeSession(path: str) -> str:
-    """
-    在指定目录下打开 tmux 窗口并执行 happy 命令。
-
-    当用户说"在某个目录下开始工作"时调用此工具。
-    """
-    import subprocess
-
-    path = path.strip()
-    if not path:
-        return "Error: path cannot be empty"
-
-    # 检查 tmux 是否可用
-    tmux_check = subprocess.run(["which", "tmux"], capture_output=True)
-    if tmux_check.returncode != 0:
-        return "Error: tmux is not installed"
-
-    # 检查目录是否存在
-    import os
-    if not os.path.isdir(path):
-        return f"Error: directory '{path}' does not exist"
-
-    # 获取绝对路径
-    abs_path = os.path.abspath(path)
-
-    # 构建命令：在指定目录打开 tmux 窗口并执行 happy
-    # -c "cd to path" 确保在正确的目录
-    # happy 命令需要在新的 shell 中执行以加载环境
-    cmd = f'tmux new-window -c "{abs_path}" "happy"'
-
+    # 执行命令（带超时，默认30s，进程中组确保超时能杀死子进程树）
+    # PYTHONUNBUFFERED=1 强制 Python 子进程无缓冲输出，避免管道缓冲吞掉 print 内容
+    import os as _os
+    import locale as _locale
+    env = {**_os.environ, "PYTHONUNBUFFERED": "1"}
+    # 使用系统代码页解码（中文Windows → cp936/gbk），避免中文字符乱码
+    sys_encoding = _locale.getpreferredencoding(do_setlocale=False) or 'utf-8'
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        if result.returncode == 0:
-            return f"Success: Opened tmux session in '{abs_path}' and started happy"
-        else:
-            return f"Error: {result.stderr or result.stdout}"
-    except Exception as e:
-        return f"Error: {str(e)}"
+        p = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,  # 防止子进程等待 stdin 而卡住
+            encoding=sys_encoding,
+            errors='replace',  # 容忍解码错误，避免个别字符导致整段输出丢失
+            env=env,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        tool_process_tracker.register(p.pid)
+        try:
+            stdout, stderr = await asyncio.to_thread(p.communicate, timeout=30)
+            output = (stdout or "").strip()
+            if not output:
+                output = (stderr or "").strip()
+            return output if output else "(no output)"
+        except asyncio.CancelledError:
+            # 被用户中断，强杀子进程
+            subprocess.run(
+                ['taskkill', '/F', '/T', '/PID', str(p.pid)],
+                capture_output=True, timeout=5
+            )
+            raise
+        finally:
+            tool_process_tracker.unregister(p.pid)
+    except subprocess.TimeoutExpired:
+        # 杀死整个进程树
+        subprocess.run(
+            ['taskkill', '/F', '/T', '/PID', str(p.pid)],
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        try:
+            stdout, stderr = await asyncio.to_thread(p.communicate, timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            await asyncio.to_thread(p.communicate)
+        partial = ((stdout or "") + (stderr or "")).strip()
+        msg = "ERROR: Command timed out after 30s."
+        if partial:
+            msg += f"\nPartial output:\n{partial}"
+        return msg
 
 
-def closeClaudeSession(window_name: str = None) -> str:
-    """
-    关闭 tmux 窗口。
-
-    当用户说"关闭工作"、"结束工作"、"关闭窗口"等时调用此工具。
-    如果指定 window_name 则关闭指定窗口，否则关闭当前窗口。
-    """
-    import subprocess
-
-    if window_name:
-        cmd = f'tmux kill-window -t "{window_name}"'
-    else:
-        cmd = 'tmux kill-window'
-
-    try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        if result.returncode == 0:
-            target = window_name or "current window"
-            return f"Success: Closed tmux {target}"
-        else:
-            return f"Error: {result.stderr or result.stdout}"
-    except Exception as e:
-        return f"Error: {str(e)}"
 
 
 registry.register(
     name="run_cmd",
-    description="""Run shell command on Windows (cmd.exe).
-
-⚠️ WARNING: This tool should be used SPARINGLY and ONLY for system operations.
-
-🔒 SECURITY RESTRICTIONS:
-
-1. DANGEROUS COMMANDS (BLOCKED):
-   - System shutdown/restart: shutdown, reboot, poweroff
-   - Destructive deletion: rm -rf, del /s /q, format
-   - Disk operations: fdisk, diskpart, dd
-   - Registry modifications: reg delete, reg add
-   - Privilege escalation: sudo, runas
-   - These commands will be REJECTED with a security error
-
-2. FILE OPERATIONS (BLOCKED):
-   - This tool will REJECT any echo, cat, head, tail, sed, awk commands
-   - Attempting to use these commands will return an error message
-   - You MUST use dedicated tools (Write, Read, Edit, Grep) for file operations
-   - There are NO exceptions to this rule
-
-3. CONFIRMATION REQUIRED (CONFIGURABLE):
-   - Some commands may require explicit user confirmation
-   - Check config.yaml tools.security settings for details
-
-Why Use Dedicated Tools:
-- Write tool: Creates new files safely (prevents accidental overwrites)
-- Read tool: Reads files and grants Edit permission
-- Edit tool: Patch-style editing (ensures you know what you're changing)
-- Grep tool: Searches files efficiently
-- These tools provide better error messages, safety checks, and user experience
-
-Allowed Use Cases for run_cmd:
-- System operations: dir, mkdir, copy, move (non-destructive)
-- Check file existence: if exist file.txt echo exists
-- Run scripts: python script.py, powershell -File script.ps1
-- Process management: tasklist (read-only)
-- Network operations: ping, ipconfig (read-only)
-
-IMPORTANT - Windows Environment:
-- This is a Windows system, use Windows command syntax
-- DO NOT use Unix commands: ls, cat, printf, touch, rm, etc.
-- DO NOT use heredoc syntax (<<EOF)
-
-Before using run_cmd, ask yourself:
-1. Can I use Write, Read, Edit, or Grep instead? (If yes, use them)
-2. Is this a system operation that dedicated tools cannot handle? (If no, don't use run_cmd)
-3. Am I trying to work around the file operation restrictions? (If yes, STOP and use dedicated tools)
-4. Is this command potentially dangerous? (If yes, it will be blocked)""",
+    description="Execute a shell command on Windows (cmd.exe). ONLY for system operations that dedicated file tools (Write/Read/Edit/Grep) cannot handle.",
     arguments_schema={
         "type": "object",
         "properties": {
             "cmd": {
                 "type": "string",
-                "description": "Windows shell command (ONLY for safe system operations, NOT for file operations or dangerous commands)",
+                "description": "Windows shell command. Examples: 'dir /b', 'mkdir new_folder', 'python script.py', 'pip install requests'. BLOCKED: shutdown, rm -rf, format, diskpart, del /s, reg delete, sudo. BLOCKED file ops: echo >, cat, sed, awk, type | (use Write/Read/Edit/Grep instead). Use Windows syntax, not Unix.",
             },
         },
         "required": ["cmd"],
@@ -195,69 +149,147 @@ Before using run_cmd, ask yourself:
     group="core",
 )
 
+
+
+# 导入 system_info_tool 以注册 get_system_info 工具
+try:
+    import Tools.builtin.system_info_tool
+except ImportError as e:
+    print(f"Warning: Failed to import system_info_tool: {e}")
+    pass
+
+
+# ==================== 知识管理工具注册 ====================
+
 registry.register(
-    name="getKnowledge",
-    description="Get knowledge from local files (stub implementation)",
+    name="AddInsight",
+    description="Add a research insight/innovation point to the knowledge base. Records core insights, methods, and experimental design ideas from papers for reuse.",
     arguments_schema={
         "type": "object",
         "properties": {
-            "query": {
+            "paper_id": {"type": "string", "description": "Paper ID (e.g. 'paper_001')."},
+            "title": {"type": "string", "description": "Insight title, concise (e.g. 'Depth-wise connections improve representation')."},
+            "description": {"type": "string", "description": "Detailed description including principle and implementation."},
+            "impact": {"type": "string", "description": "Significance and contribution to the field."},
+            "category": {
                 "type": "string",
-                "description": "要检索的知识查询",
+                "description": "Category: method / architecture / training / evaluation / general.",
+                "enum": ["method", "architecture", "training", "evaluation", "general"]
             },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Tags for retrieval (optional)."
+            },
+            "related_papers": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Related paper IDs (optional)."
+            }
         },
-        "required": ["query"],
+        "required": ["paper_id", "title", "description", "impact"]
     },
-    handler=getKnowledge,
-    group="core",
+    handler=lambda **kwargs: json.dumps(add_insight(**kwargs), ensure_ascii=False),
+    group="knowledge"
 )
 
 registry.register(
-    name="makeClaudeSession",
-    description="""在指定目录下打开 tmux 窗口并执行 happy 命令。
-
-当用户说"在某个目录下开始工作"、"我要开始工作了"、"开始工作吧"等类似表达时，调用此工具。
-
-参数：
-- path: 工作目录的绝对路径
-
-示例调用：
-{"tool": "makeClaudeSession", "arguments": {"path": "/root/TableHelper"}}""",
+    name="ReadInsight",
+    description="Read all insights for a given paper. Returns JSON with insight data.",
     arguments_schema={
         "type": "object",
         "properties": {
-            "path": {
-                "type": "string",
-                "description": "工作目录的绝对路径",
-            },
+            "paper_id": {"type": "string", "description": "Paper ID (e.g. 'paper_001')."}
         },
-        "required": ["path"],
+        "required": ["paper_id"]
     },
-    handler=makeClaudeSession,
-    group="core",
+    handler=lambda paper_id: json.dumps(read_insight(paper_id), ensure_ascii=False),
+    group="knowledge"
 )
 
 registry.register(
-    name="closeClaudeSession",
-    description="""关闭 tmux 窗口。
-
-当用户说"关闭工作"、"结束工作"、"关闭窗口"等类似表达时，调用此工具。
-
-参数：
-- window_name (可选): 要关闭的窗口名称，不指定则关闭当前窗口
-
-示例调用：
-{"tool": "closeClaudeSession", "arguments": {}}
-{"tool": "closeClaudeSession", "arguments": {"window_name": "work"}}""",
+    name="ListInsights",
+    description="List all insights, optionally filtered by category and tags.",
     arguments_schema={
         "type": "object",
         "properties": {
-            "window_name": {
-                "type": "string",
-                "description": "要关闭的 tmux 窗口名称（可选，不指定则关闭当前窗口）",
+            "category": {"type": "string", "description": "Filter by category: method/architecture/training/evaluation/general."},
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Filter by tags (optional)."
             },
-        },
+            "limit": {"type": "integer", "description": "Max results.", "default": 50}
+        }
     },
-    handler=closeClaudeSession,
-    group="core",
+    handler=lambda **kwargs: json.dumps(list_insights(**kwargs), ensure_ascii=False),
+    group="knowledge"
+)
+
+registry.register(
+    name="AddModule",
+    description="Add a technical module to the knowledge base. Records reusable module implementations (only use when paper provides a GitHub link).",
+    arguments_schema={
+        "type": "object",
+        "properties": {
+            "paper_id": {"type": "string", "description": "Paper ID (e.g. 'paper_001')."},
+            "module_name": {"type": "string", "description": "Module name (e.g. 'Depth-Connections')."},
+            "category": {
+                "type": "string",
+                "description": "Category: Core_Mechanisms / Efficiency / Architecture.",
+                "enum": ["Core_Mechanisms", "Efficiency", "Architecture"]
+            },
+            "principle": {"type": "string", "description": "Core principle in one sentence."},
+            "description": {"type": "string", "description": "Detailed description."},
+            "formula": {"type": "string", "description": "Key formula (optional)."},
+            "complexity": {"type": "string", "description": "Time complexity (optional)."},
+            "code_path": {"type": "string", "description": "Code path relative to module directory (optional)."},
+            "github_url": {"type": "string", "description": "GitHub repo URL (optional)."},
+            "use_cases": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Application scenarios (optional)."
+            },
+            "dependencies": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Dependent modules (optional)."
+            }
+        },
+        "required": ["paper_id", "module_name", "category", "principle", "description"]
+    },
+    handler=lambda **kwargs: json.dumps(add_module(**kwargs), ensure_ascii=False),
+    group="knowledge"
+)
+
+registry.register(
+    name="ReadModule",
+    description="Read module details for a paper. Returns JSON with module data.",
+    arguments_schema={
+        "type": "object",
+        "properties": {
+            "paper_id": {"type": "string", "description": "Paper ID (e.g. 'paper_001')."},
+            "module_name": {"type": "string", "description": "Module name (e.g. 'Depth-Connections')."}
+        },
+        "required": ["paper_id", "module_name"]
+    },
+    handler=lambda paper_id, module_name: json.dumps(
+        read_module(paper_id, module_name), ensure_ascii=False
+    ),
+    group="knowledge"
+)
+
+registry.register(
+    name="ListModules",
+    description="List all modules, optionally filtered by category or paper.",
+    arguments_schema={
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "description": "Filter by category: Core_Mechanisms/Efficiency/Architecture."},
+            "paper_id": {"type": "string", "description": "Filter by paper ID (optional)."},
+            "limit": {"type": "integer", "description": "Max results.", "default": 50}
+        }
+    },
+    handler=lambda **kwargs: json.dumps(list_modules(**kwargs), ensure_ascii=False),
+    group="knowledge"
 )

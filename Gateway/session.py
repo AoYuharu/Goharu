@@ -131,21 +131,23 @@ def build_session_context_prompt(context: SessionContext) -> str:
     # 基础信息
     prompt = f"You are currently in a {source.chat_type} conversation"
 
+    user_context = ""
     if source.chat_type == "dm":
-        prompt += f" with {source.user_name or 'a user'}"
+        user_context = f" with {source.user_name or 'a user'}"
     elif source.chat_type == "group":
         prompt += f" in group '{source.chat_name or 'unknown'}'"
         if not context.shared_multi_user_session:
-            prompt += f" (private session with {source.user_name})"
+            user_context = f" (private session with {source.user_name})"
 
     # 平台信息
-    prompt += f" on {source.platform.value}"
+    platform_info = f" on {source.platform.value}"
 
     # 可用平台
+    connected_platforms = ""
     if context.connected_platforms:
-        prompt += f"\n\nConnected platforms: {', '.join(context.connected_platforms)}"
+        connected_platforms = f"\n\nConnected platforms: {', '.join(context.connected_platforms)}"
 
-    return prompt
+    return prompt + user_context + platform_info + connected_platforms
 
 
 class SessionStore:
@@ -418,14 +420,3 @@ class SessionStore:
                 self._save()
                 return entry
             return None
-
-    def list_sessions(self) -> List[SessionEntry]:
-        """
-        列出所有会话
-
-        Returns:
-            List[SessionEntry]: 会话列表
-        """
-        with self._lock:
-            self._ensure_loaded_locked()
-            return list(self._entries.values())

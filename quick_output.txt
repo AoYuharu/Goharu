@@ -1,0 +1,6 @@
+Hello from Python!
+Value: 42
+0
+1
+2
+Done!

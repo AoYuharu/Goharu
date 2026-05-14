@@ -337,14 +337,6 @@ class QQAdapter(BasePlatformAdapter):
             gateway_url = data.get("url", "wss://api.sgroup.qq.com/websocket")
             return gateway_url
 
-            if response.status_code != 200:
-                print(f"[QQAdapter] Failed to get gateway URL, using default")
-                return "wss://api.sgroup.qq.com/websocket"
-
-            data = response.json()
-            gateway_url = data.get("url", "wss://api.sgroup.qq.com/websocket")
-            return gateway_url
-
     async def _heartbeat_loop(self, interval: float) -> None:
         """心跳循环"""
         try:

@@ -230,6 +230,17 @@ async def Read(path: str, start_line: int = 1, end_line: int | None = None, acto
     if end_line is not None and end_line < start_line:
         return _error("end_line 必须大于等于 start_line")
 
+    # 限制单次最多读取 300 行
+    MAX_READ_LINES = 300
+    if end_line is None:
+        end_line = start_line + MAX_READ_LINES - 1
+    elif end_line - start_line + 1 > MAX_READ_LINES:
+        return _error(
+            f"单次最多读取 {MAX_READ_LINES} 行",
+            requested=end_line - start_line + 1,
+            hint=f"请分批读取，例如先 Read start_line={start_line}, end_line={start_line + MAX_READ_LINES - 1}",
+        )
+
     file_key = _file_state.normalize_path(str(path_obj))
     blocked = await _file_state.acquire_read(file_key, actor_id)
     if blocked is not None:
@@ -238,7 +249,7 @@ async def Read(path: str, start_line: int = 1, end_line: int | None = None, acto
     try:
         lines, _, _ = _read_file_text(path_obj)
         total_lines = len(lines)
-        actual_end = total_lines if end_line is None else min(end_line, total_lines)
+        actual_end = min(end_line, total_lines)
         if start_line > total_lines:
             content = []
             actual_end = total_lines
@@ -367,38 +378,14 @@ async def Edit(
 
 registry.register(
     name="Grep",
-    description="""A powerful search tool for finding text in files.
-
-Usage:
-- ALWAYS use Grep for search tasks. NEVER invoke `grep` or similar commands via run_cmd. The Grep tool has been optimized for correct permissions and access.
-- Searches for text patterns in file contents and returns matching file paths, line numbers, and line content
-- Filter by file or directory with path parameter (default: current directory)
-- Case-sensitive by default (set case_sensitive=false for case-insensitive search)
-- Results are limited to 100 matches by default to prevent context bloat
-- Use Glob tool to find files by name patterns, use Grep to search file contents
-
-Important Notes:
-- Grep is read-only and does NOT grant Edit permission (you must use Read tool before Edit)
-- Returns 1-based line numbers for easy reference
-- Automatically skips binary files and common cache directories
-- For open-ended searches requiring multiple rounds, consider using a more targeted approach
-
-Pattern Examples:
-- "error" - Find all occurrences of "error"
-- "function.*main" - Find lines matching regex pattern (basic regex supported)
-- "TODO" - Find all TODO comments
-
-Performance:
-- Fast for any codebase size
-- More efficient than reading files one by one
-- Suitable for exploratory searches and code discovery""",
+    description="Search file contents for a text pattern. Returns matching file paths, line numbers, and content. Read-only, does NOT grant Edit permission.",
     arguments_schema={
         "type": "object",
         "properties": {
-            "pattern": {"type": "string", "description": "Text pattern to search for (supports basic regex)"},
-            "path": {"type": "string", "description": "File or directory to search in. Defaults to current directory if not specified."},
-            "case_sensitive": {"type": "boolean", "description": "Case sensitive search. Defaults to true."},
-            "max_results": {"type": "integer", "description": "Maximum number of results to return. Defaults to 100."},
+            "pattern": {"type": "string", "description": "Text pattern to search for. Supports basic regex (e.g. 'error', 'function.*main', 'TODO')."},
+            "path": {"type": "string", "description": "File or directory to search in. Default: current directory."},
+            "case_sensitive": {"type": "boolean", "description": "Case-sensitive search.", "default": True},
+            "max_results": {"type": "integer", "description": "Max results returned.", "default": 100},
         },
         "required": ["pattern"],
     },
@@ -408,43 +395,13 @@ Performance:
 
 registry.register(
     name="Read",
-    description="""Read a file from the local filesystem. You can access any file directly by using this tool.
-
-Usage:
-- The path parameter must be an absolute path, not a relative path
-- By default, reads the entire file from beginning to end
-- You can optionally specify a line range with start_line and end_line (especially handy for long files), but it's recommended to read the whole file by not providing these parameters
-- Results are returned with 1-based line numbers for easy reference
-- Returns file path, total lines, and line-by-line content in JSON format
-
-Important Notes:
-- This tool can only read files, not directories. To list directory contents, use run_cmd with appropriate commands.
-- After successful read, the range is recorded and grants Edit permission for that file
-- Edit can ONLY modify files that have been Read first (Grep does NOT grant Edit permission)
-- If you read a file that exists but has empty contents, you will receive an error message
-- Assume this tool is able to read all files on the machine. If the user provides a path to a file, assume that path is valid.
-
-Read + Edit Workflow:
-1. First, use Read to view the file content
-2. Then, use Edit to modify the file (requires exact old_string match)
-3. Read grants Edit permission, Grep does not
-
-Line Range Examples:
-- Read(path="file.txt") - Read entire file
-- Read(path="file.txt", start_line=1, end_line=50) - Read first 50 lines
-- Read(path="file.txt", start_line=100, end_line=200) - Read lines 100-200
-
-Performance:
-- Fast for files of any size
-- Use line ranges for very large files to avoid context bloat
-- Concurrent reads are safe (multiple actors can read the same file simultaneously)""",
+    description="Read a file from the local filesystem. Returns line-by-line content with 1-based line numbers. After reading, grants Edit permission for that file. Cannot read directories (use run_cmd dir instead). MAX 300 lines per call: if end_line is omitted, defaults to start_line+299; if range exceeds 300 lines, returns an error. Use multiple calls with different start_line/end_line to read large files.",
     arguments_schema={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Absolute file path to read"},
-            "start_line": {"type": "integer", "description": "Start line number (1-based). Defaults to 1 if not specified."},
-            "end_line": {"type": "integer", "description": "End line number (1-based), inclusive. Omit to read to end of file."},
-            "actor_id": {"type": "string", "description": "Actor identifier for concurrency control. Defaults to 'agent'."},
+            "path": {"type": "string", "description": "Absolute file path to read (e.g. 'C:/project/main.py')."},
+            "start_line": {"type": "integer", "description": "Start line number (1-based). Default: 1 (beginning)."},
+            "end_line": {"type": "integer", "description": "End line number (1-based, inclusive). Default: start_line+299 (max 300 lines total). Range cannot exceed 300 lines."},
         },
         "required": ["path"],
     },
@@ -454,19 +411,12 @@ Performance:
 
 registry.register(
     name="Write",
-    description=(
-        "Create a new file with the given content. "
-        "Required: path, content. "
-        "IMPORTANT: This tool can ONLY create new files. If the file already exists, it will fail. "
-        "To modify existing files, use Read + Edit instead. "
-        "The file will be created with UTF-8 encoding and LF line endings by default."
-    ),
+    description="Create a new file. ONLY creates new files (fails if file exists). For modifying existing files, use Read + Edit instead. UTF-8 encoding, LF line endings.",
     arguments_schema={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "File path to create (must not exist)"},
-            "content": {"type": "string", "description": "File content to write"},
-            "actor_id": {"type": "string", "description": "Actor identifier, default 'agent'"},
+            "path": {"type": "string", "description": "File path to create (must NOT already exist). Example: 'C:/project/new_file.py'."},
+            "content": {"type": "string", "description": "Full file content to write."},
         },
         "required": ["path", "content"],
     },
@@ -476,24 +426,13 @@ registry.register(
 
 registry.register(
     name="Edit",
-    description=(
-        "Edit file by replacing old_string with new_string (patch-style, like git diff). "
-        "Required: path, old_string, new_string. "
-        "IMPORTANT: "
-        "1. You must Read the file first to see its content. "
-        "2. old_string must exist in the file and be unique (appear exactly once). "
-        "3. old_string must match EXACTLY (including whitespace, indentation, line breaks). "
-        "4. If old_string appears multiple times, provide more context to make it unique. "
-        "5. Grep does not grant Edit permission - you must use Read. "
-        "This is a safer way to edit files as it ensures you know what you're changing."
-    ),
+    description="Edit a file by replacing exact old_string with new_string (patch-style, like git diff). Requires Read first (Grep does NOT grant permission). old_string must appear exactly once and match EXACTLY including whitespace.",
     arguments_schema={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "File path to modify"},
-            "old_string": {"type": "string", "description": "Exact string to find and replace (must be unique in file)"},
-            "new_string": {"type": "string", "description": "New string to replace old_string with"},
-            "actor_id": {"type": "string", "description": "Actor identifier, default 'agent'"},
+            "path": {"type": "string", "description": "File path to modify (must have been Read first)."},
+            "old_string": {"type": "string", "description": "Exact text to replace. Must match whitespace/indentation exactly. Must be unique in file. Include surrounding lines for uniqueness if needed."},
+            "new_string": {"type": "string", "description": "Replacement text."},
         },
         "required": ["path", "old_string", "new_string"],
     },

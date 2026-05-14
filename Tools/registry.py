@@ -151,20 +151,5 @@ class ToolRegistry:
         except Exception as exc:
             return self._error_result(f"Tool execution failed: {type(exc).__name__}: {exc}")
 
-    def dispatch_sync(self, name, arguments=None):
-        entry = self.get_entry(name)
-        if entry is None:
-            return self._error_result(f"Unknown tool: {name}")
-
-        try:
-            validated_arguments = self._validate_arguments(entry, arguments)
-            if entry.is_async:
-                return self._run_async(entry.handler(**validated_arguments))
-            return entry.handler(**validated_arguments)
-        except ToolValidationError as exc:
-            return self._error_result(exc)
-        except Exception as exc:
-            return self._error_result(f"Tool execution failed: {type(exc).__name__}: {exc}")
-
 
 registry = ToolRegistry()

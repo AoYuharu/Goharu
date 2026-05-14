@@ -5,34 +5,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Install dependencies from the checked-in requirements file:
   - `pip install -r requirements.txt`
-- Run the main MCP-enabled agent CLI:
-  - `python main.py`
-- Interactive commands available in `main.py`:
-  - `/help` - Show help message
-  - `/multi` - Enter multiline input mode
-  - `/context` - Show the current context structure (message count, roles, and previews)
-  - `/sysprompt` - Show the complete system prompt sections sent to the LLM
-  - `/clear` - Clear the current session context
-  - `/interrupt` - Interrupt the current agent execution
-  - `/exit` or `/quit` - Exit the application
+- Run the TUI application (primary entrypoint):
+  - `python run_tui.py`
+- TUI keyboard shortcuts:
+  - `Ctrl+C` — Quit
+  - `Ctrl+L` — Clear chat
+  - `Ctrl+H` — Toggle help
 
 There is no repo-defined `pytest`/`unittest` test suite, lint configuration, or formatter configuration. The testing approach is:
 
 **Interactive code** (has `input()`, GUI, infinite loops): Create standalone test files (e.g., `test_xxx.py`) that test core functions without running the interactive loop. Run specific tests directly with `python test_xxx.py`.
 **Standalone scripts** (pure functions/classes): Run directly with `python script.py`.
 
-The `reflection_mode: answer_review` in `config.yaml` is the current default. In this mode, `Agent/answer_review_flow.py` handles the actor→reflection→answer cycle, with `FileStateManager` tracking which files have been read/modified to avoid redundant operations.
+The `reflection_mode: never` in `config.yaml` is the current default. Other modes include `always` (reflect after every step) and `answer_review` (review before final answer via `Agent/answer_review_flow.py`).
 
 ## Architecture
 
-- `main.py` is the primary runtime entrypoint.
-  - `run_agent()` appends the user message to memory, loops up to `config.get("mcp.maxDepth")`, asks `ActorAgent.act()` to either answer or call a tool, runs `ReflectionAgent.reflect()` after each step, and then forces one final answer pass from the accumulated working-memory context.
-  - `main()` starts an MCP stdio client using `mcp.executor` and `mcp.args` from `config.yaml`, creates `MemoryManager`, `ActorAgent`, and `ReflectionAgent`, and then runs the interactive loop.
-  - Two execution modes selected by `mcp.reflection_mode`: the older `run_agent()` loop and the newer `answer_review_flow.py` (current default).
+- `run_tui.py` is the primary runtime entrypoint.
+  - Launches a Textual TUI (`TUI/app.py`) which starts the agent backend as a subprocess (`TUI/gateway_entry.py`) and communicates via JSON-RPC over stdio.
+  - `TUI/gateway_entry.py` initializes `MemoryManager`, `ActorAgent`, `ReflectionAgent`, and the in-process tool runtime, then runs the agent loop in `GatewaySession.process_message()`.
+  - The shared agent execution loop (`Agent/agent_loop.py`) is used by the Gateway path (`Gateway/agent_bridge.py`) and answer-review flow.
+  - Three execution modes selected by `agent.reflection_mode`: `never` (no reflection), `always` (reflect after every step), and `answer_review` (review before final answer via `Agent/answer_review_flow.py`).
 
 - `Agent/LargeLanguageModel.py` is a thin wrapper over the singleton `Agent/LLMCore.py`.
-  - `LLMCore` loads the base Qwen model and tokenizer from `config.yaml` and applies 4-bit quantization.
   - `LargeLanguageModel.query()` delegates to `LLMCore.generate()`.
+  - `LLMCore` supports two providers: `anthropic_compatible` (Anthropic-compatible API) and `local_hf` (local HuggingFace model, optionally 4-bit quantized).
 
 - Prompt locations are split by role.
   - Tool-use prompt: `Agent/ActorAgent.py`
@@ -45,9 +42,8 @@ The `reflection_mode: answer_review` in `config.yaml` is the current default. In
   - `MemoryManager.detectOverflow()` checks for expired daily files based on `memory.daily.retention_days`, summarizes one expired day through `SummarizeAgent`, updates long-term memory, and deletes that daily file.
   - Main answer generation builds prompts through `MemoryManager.get_prompt_context()`, which injects the actor system prompt, then `MEMORY.md`, then recent working-memory messages, and finally any extra system prompt.
 
-- MCP/tooling is separate from the model runtime.
-  - `MCP/MCP.py` exposes file operation tools (`Read`, `Write`, `Edit`, `Grep`) and `run_cmd` via FastMCP.
-  - `main.py` connects to that MCP server over stdio using the executor and args configured in `config.yaml`.
+- All tools run in-process through `Tools.runtime.InProcessToolRuntime`.
+  - `Tools/builtin/` contains all built-in tools loaded via `config.yaml` → `tools.builtin_modules`.
   - **Security layer**: `Tools/security.py` implements command safety checks for `run_cmd`
   - **Dangerous commands blocked**: shutdown, restart, rm -rf, del /s, format, diskpart, reg delete, etc.
   - **Configuration**: Security settings in `config.yaml` under `tools.security`
@@ -78,19 +74,19 @@ The `reflection_mode: answer_review` in `config.yaml` is the current default. In
   - **Not cached**: Latest conversation turn (current user input and ongoing responses)
   - Cache TTL: 5 minutes (Anthropic default)
   - Expected benefits: ~85-90% cost reduction on cached tokens, faster first-token latency
-  - Implementation: `cache_control: {"type": "ephemeral"}` on PromptSection → PromptRenderer → LLMCore
+  - Implementation: `cache_control: {"type": "ephemeral"}` on PromptSection `→` PromptRenderer `→` LLMCore (Anthropic path only)
   - Test: Run `python test_multilevel_cache.py` to verify caching strategy
   - Documentation: See `docs/multilevel_cache.md` for detailed implementation guide
 
 - Retrieval/RAG code exists, but it is not integrated into the main agent flow.
   - `MCP/RAG.py` contains standalone embedding, Milvus, and reranking code.
-  - The MCP `getKnowledge` implementation in `MCP/MCP.py` is still a stub, and `main.py` does not wire `MCP/RAG.py` into the main loop.
+  - The knowledge tools (`Tools/builtin/knowledge_tools.py`) provide the interface to the knowledge management system.
 
 ## Important repository specifics
 
-- `config.yaml` controls model paths, memory paths and retention, MCP executor/args, and the retained embedding/rerank settings for the unused RAG shell. The checked-in paths are Windows-specific absolute local paths.
+- `config.yaml` controls model paths, memory paths and retention, tool settings, and the retained embedding/rerank settings for the unused RAG shell. The checked-in paths are Windows-specific absolute local paths.
 - This repository is centered on local agent/runtime code. Fine-tuning scripts and runtime LoRA loading have been removed.
-- `main.py` is the active execution mode: MCP-enabled multi-step agent workflow with actor/reflection/memory management
+- `run_tui.py` is the active execution mode: TUI-based multi-step agent workflow with actor/reflection/memory management
 
 ## 开发理念
 - **模块化**：将代码分解为独立的模块和类，以便于理解和维护与后期延展
@@ -98,6 +94,11 @@ The `reflection_mode: answer_review` in `config.yaml` is the current default. In
 - **单元测试与验收测试**：添加小模块后对小模块进行全面的单元测试，与整体耦合结束后主动启动项目对模型进行询问与成果验收(必须要能够得到模型回复，才算是对话成功)
 - **仔细思考**：当收到用户的需求，对每个需求进行详细思考，如果有不明确的地方应该**主动向用户提问，排除模糊点再修改**，而不是直接进行假设并编写代码
 - **最简开发**：在完成需求的前提下，尽量减少代码量，避免任何过度设计
+- **全面日志**：在添加任何新模块的时候，一定要写详尽的日志，以便后期查日志了解问题
+
+## 用户交互
+- **默认最简回答：**当用户询问问题的时候，默认进行简要的关键点回答，回答尽量简练明确重点，不要长篇大论分点
+- **用户辅助排查错误时：**给用户最真实的LOG日志以及问题点（可能是代码，也可能是提示词等），告诉问题所在，简要给出解决方案
 
 ## 测试策略（针对交互式代码）
 模型在测试代码时会根据代码类型选择合适的策略：

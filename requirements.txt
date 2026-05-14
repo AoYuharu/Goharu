@@ -14,3 +14,13 @@ tqdm
 nltk
 rich
 nest_asyncio
+
+# ACP HTTP Server 依赖
+aiohttp>=3.9.0
+requests>=2.31.0
+
+# PDF解析依赖
+PyMuPDF>=1.23.0
+pdfplumber>=0.10.0
+Pillow>=10.0.0
+pytesseract>=0.3.10

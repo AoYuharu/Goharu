@@ -152,7 +152,7 @@ class AgentDelegateManager:
 _manager = AgentDelegateManager()
 
 
-def _execute_subagent_task(agent_type: str, task: str, agent_id: str, tools_registry, output_callback=None) -> Dict[str, Any]:
+def _execute_subagent_task(agent_type: str, task: str, agent_id: str, tools_registry, output_callback=None, shared_state=None) -> Dict[str, Any]:
     """
     在线程中执行子agent任务
 
@@ -162,6 +162,7 @@ def _execute_subagent_task(agent_type: str, task: str, agent_id: str, tools_regi
         agent_id: agent ID
         tools_registry: 工具注册表
         output_callback: 输出回调函数
+        shared_state: 跨线程共享状态 dict，用于超时后提取最后文本
 
     Returns:
         执行结果
@@ -178,7 +179,8 @@ def _execute_subagent_task(agent_type: str, task: str, agent_id: str, tools_regi
             task=task,
             agent_id=agent_id,
             tools_registry=tools_registry,
-            output_callback=output_callback
+            output_callback=output_callback,
+            shared_state=shared_state,
         )
 
         # 执行任务
@@ -258,6 +260,9 @@ async def AgentDelegate(
     loop = asyncio.get_event_loop()
     timeout = _manager.get_timeout()
 
+    # 跨线程共享状态：子agent线程写入 last_text_answer，超时后主线程读取
+    shared_state = {}
+
     try:
         # 使用 run_in_executor 异步执行（不阻塞事件循环）
         result = await asyncio.wait_for(
@@ -268,21 +273,37 @@ async def AgentDelegate(
                 task,
                 agent_id,
                 tools_registry_instance,
-                _manager.output_callback
+                _manager.output_callback,
+                shared_state,
             ),
             timeout=timeout
         )
     except asyncio.TimeoutError:
-        result = {
-            "agent_id": agent_id,
-            "agent_type": agent_type,
-            "status": "error",
-            "content": "",
-            "error": f"子agent执行超时（{timeout}秒）",
-            "token_count": 0,
-            "duration_ms": 0,
-            "tool_calls_count": 0
-        }
+        # 超时：尝试从共享状态提取子agent最后一条文本/思考
+        last_text = shared_state.get("last_text_answer")
+        if last_text:
+            result = {
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "status": "partial",
+                "content": last_text,
+                "warning": f"子agent执行超时（{timeout}秒），返回最后一条文本内容",
+                "token_count": 0,
+                "duration_ms": int(timeout * 1000),
+                "tool_calls_count": 0,
+                "iterations": 0,
+            }
+        else:
+            result = {
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "status": "error",
+                "content": "",
+                "error": f"子agent执行超时（{timeout}秒），且未获取到任何文本输出",
+                "token_count": 0,
+                "duration_ms": 0,
+                "tool_calls_count": 0,
+            }
     except Exception as e:
         result = {
             "agent_id": agent_id,
@@ -302,12 +323,35 @@ async def AgentDelegate(
         _manager.unregister_task(agent_type, task)
 
         # 通知完成
-        status_icon = "✅" if result.get("status") == "success" else "❌"
+        if result.get("status") == "success":
+            status_icon = "✅"
+        elif result.get("status") == "partial":
+            status_icon = "⚠️"
+        else:
+            status_icon = "❌"
         _manager.notify_output(f"{status_icon} {agent_type} agent [{agent_id}] 完成", "info")
 
     # 添加总体统计
     total_duration = int((time.time() - start_time) * 1000)
     result["total_duration_ms"] = total_duration
+
+    # 错误结果使用突出的格式，确保主 LLM 无法忽略
+    if result.get("status") == "error":
+        return (
+            f"=== SUBAGENT FAILED ===\n"
+            f"Agent: {result.get('agent_id')} ({result.get('agent_type')})\n"
+            f"Error: {result.get('error')}\n"
+            f"Duration: {total_duration}ms\n"
+            f"=== DO NOT RETRY THIS SUBAGENT - IT HAS ALREADY FAILED ===\n\n"
+            f"Raw result:\n{json.dumps(result, ensure_ascii=False, indent=2)}"
+        )
+
+    # partial 和 success 统一返回 JSON
+    if result.get("status") == "partial" and result.get("warning"):
+        result["content"] = (
+            f"[{result['warning']}]\n\n"
+            f"{result.get('content', '')}"
+        )
 
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -315,110 +359,36 @@ async def AgentDelegate(
 # 注册工具
 registry.register(
     name="AgentDelegate",
-    description="""创建并执行子agent来处理特定类型的任务。
+    description="""CRITICAL: For broad search/exploration tasks, you MUST split the work: make MULTIPLE concurrent AgentDelegate calls in parallel, each covering a DIFFERENT target area.
 
-## 支持的agent类型
+WHY SPLIT: Sub-agents run concurrently (up to 3 Explore at once). Parallel search is much faster than searching one area at a time. After all complete, merge their results.
 
-### Explore
-- 专门用于代码库探索和搜索
-- 只读权限：可以使用 Read, Grep, Glob 和受限的 run_cmd
-- 适用场景：查找文件、搜索代码、理解项目结构
+WHEN TO SPLIT:
+- Scanning multiple directories/disks: one agent per directory tree
+- Analyzing multiple modules: one agent per module
+- Searching by multiple patterns: one agent per pattern
+- Any task that can be partitioned: DO IT
 
-### Plan
-- 专门用于架构设计和实现规划
-- 只读权限：可以使用 Read, Grep, Glob 和受限的 run_cmd
-- 适用场景：设计实现方案、规划任务步骤、分析架构
+GOOD (split — concurrent):
+  call 1: Explore task="Search for 'keyword' in C:/Projects/src"
+  call 2: Explore task="Search for 'keyword' in C:/Projects/tests"
+  call 3: Explore task="Search for 'keyword' in D:/archive"
 
-## When To Use（何时使用）
+BAD (monolithic — slow):
+  Explore task="Search entire C:/ and D:/ drives for 'keyword'"  ← DON'T do this
 
-**强烈推荐使用子agent的场景：**
-- 🎯 **代码库分析**：当用户希望分析、理解、探索代码库时，积极使用多个Explore agent并发分析不同模块
-- 🎯 **架构理解**：需要理解系统架构、模块关系、设计模式时
-- 🎯 **功能定位**：查找特定功能的实现位置、依赖关系时
-- 🎯 **方案设计**：需要设计新功能、重构方案时，使用Plan agent
-
-**其他适用场景：**
-- 需要探索大型代码库
-- 需要设计复杂功能的实现方案
-- 任务可以并行处理（如同时探索多个模块）
-
-**何时不使用子agent：**
-- 简单的单文件修改
-- 明确的bug修复
-- 已经了解代码结构的情况
-
-## ⚠️ 重要：避免重复任务
-
-**系统会自动检测并拒绝重复任务！**
-
-- 如果相同的任务（agent类型 + 任务描述）已在运行，会返回错误
-- 任务描述会被标准化后比较（忽略大小写、多余空格）
-- 这是为了避免资源浪费和重复劳动
-
-**✅ 正确做法：为不同目标创建不同任务**
-```
-// 同时分析不同模块 - 允许并发
-AgentDelegate(agent_type="Explore", task="分析Memory模块的实现")
-AgentDelegate(agent_type="Explore", task="分析Agent模块的实现")
-AgentDelegate(agent_type="Explore", task="分析Tools模块的实现")
-```
-
-**❌ 错误做法：重复相同任务**
-```
-// 不要这样做 - 会被拒绝
-AgentDelegate(agent_type="Explore", task="分析项目结构")
-AgentDelegate(agent_type="Explore", task="分析项目结构")  // 错误：重复任务！
-```
-
-## 并发执行最佳实践
-
-**✅ 推荐：并发分析不同模块**
-- 将大任务拆分成独立的子任务
-- 每个子任务分析不同的模块或方面
-- 利用并发优势加速分析
-
-**示例：分析项目架构**
-```
-// 一次性启动多个Explore agent，并发分析
-AgentDelegate(agent_type="Explore", task="分析Memory模块：理解内存管理机制")
-AgentDelegate(agent_type="Explore", task="分析Agent模块：理解Actor和Reflection的实现")
-AgentDelegate(agent_type="Explore", task="分析Tools模块：理解工具注册和调用机制")
-AgentDelegate(agent_type="Explore", task="分析Prompting模块：理解提示词组装流程")
-
-// 等所有Explore完成后，再启动Plan
-AgentDelegate(agent_type="Plan", task="基于以上分析，设计新功能的实现方案")
-```
-
-## 并发限制
-
-- Explore agent: 最多3个并发
-- Plan agent: 最多2个并发
-- 超过限制时会返回错误，需要等待现有任务完成
-
-## 执行顺序建议
-
-1. **先Explore，后Plan**：先用多个Explore并发了解代码，再用Plan设计方案
-2. **任务要具体**：明确指定要分析的模块或方面，避免任务描述过于宽泛
-3. **避免重复**：确保每个任务的目标不同
-
-## 重要提示
-
-- 子agent不能创建子agent（禁止嵌套）
-- 子agent只有只读权限，不能修改文件
-- 子agent支持并发执行，充分利用多核性能
-- 系统会自动去重，避免重复执行相同任务
-- 根据任务复杂度合理使用，避免过度使用""",
+Concurrent execution: max 3 Explore, max 2 Plan. Sub-agents are read-only. Auto-deduplicates identical tasks.""",
     arguments_schema={
         "type": "object",
         "properties": {
             "agent_type": {
                 "type": "string",
                 "enum": ["Explore", "Plan", "explore", "plan"],
-                "description": "子agent类型：Explore（探索代码库）或 Plan（规划实现）"
+                "description": "Agent type: Explore (search/understand codebase) or Plan (design implementation plan)."
             },
             "task": {
                 "type": "string",
-                "description": "要执行的任务描述，应该清晰具体。建议将大任务拆分成不同的子任务，可以并发调用多个AgentDelegate分析不同模块"
+                "description": "Task for THIS specific area only. Each AgentDelegate call = ONE target. DO NOT bundle multiple areas in one call. Example: 'Search for config.yaml in C:/Users' rather than 'Search everywhere for config.yaml'. Be specific about path and target."
             }
         },
         "required": ["agent_type", "task"]

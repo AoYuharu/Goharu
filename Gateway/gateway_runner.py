@@ -20,6 +20,7 @@ from .session import SessionStore
 from .adapter_manager import AdapterManager
 from .message_router import MessageRouter
 from .agent_bridge import AgentBridge
+from .http_server import ACPHttpServer
 
 
 class GatewayRunner:
@@ -49,6 +50,7 @@ class GatewayRunner:
         self.adapter_manager: Optional[AdapterManager] = None
         self.message_router: Optional[MessageRouter] = None
         self.agent_bridge: Optional[AgentBridge] = None
+        self.http_server: Optional[ACPHttpServer] = None
 
         # Agent 组件
         self.memory_manager: Optional[MemoryManager] = None
@@ -76,6 +78,7 @@ class GatewayRunner:
         self.memory_manager = MemoryManager()
         self.runtime = create_tool_runtime(config.get("tools.runtime", "in_process"))
         await self.runtime.initialize()
+        await self.runtime.list_tools()  # populate last_tool_definitions
 
         self.actor = ActorAgent(self.runtime, self.memory_manager)
         self.reflector = ReflectionAgent()
@@ -104,6 +107,16 @@ class GatewayRunner:
         # 6. 启动所有适配器
         await self.adapter_manager.start_all(self.message_router.route_message)
 
+        # 7. 启动 HTTP API 服务器（用于 ACP）
+        acp_config = self.config.get("acp", {})
+        acp_enabled = acp_config.get("enabled", True)
+        if acp_enabled:
+            acp_host = acp_config.get("host", "127.0.0.1")
+            acp_port = acp_config.get("port", 8765)
+            self.http_server = ACPHttpServer(self.message_router, acp_host, acp_port)
+            await self.http_server.start()
+            print(f"[Gateway] ACP HTTP Server started on http://{acp_host}:{acp_port}")
+
         self._running = True
         connected_count = len(self.adapter_manager.adapters)
         print(f"[Gateway] Started with {connected_count} platform(s)")
@@ -112,6 +125,10 @@ class GatewayRunner:
         """停止 Gateway"""
         print("[Gateway] Stopping...")
         self._running = False
+
+        # 停止 HTTP 服务器
+        if self.http_server:
+            await self.http_server.stop()
 
         # 停止所有适配器
         if self.adapter_manager:

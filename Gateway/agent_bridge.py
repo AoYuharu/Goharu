@@ -69,8 +69,7 @@ class AgentBridge:
         # 3. 调用现有的 Agent 处理逻辑
         try:
             print(f"[AgentBridge] Calling run_agent...")
-            # 导入 run_agent（避免循环导入）
-            from main import run_agent
+            from Agent.agent_loop import run_agent
 
             result = await run_agent(
                 self.actor,

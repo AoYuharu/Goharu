@@ -18,7 +18,8 @@
       "Bash(tasklist:*)",
       "Bash(lftp:*)",
       "Bash(python:*)",
-      "Bash(expect:*)"
+      "Bash(expect:*)",
+      "Bash(find prompts -type f -name \"*.md\" -exec sh -c 'echo \"\"$\\(basename $\\(dirname \\)\\)/$\\(basename {}\\)\"\"' ;)"
     ]
   }
 }

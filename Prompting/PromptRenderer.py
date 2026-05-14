@@ -28,7 +28,12 @@ class PromptRenderer:
         return messages
 
     def render_section(self, section):
-        content = self._stringify_content(section.content).strip()
+        raw_content = section.content
+        # 保留原生 Anthropic 列表块（避免 JSON 序列化后流失 tool_use_id）
+        if isinstance(raw_content, list):
+            content = raw_content
+        else:
+            content = self._stringify_content(raw_content).strip()
         if not content and section.kind != "tool_result":
             return None
 

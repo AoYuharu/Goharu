@@ -1,4 +1,5 @@
-from contextlib import AsyncExitStack
+import asyncio
+import json
 from dataclasses import dataclass
 
 from configurationLoader import config
@@ -35,30 +36,11 @@ def _normalize_tool_definition(tool):
     }
 
 
-def _normalize_tool_result_content(result):
-    content = getattr(result, "content", result)
-    if not isinstance(content, list):
-        return content
-
-    parts = []
-    for item in content:
-        if isinstance(item, str):
-            parts.append(item)
-            continue
-        if isinstance(item, dict):
-            text = item.get("text")
-            if text is None:
-                text = item.get("content")
-            parts.append(str(text if text is not None else item))
-            continue
-        text = getattr(item, "text", None)
-        parts.append(str(text if text is not None else item))
-
-    merged = "\n".join(part for part in parts if str(part).strip())
-    return merged if merged else "(no output)"
-
-
 class InProcessToolRuntime:
+    """
+    In-process tool runtime - 所有工具通过registry直接调用
+    不再支持MCP，所有工具必须通过Tools.registry注册
+    """
     def __init__(self, group=None, modules=None):
         self.group = group
         self.modules = modules
@@ -83,65 +65,34 @@ class InProcessToolRuntime:
     async def call_tool(self, name, arguments=None):
         if not self._initialized:
             await self.initialize()
-        result = await registry.dispatch(name, arguments or {})
-        return ToolResult(content=result)
+        timeout = config.get("tools.timeout", 60)
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            timeout = None
+        # AgentDelegate 有自己的超时机制，不在此处覆盖
+        if name == "AgentDelegate":
+            timeout = None
+        try:
+            if timeout:
+                result = await asyncio.wait_for(registry.dispatch(name, arguments or {}), timeout=timeout)
+            else:
+                result = await registry.dispatch(name, arguments or {})
+            return ToolResult(content=result)
+        except asyncio.TimeoutError:
+            return ToolResult(
+                content=json.dumps({"error": f"Tool '{name}' timed out after {timeout}s"}, ensure_ascii=False)
+            )
 
     async def close(self):
         return None
 
 
-class MCPToolRuntime:
-    def __init__(self, command=None, args=None):
-        self.command = command or config.get("mcp.executor")
-        self.args = list(args if args is not None else (config.get("mcp.args") or []))
-        self.runtime_name = "mcp"
-        self.status_label = "mcp"
-        self.last_tool_definitions = []
-        self._initialized = False
-        self._exit_stack = None
-        self.session = None
-
-    async def initialize(self):
-        from mcp import ClientSession
-        from mcp.client.stdio import StdioServerParameters, stdio_client
-
-        self._exit_stack = AsyncExitStack()
-        server_parameters = StdioServerParameters(
-            command=self.command,
-            args=self.args,
-        )
-        read, write = await self._exit_stack.enter_async_context(stdio_client(server_parameters))
-        self.session = await self._exit_stack.enter_async_context(ClientSession(read, write))
-        await self.session.initialize()
-        self._initialized = True
-        return self
-
-    async def list_tools(self):
-        if not self._initialized:
-            await self.initialize()
-        tools_result = await self.session.list_tools()
-        tools = getattr(tools_result, "tools", tools_result)
-        self.last_tool_definitions = [_normalize_tool_definition(tool) for tool in (tools or [])]
-        return list(self.last_tool_definitions)
-
-    async def call_tool(self, name, arguments=None):
-        if not self._initialized:
-            await self.initialize()
-        result = await self.session.call_tool(name, arguments or {})
-        return ToolResult(content=_normalize_tool_result_content(result))
-
-    async def close(self):
-        if self._exit_stack is not None:
-            await self._exit_stack.aclose()
-            self._exit_stack = None
-        self.session = None
-        self._initialized = False
-
-
 def create_tool_runtime(runtime_name=None):
+    """
+    创建工具运行时
+
+    注意：MCP支持已移除，所有工具必须通过Tools.registry注册
+    """
     selected_runtime = str(runtime_name or config.get("tools.runtime", "in_process")).strip().lower()
     if selected_runtime == "in_process":
         return InProcessToolRuntime()
-    if selected_runtime == "mcp":
-        return MCPToolRuntime()
-    raise ValueError(f"Unsupported tool runtime: {selected_runtime}")
+    raise ValueError(f"Unsupported tool runtime: {selected_runtime}. Only 'in_process' is supported.")
