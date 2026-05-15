@@ -1,13 +1,14 @@
 """
-Agent 执行循环 — 供 Gateway 和 answer_review 路径共享。
+Agent 执行循环 — 供 Gateway 路径共享。
 """
 
 import asyncio
 import json
 
 from Agent.ActorAgent import ActorAgent
+from Agent.BackgroundTaskManager import BackgroundTaskManager
 from Agent.ContextCompactor import ContextCompactor
-from Agent.ReflectionAgent import ReflectionAgent
+from Agent.MicroCompactor import MicroCompactor
 from Memory.MemoryManager import MemoryManager
 from configurationLoader import config
 
@@ -124,11 +125,8 @@ def render_step_result(step_number, action, console=None, logger=None):
     if action_type == "tool":
         tool_name = action.get("tool_name", "unknown_tool")
         result_preview = action.get("result_preview") or "(no preview)"
-        guard_logs = action.get("guard_logs")
-
         if logger:
             logger.log_tool_call(step_number, tool_name, action.get("arguments", {}), result_preview)
-
         if RICH_AVAILABLE and console:
             console.print(Panel(
                 _rich_escape(result_preview),
@@ -136,15 +134,10 @@ def render_step_result(step_number, action, console=None, logger=None):
                 border_style="green",
                 padding=(1, 2)
             ))
-            if config.get("ui.verbose", False) and guard_logs:
-                console.print(f"  [dim italic]Guard: {'; '.join(guard_logs)}[/dim italic]")
         else:
             print(f"Result:\n{result_preview}\n")
-            if config.get("ui.verbose", False) and guard_logs:
-                print(f"Guard: {'; '.join(guard_logs)}\n")
         return
 
-    # continue 类型 nothing to render
     if action_type == "continue":
         pass
 
@@ -152,7 +145,6 @@ def render_step_result(step_number, action, console=None, logger=None):
 # ── 核心 Agent 循环 ──────────────────────────────────
 async def run_agent(
     actor: ActorAgent,
-    reflector: ReflectionAgent,
     question: str,
     memory_manager: MemoryManager,
     logger=None,
@@ -165,32 +157,9 @@ async def run_agent(
     turn_start_index = memory_manager.get_context_size()
     memory_manager.append({"role": "user", "content": question})
 
-    show_reflections = config.get("ui.show_reflections", False)
-    reflection_mode = config.get("agent.reflection_mode", "adaptive")
-    reflections = []
-    last_answer = None
     max_depth = int(config.get("agent.maxDepth", 8) or 8)
-    max_reflection_steps = 5
     token_usage = empty_token_usage()
-
-    consecutive_rejections = 0
-    last_tool_call_step = -1
-    reflection_count = 0
-
-    def should_reflect(step_num, action_type):
-        if reflection_count >= max_reflection_steps:
-            return False
-        if reflection_mode == "always":
-            return True
-        if reflection_mode == "never":
-            return False
-        if action_type == "answer":
-            return True
-        if step_num >= max_depth - 1:
-            return True
-        if step_num > 0 and step_num % 3 == 0:
-            return True
-        return False
+    last_answer = None
 
     def on_tool_call_start(tool_name, args, raw_reply, guard_result):
         nonlocal step
@@ -230,12 +199,28 @@ async def run_agent(
             "token_usage": dict(token_usage),
         })
 
+    # ── Snip 提醒 ────────────────────────────────────
+    snip_enabled = bool(config.get("agent.snip.enabled", False))
+    snip_threshold = int(config.get("agent.snip.reminder_threshold_tokens", 40000))
+
+    def _get_snip_reminder():
+        if not snip_enabled:
+            return None
+        total = token_usage.get("total_tokens", 0)
+        if total < snip_threshold:
+            return None
+        return (
+            f"[系统提示] 当前上下文累计 Token 已达到 {total}，超过限制 {snip_threshold}。"
+            f"建议使用 Snip 工具裁剪你认为不再有用的历史消息。"
+            f"消息的 ID 前缀格式为 [ID:msg_xxxxxxxx]，传入这些 ID 即可删除对应消息。"
+        )
+
     # ── 上下文自动压缩 ──────────────────────────────
     compact_enabled = bool(config.get("agent.context_compact.enabled", False))
     compact_threshold = int(config.get("agent.context_compact.threshold_tokens", 80000))
-    compact_before_step = bool(config.get("agent.context_compact.trigger_before_step", True))
     _compactor = None
     _compacted_this_turn = False
+    _last_api_input_tokens = None
 
     def maybe_compact_context(step_num, force=False):
         nonlocal _compactor, _compacted_this_turn
@@ -243,30 +228,23 @@ async def run_agent(
             return False
         if _compacted_this_turn and not force:
             return False
-        if not compact_before_step and not force:
-            return False
-
         messages = memory_manager.get_context()
         if _compactor is None:
             _compactor = ContextCompactor()
         estimated = _compactor.estimate_tokens(messages)
-
+        if _last_api_input_tokens is not None and _last_api_input_tokens > estimated:
+            estimated = _last_api_input_tokens
         if estimated < compact_threshold and not force:
             return False
-
         if logger:
             logger.log_memory_event(
                 f"Context auto-compact triggered at step {step_num + 1} "
                 f"(estimated {estimated} tokens, threshold {compact_threshold})"
             )
         if RICH_AVAILABLE and console:
-            console.print(
-                f"[yellow]⚡ Context tokens ({estimated}) exceed threshold ({compact_threshold}), "
-                f"auto-compacting...[/yellow]"
-            )
+            console.print(f"[yellow]⚡ Context tokens ({estimated}) exceed threshold ({compact_threshold}), compacting...[/yellow]")
         else:
             print(f"[*] Context tokens ({estimated}) exceed threshold ({compact_threshold}), compacting...")
-
         try:
             summary = _compactor.compact(messages)
             if not summary or len(summary) < 20:
@@ -274,19 +252,12 @@ async def run_agent(
         except Exception as e:
             if logger:
                 logger.log_error(f"Context compaction failed: {e}, falling back to truncation")
-            if RICH_AVAILABLE and console:
-                console.print(f"[red]Compaction failed: {e}, using hard truncation[/red]")
-            else:
-                print(f"[-] Compaction failed: {e}, using hard truncation")
-            # 回退：硬截断，保留最近 max_context_messages 条
             max_msgs = int(config.get("agent.max_context_messages", 20) or 20)
             recent = messages[-max_msgs:]
             memory_manager.clear_context()
             for msg in recent:
                 memory_manager.append(msg)
             return True
-
-        # 成功压缩：清空上下文并注入摘要
         memory_manager.clear_context()
         compact_message = {
             "role": "user",
@@ -294,232 +265,84 @@ async def run_agent(
         }
         memory_manager.append(compact_message)
         _compacted_this_turn = True
-
         if logger:
-            logger.log_memory_event(
-                f"Context compacted: {len(messages)} messages → "
-                f"{len(summary)} chars summary"
-            )
+            logger.log_memory_event(f"Context compacted: {len(messages)} messages → {len(summary)} chars summary")
         if RICH_AVAILABLE and console:
-            console.print(
-                f"[green]✓ Context compacted: {len(messages)} messages → "
-                f"{len(summary)} chars summary[/green]"
-            )
+            console.print(f"[green]✓ Context compacted: {len(messages)} messages → {len(summary)} chars summary[/green]")
         else:
             print(f"[+] Context compacted: {len(messages)} messages → {len(summary)} chars summary")
         return True
 
-    if RICH_AVAILABLE and console:
-        for step in range(max_depth):
-            if check_interrupt():
+    # ── 微压缩 ──────────────────────────────────────
+    micro_compact_enabled = bool(config.get("agent.micro_compact.enabled", True))
+    micro_compact_age = float(config.get("agent.micro_compact.age_threshold_hours", 1))
+    micro_compact_keep = int(config.get("agent.micro_compact.keep_tool_results", 5))
+    _micro_compacted_this_turn = False
+
+    def maybe_micro_compact(step_num):
+        nonlocal _micro_compacted_this_turn
+        if not micro_compact_enabled:
+            return False
+        if _micro_compacted_this_turn:
+            return False
+        messages = memory_manager.get_context()
+        compacted = MicroCompactor.compact(
+            messages, age_threshold_hours=micro_compact_age, keep_tool_results=micro_compact_keep,
+        )
+        if compacted is messages:
+            return False
+        removed_count = len(messages) - len(compacted)
+        memory_manager.clear_context()
+        for msg in compacted:
+            memory_manager.append(msg)
+        _micro_compacted_this_turn = True
+        if logger:
+            logger.log_memory_event(f"Micro-compact at step {step_num + 1}: removed {removed_count} older tool results")
+        if RICH_AVAILABLE and console:
+            console.print(f"[dim]📦 Micro-compact: {removed_count} older tool results → placeholder[/dim]")
+        return True
+
+    def _drain_background():
+        bg_results = BackgroundTaskManager().drain_pending()
+        if bg_results:
+            BackgroundTaskManager().inject_into_memory(memory_manager, bg_results)
+            if RICH_AVAILABLE and console:
+                console.print(f"[cyan]📥 {len(bg_results)} background task(s) completed, results injected into context[/cyan]")
+            elif logger:
+                logger.info(f"{len(bg_results)} background task(s) completed and injected")
+        return bg_results
+
+    # ── 主循环 ──────────────────────────────────────
+    for step in range(max_depth):
+        if check_interrupt():
+            if RICH_AVAILABLE and console:
                 console.print("[yellow]⚠ Execution interrupted by user[/yellow]")
-                return {
-                    "final_answer": "执行已被用户中断。",
-                    "reflections": reflections,
-                    "interrupted": True,
-                    "token_usage": dict(token_usage),
-                }
-
-            maybe_compact_context(step)
-            notify_before_api_call()
-            action = await actor.act(on_tool_call_start=on_tool_call_start)
-            add_usage(token_usage, action.get("usage"))
-            render_step_result(step + 1, action, console=console, logger=logger)
-
-            if action.get("type") in ["tool", "tool_batch"]:
-                last_tool_call_step = step
-                consecutive_rejections = 0
-
-            if action.get("type") == "answer":
-                last_answer = action.get("answer")
-
-            if should_reflect(step, action.get("type")):
-                reflection = reflector.reflect(
-                    question=question,
-                    history=memory_manager.get_context(),
-                    memory_markdown=memory_manager.get_memory_markdown(),
-                    soul_markdown=memory_manager.get_soul_markdown(),
-                )
-                reflections.append(reflection)
-                reflection_count += 1
-                if logger:
-                    logger.log_reflection(step + 1, reflection)
-
-                console.print(Panel(
-                    _rich_escape(reflection),
-                    title=f"[bold magenta]Reflection ({reflection_count}/{max_reflection_steps}, step {step + 1})[/bold magenta]",
-                    border_style="magenta",
-                    padding=(1, 2)
-                ))
-
-                if "可以给出最终回答" in reflection:
-                    consecutive_rejections = 0
-                    if action.get("type") == "tool":
-                        memory_manager.append({
-                            "role": "user",
-                            "content": f"[Reflection] {reflection}\n\n✓ 信息已充分，现在请基于以上所有信息给出完整的最终回答。禁止继续调用工具。",
-                        })
-                        continue
-                    break
-                elif "需要继续调用工具" in reflection:
-                    consecutive_rejections += 1
-                    if consecutive_rejections >= 10:
-                        console.print("[bold red]⚠ Reflection 连续 10 次拒绝，可能陷入死循环[/bold red]")
-                        console.print("[yellow]问题分析：[/yellow]")
-                        console.print(f"  - 最后一次工具调用在 step {last_tool_call_step + 1}")
-                        console.print(f"  - 当前 step {step + 1}")
-                        console.print(f"  - Actor 可能没有响应 Reflection 的要求")
-                        console.print("\n[yellow]建议：[/yellow]")
-                        console.print("  1. 检查 Actor prompt 是否足够强制")
-                        console.print("  2. 检查模型是否理解工具调用格式")
-                        console.print("  3. 尝试更明确的用户指令\n")
-                        return {
-                            "final_answer": f"执行失败：Reflection 连续 {consecutive_rejections} 次拒绝，可能 Actor 没有正确调用工具。\n\n最后的 Reflection：\n{reflection}",
-                            "reflections": reflections,
-                            "deadlock": True,
-                            "token_usage": dict(token_usage),
-                        }
-                    feedback = f"[Reflection] {reflection}\n\n⚠ 警告：你必须调用工具来验证。不要编造结果。请立即调用必要的工具。"
-                    memory_manager.append({"role": "user", "content": feedback})
-                    continue
-                elif action.get("type") == "answer":
-                    consecutive_rejections += 1
-                    memory_manager.append({
-                        "role": "user",
-                        "content": f"[Reflection] {reflection}\n\n你的回答需要更多验证，请继续执行必要的工具调用。",
-                    })
-                    continue
-            elif action.get("type") == "answer":
-                if reflection_mode == "never":
-                    break
-                if reflection_count < max_reflection_steps:
-                    reflection = reflector.reflect(
-                        question=question,
-                        history=memory_manager.get_context(),
-                        memory_markdown=memory_manager.get_memory_markdown(),
-                        soul_markdown=memory_manager.get_soul_markdown(),
-                    )
-                    reflections.append(reflection)
-                    reflection_count += 1
-                    if logger:
-                        logger.log_reflection(step + 1, reflection)
-
-                    console.print(Panel(
-                        _rich_escape(reflection),
-                        title=f"[bold magenta]Reflection ({reflection_count}/{max_reflection_steps}, step {step + 1})[/bold magenta]",
-                        border_style="magenta",
-                        padding=(1, 2)
-                    ))
-
-                    if "可以给出最终回答" in reflection:
-                        break
-                    else:
-                        consecutive_rejections += 1
-                        memory_manager.append({
-                            "role": "user",
-                            "content": f"[Reflection] {reflection}\n\n请继续执行必要的操作。",
-                        })
-                        continue
-                else:
-                    break
-    else:
-        for step in range(max_depth):
-            if check_interrupt():
+            else:
                 print("[Execution interrupted by user]")
-                return {
-                    "final_answer": "执行已被用户中断。",
-                    "reflections": reflections,
-                    "interrupted": True,
-                    "token_usage": dict(token_usage),
-                }
+            return {
+                "final_answer": "执行已被用户中断。",
+                "interrupted": True,
+                "token_usage": dict(token_usage),
+            }
 
-            maybe_compact_context(step)
-            notify_before_api_call()
-            action = await actor.act(on_tool_call_start=on_tool_call_start)
-            add_usage(token_usage, action.get("usage"))
-            render_step_result(step + 1, action, console=console, logger=logger)
+        _drain_background()
+        maybe_compact_context(step)
+        maybe_micro_compact(step)
+        notify_before_api_call()
+        action = await actor.act(on_tool_call_start=on_tool_call_start, extra_system_prompt=_get_snip_reminder())
+        add_usage(token_usage, action.get("usage"))
+        _last_api_input_tokens = (action.get("usage") or {}).get("input_tokens")
+        render_step_result(step + 1, action, console=console, logger=logger)
 
-            if action.get("type") in ["tool", "tool_batch"]:
-                last_tool_call_step = step
-                consecutive_rejections = 0
+        if action.get("type") == "answer":
+            last_answer = action.get("answer")
+            if BackgroundTaskManager().has_pending():
+                _drain_background()
+                continue
+            break
 
-            if action.get("type") == "answer":
-                last_answer = action.get("answer")
-
-            if should_reflect(step, action.get("type")):
-                reflection = reflector.reflect(
-                    question=question,
-                    history=memory_manager.get_context(),
-                    memory_markdown=memory_manager.get_memory_markdown(),
-                    soul_markdown=memory_manager.get_soul_markdown(),
-                )
-                reflections.append(reflection)
-                reflection_count += 1
-                if logger:
-                    logger.log_reflection(step + 1, reflection)
-
-                print(format_block(f"Reflection ({reflection_count}/{max_reflection_steps}, step {step + 1})", reflection))
-
-                if "可以给出最终回答" in reflection:
-                    consecutive_rejections = 0
-                    if action.get("type") == "tool":
-                        memory_manager.append({
-                            "role": "user",
-                            "content": f"[Reflection] {reflection}\n\n✓ 信息已充分，现在请基于以上所有信息给出完整的最终回答。禁止继续调用工具。",
-                        })
-                        continue
-                    break
-                elif "需要继续调用工具" in reflection:
-                    consecutive_rejections += 1
-                    if consecutive_rejections >= 10:
-                        print("⚠ Reflection 连续 10 次拒绝，可能陷入死循环")
-                        print(f"最后一次工具调用在 step {last_tool_call_step + 1}")
-                        print(f"当前 step {step + 1}")
-                        print("Actor 可能没有响应 Reflection 的要求\n")
-                        return {
-                            "final_answer": f"执行失败：Reflection 连续 {consecutive_rejections} 次拒绝。\n\n最后的 Reflection：\n{reflection}",
-                            "reflections": reflections,
-                            "deadlock": True,
-                            "token_usage": dict(token_usage),
-                        }
-                    feedback = f"[Reflection] {reflection}\n\n⚠ 警告：你必须调用工具来验证。不要编造结果。请立即调用必要的工具。"
-                    memory_manager.append({"role": "user", "content": feedback})
-                    continue
-                elif action.get("type") == "answer":
-                    consecutive_rejections += 1
-                    memory_manager.append({
-                        "role": "user",
-                        "content": f"[Reflection] {reflection}\n\n你的回答需要更多验证，请继续执行必要的工具调用。",
-                    })
-                    continue
-            elif action.get("type") == "answer":
-                if reflection_mode == "never":
-                    break
-                if reflection_count < max_reflection_steps:
-                    reflection = reflector.reflect(
-                        question=question,
-                        history=memory_manager.get_context(),
-                        memory_markdown=memory_manager.get_memory_markdown(),
-                        soul_markdown=memory_manager.get_soul_markdown(),
-                    )
-                    reflections.append(reflection)
-                    reflection_count += 1
-                    if logger:
-                        logger.log_reflection(step + 1, reflection)
-
-                    print(format_block(f"Reflection ({reflection_count}/{max_reflection_steps}, step {step + 1})", reflection))
-
-                    if "可以给出最终回答" in reflection:
-                        break
-                    else:
-                        consecutive_rejections += 1
-                        memory_manager.append({
-                            "role": "user",
-                            "content": f"[Reflection] {reflection}\n\n请继续执行必要的操作。",
-                        })
-                        continue
-                else:
-                    break
+    # Final drain: background tasks may have completed during the last step
+    _drain_background()
 
     final_prompt = actor.build_messages(FINAL_ANSWER_PROMPT)
     used_fallback_answer = False
@@ -554,7 +377,6 @@ async def run_agent(
 
     return {
         "final_answer": final_answer,
-        "reflections": reflections,
         "review_events": review_events,
         "housekeeping_events": housekeeping_events,
         "token_usage": dict(token_usage),

@@ -1,7 +1,7 @@
 import json
 
-from Memory.ToolCall import ToolCall
-from Prompting.PromptDocument import PromptDocument
+from Core.ToolCall import ToolCall
+from Core.PromptDocument import PromptDocument
 
 
 class PromptRenderer:
@@ -36,6 +36,15 @@ class PromptRenderer:
             content = self._stringify_content(raw_content).strip()
         if not content and section.kind != "tool_result":
             return None
+
+        # 注入消息 ID 前缀（仅 LLM 可见，TUI 不经过此路径）
+        msg_id = section.metadata.get("id")
+        if msg_id:
+            if isinstance(content, str):
+                content = f"[ID:{msg_id}] {content}"
+            elif isinstance(content, list):
+                # Anthropic 原生内容块列表：在最前面插入 text block
+                content = [{"type": "text", "text": f"[ID:{msg_id}] "}] + list(content)
 
         if section.kind in {"system", "user", "assistant"}:
             message = {

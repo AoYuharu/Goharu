@@ -1,10 +1,14 @@
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 
+from Agent.BackgroundTaskManager import BackgroundTaskManager
 from configurationLoader import config
 from Tools.loader import load_builtin_tools
 from Tools.registry import registry
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -65,21 +69,42 @@ class InProcessToolRuntime:
     async def call_tool(self, name, arguments=None):
         if not self._initialized:
             await self.initialize()
-        timeout = config.get("tools.timeout", 60)
-        if not isinstance(timeout, (int, float)) or timeout <= 0:
-            timeout = None
-        # AgentDelegate 有自己的超时机制，不在此处覆盖
-        if name == "AgentDelegate":
-            timeout = None
+        args = arguments or {}
+        background_timeout = config.get("tools.background_timeout", 120)
+        if not isinstance(background_timeout, (int, float)) or background_timeout <= 0:
+            background_timeout = None
+
         try:
-            if timeout:
-                result = await asyncio.wait_for(registry.dispatch(name, arguments or {}), timeout=timeout)
+            if background_timeout:
+                result = await asyncio.wait_for(
+                    registry.dispatch(name, args), timeout=background_timeout
+                )
             else:
-                result = await registry.dispatch(name, arguments or {})
+                result = await registry.dispatch(name, args)
             return ToolResult(content=result)
         except asyncio.TimeoutError:
+            # Move to background instead of failing
+            task_mgr = BackgroundTaskManager()
+            desc = f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
+
+            async def _bg_work():
+                return await registry.dispatch(name, args)
+
+            task_id = task_mgr.submit(name, _bg_work(), desc)
+            logger.info(
+                "Tool '%s' exceeded background_timeout (%ss), moved to background (task #%d)",
+                name, background_timeout, task_id,
+            )
             return ToolResult(
-                content=json.dumps({"error": f"Tool '{name}' timed out after {timeout}s"}, ensure_ascii=False)
+                content=json.dumps(
+                    {
+                        "backgrounded": True,
+                        "task_id": task_id,
+                        "tool": name,
+                        "message": f"Task moved to background (task #{task_id})",
+                    },
+                    ensure_ascii=False,
+                )
             )
 
     async def close(self):

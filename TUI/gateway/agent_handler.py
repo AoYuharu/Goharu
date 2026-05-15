@@ -9,7 +9,6 @@ from typing import Dict, Any, Optional
 from datetime import datetime
 
 from Agent.ActorAgent import ActorAgent
-from Agent.ReflectionAgent import ReflectionAgent
 from Memory.MemoryManager import MemoryManager
 from Tools.runtime import create_tool_runtime
 from configurationLoader import config
@@ -24,7 +23,6 @@ class AgentHandler:
         self.runtime = None
         self.memory = None
         self.actor = None
-        self.reflection = None
         self.current_session_id = "default"
         self._initialized = False
 
@@ -46,7 +44,6 @@ class AgentHandler:
 
             # Create agents
             self.actor = ActorAgent(self.runtime, self.memory)
-            self.reflection = ReflectionAgent(self.memory)
 
             emit_event("agent.ready", {
                 "model": config.get("model.large-language-model.model", "unknown"),

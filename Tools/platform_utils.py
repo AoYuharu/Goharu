@@ -142,6 +142,9 @@ def get_subprocess_env() -> dict:
     env = os.environ.copy()
     # PYTHONUNBUFFERED 强制 Python 子进程无缓冲输出
     env['PYTHONUNBUFFERED'] = '1'
+    # 强制 Python 子进程使用 UTF-8 输出，避免 Windows 上 cp936 / UTF-8 编码不一致导致中文乱码
+    env['PYTHONUTF8'] = '1'
+    env['PYTHONIOENCODING'] = 'utf-8'
     return env
 
 

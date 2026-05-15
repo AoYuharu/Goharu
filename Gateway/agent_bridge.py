@@ -10,7 +10,6 @@ Agent 桥接器 - 连接 Gateway 和现有的 Agent 系统
 from typing import Optional
 
 from Agent.ActorAgent import ActorAgent
-from Agent.ReflectionAgent import ReflectionAgent
 from Memory.MemoryManager import MemoryManager
 
 from .platforms.base import MessageEvent
@@ -23,7 +22,6 @@ class AgentBridge:
     def __init__(
         self,
         actor: ActorAgent,
-        reflector: ReflectionAgent,
         memory_manager: MemoryManager,
         session_store,
     ):
@@ -32,12 +30,10 @@ class AgentBridge:
 
         Args:
             actor: ActorAgent 实例
-            reflector: ReflectionAgent 实例
             memory_manager: MemoryManager 实例
             session_store: SessionStore 实例
         """
         self.actor = actor
-        self.reflector = reflector
         self.memory_manager = memory_manager
         self.session_store = session_store
 
@@ -73,7 +69,6 @@ class AgentBridge:
 
             result = await run_agent(
                 self.actor,
-                self.reflector,
                 event.text,
                 self.memory_manager,
             )

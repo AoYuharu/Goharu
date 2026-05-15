@@ -195,6 +195,14 @@ class ChatPanel(Container):
             except:
                 pass
 
+        elif cmd == "/compact":
+            # Summarize current conversation via LLM and replace with summary
+            try:
+                self.app.gateway.call("agent.compact", {"session_id": self.app.session_id})
+                self.add_system_message("Conversation compacted — history summarized via LLM")
+            except Exception as e:
+                self.add_error_message(f"Compact failed: {e}")
+
         elif cmd == "/copy":
             # Copy last assistant message to clipboard
             if self.last_assistant_message:
@@ -258,6 +266,7 @@ class ChatPanel(Container):
         elif cmd == "/help":
             self.add_system_message("Available commands:")
             self.add_system_message("  /clear - Clear chat history")
+            self.add_system_message("  /compact - Summarize conversation via LLM")
             self.add_system_message("  /config - Open interactive configuration editor")
             self.add_system_message("  /copy - Copy last assistant message")
             self.add_system_message("  /export - Export chat history to file")

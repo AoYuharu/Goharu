@@ -18,14 +18,10 @@ prompt:
     shared: []
     actor:
     - ./prompts/actor/base.md
-    - ./Agent/prompts/paper_analysis_sop.md
-    reflection:
-    - ./prompts/reflection/base.md
     summarizer:
     - ./prompts/summarizer/base.md
     reviewer:
     - ./prompts/reviewer/base.md
-    - ./prompts/reviewer/contract.md
 model:
   large-language-model:
     provider: anthropic_compatible
@@ -49,6 +45,11 @@ model:
       repetition_penalty: 1.1
 tools:
   runtime: in_process
+  background_timeout: 120  # seconds before moving to background (0 to disable)
+  result_budget:
+    cache_dir: ./runtime_memory/tool_cache
+    max_single_tokens: 8000  # per-result token limit
+    max_batch_tokens: 24000  # batch total token limit
   builtin_modules:
   - Tools.builtin.core_tools
   - Tools.builtin.file_tools
@@ -57,6 +58,9 @@ tools:
   - Tools.builtin.pdf_tools
   - Tools.builtin.system_info_tool
   - Tools.builtin.skill_tool
+  - Tools.builtin.snip_tool
+  - Tools.builtin.sleep_tool
+  - Tools.builtin.agent_verify
   security:
     dangerous_commands:
     - shutdown
@@ -95,14 +99,21 @@ tools:
     enabled: true
     allow_confirmation: false
 agent:
-  maxDepth: 40
-  reflection_mode: never
-  max_review_cycles: 3
+  maxDepth: 200
   max_context_messages: 20  # 保留最近N条消息，防止上下文爆炸
+  background_watch_window: 1800  # 30 min post-answer watch for late completions
+  background_max_reactivations: 3  # max times agent can be reactivated by bg tasks
+  micro_compact:
+    enabled: true
+    age_threshold_hours: 1  # messages older than this are candidates for compaction
+    keep_tool_results: 5  # keep latest N tool results from expired period
   context_compact:
     enabled: true
     threshold_tokens: 80000   # 超过此 token 数触发自动摘要
     trigger_before_step: true # 每步 actor 调用前检查
+  snip:
+    enabled: true
+    reminder_threshold_tokens: 40000  # 累计token超过此值后每轮提醒使用 Snip
 debug:
   enabled: true
 logging:
@@ -116,12 +127,13 @@ agent_delegate:
     max_concurrent: 3
   plan:
     max_concurrent: 2
-  timeout: 600
+  verify:
+    max_concurrent: 1
+    max_iterations: 12
   max_iterations: 20
   max_history_turns: 3
 ui:
   verbose: true
-  show_reflections: false
   show_memory_events: false
   show_actor_output: true
   show_thinking: true  # 显示模型的thinking过程

@@ -11,7 +11,6 @@ import asyncio
 from typing import Optional, Dict
 
 from Agent.ActorAgent import ActorAgent
-from Agent.ReflectionAgent import ReflectionAgent
 from Memory.MemoryManager import MemoryManager
 from Tools.runtime import create_tool_runtime
 from configurationLoader import config
@@ -55,7 +54,6 @@ class GatewayRunner:
         # Agent 组件
         self.memory_manager: Optional[MemoryManager] = None
         self.actor: Optional[ActorAgent] = None
-        self.reflector: Optional[ReflectionAgent] = None
         self.runtime = None
 
     async def start(self) -> None:
@@ -81,13 +79,15 @@ class GatewayRunner:
         await self.runtime.list_tools()  # populate last_tool_definitions
 
         self.actor = ActorAgent(self.runtime, self.memory_manager)
-        self.reflector = ReflectionAgent()
         print("[Gateway] Agent components initialized")
+
+        # Inject WorkingMemory into snip tool
+        import Tools.builtin.snip_tool as snip_tool
+        snip_tool.set_working_memory(self.memory_manager.working)
 
         # 3. 初始化 AgentBridge
         self.agent_bridge = AgentBridge(
             self.actor,
-            self.reflector,
             self.memory_manager,
             self.session_store,
         )

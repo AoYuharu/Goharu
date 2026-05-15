@@ -22,13 +22,10 @@ prompt:
     shared: []
     actor:
       - ./prompts/actor/base.md
-    reflection:
-      - ./prompts/reflection/base.md
     summarizer:
       - ./prompts/summarizer/base.md
     reviewer:
       - ./prompts/reviewer/base.md
-      - ./prompts/reviewer/contract.md
 
 model:
   large-language-model:
@@ -91,8 +88,6 @@ mcp:
   args:
     - ./MCP/MCP.py
   maxDepth: 8
-  reflection_mode: answer_review
-  max_review_cycles: 3
 
 agent_delegate:
   explore:
@@ -105,7 +100,6 @@ agent_delegate:
 
 ui:
   verbose: false
-  show_reflections: false
   show_memory_events: false
   show_actor_output: true
 

@@ -136,6 +136,10 @@ class TableHelperTUI(App):
         self.gateway.on_event("user.batch", self._on_user_batch)
         self.gateway.on_event("user.merge", self._on_user_merge)
         self.gateway.on_event("message.complete", self._on_message_complete)
+        self.gateway.on_event("context.micro_compact", self._on_micro_compact)
+        self.gateway.on_event("task.background.started", self._on_background_started)
+        self.gateway.on_event("task.background.completed", self._on_background_completed)
+        self.gateway.on_event("task.background.status", self._on_background_status)
         self.gateway.on_event("agent.interrupted", self._on_agent_interrupted)
         self.gateway.on_event("agent.error", self._on_agent_error)
 
@@ -244,12 +248,14 @@ class TableHelperTUI(App):
         tool_name = payload.get("tool", "unknown")
         step = payload.get("step", 0)
         arguments = payload.get("arguments", {})
+        call_id = payload.get("call_id", "")
 
         # Push to thread-safe queue — ToolPanel._tick() drains it on the main thread
         self._tool_event_queue.put(("call", {
             "tool_name": tool_name,
             "arguments": arguments,
             "step": step,
+            "call_id": call_id,
         }))
 
         # Update status bar (lightweight, via call_from_thread is fine)
@@ -272,11 +278,13 @@ class TableHelperTUI(App):
         """Tool call completed (called from gateway reader thread)"""
         tool_name = payload.get("tool", "unknown")
         result = payload.get("result", "")
+        call_id = payload.get("call_id", "")
 
         # Push to thread-safe queue — ToolPanel._tick() drains it on the main thread
         self._tool_event_queue.put(("result", {
             "tool_name": tool_name,
             "result": result,
+            "call_id": call_id,
         }))
 
         # Update status bar (lightweight, via call_from_thread is fine)
@@ -390,6 +398,43 @@ class TableHelperTUI(App):
         """Toggle help overlay"""
         # TODO: Implement help overlay
         pass
+
+    def _on_micro_compact(self, payload):
+        """Micro-compact: older tool results collapsed into placeholder"""
+        removed = payload.get("removed_results", 0)
+        chat_panel = self.query_one(ChatPanel)
+        chat_panel.add_system_message(
+            f"📦 Micro-compact: {removed} older tool results compacted"
+        )
+
+    def _on_background_started(self, payload):
+        """Background task started"""
+        tool_calls = payload.get("tool_calls", [])
+        bg_names = [tc.get("tool_name", "?") for tc in tool_calls]
+        chat_panel = self.query_one(ChatPanel)
+        chat_panel.add_system_message(
+            f"🔧 Background task(s) started: {', '.join(bg_names)}"
+        )
+        status_bar = self.query_one(StatusBar)
+        status_bar.set_status(f"BG task: {', '.join(bg_names)}", "working")
+
+    def _on_background_completed(self, payload):
+        """Background task completed, results injected"""
+        count = payload.get("count", 0)
+        task_ids = payload.get("task_ids", [])
+        chat_panel = self.query_one(ChatPanel)
+        chat_panel.add_system_message(
+            f"📥 {count} background task(s) completed (IDs: {task_ids})"
+        )
+        status_bar = self.query_one(StatusBar)
+        status_bar.set_status(f"BG tasks completed: {count}", "success")
+
+    def _on_background_status(self, payload):
+        """Background task status update"""
+        pending = payload.get("pending_results", 0)
+        if pending > 0:
+            status_bar = self.query_one(StatusBar)
+            status_bar.set_status(f"BG: {pending} pending", "working")
 
     def _on_agent_interrupted(self, payload):
         """Agent was interrupted by user"""

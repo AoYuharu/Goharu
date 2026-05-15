@@ -28,152 +28,16 @@ PROMPT_CATALOG = [
         "group": "🧠 Core Agents"
     },
     {
-        "name": "Reflection Agent",
-        "file": "prompts/reflection/base.md",
-        "description": "反思智能体提示词 — 回合决策、防编造、任务完成判断",
-        "group": "🧠 Core Agents"
-    },
-    {
         "name": "Review Agent",
         "file": "prompts/reviewer/base.md",
         "description": "用户画像复盘模块 — 提取用户画像增量写入 USER.md",
         "group": "🧠 Core Agents"
     },
     {
-        "name": "Review Agent (Contract)",
-        "file": "prompts/reviewer/contract.md",
-        "description": "复盘输出契约 — 定义用户画像更新的JSON格式",
-        "group": "🧠 Core Agents"
-    },
-    {
         "name": "Summarizer Agent",
         "file": "prompts/summarizer/base.md",
-        "description": "长期记忆摘要模块 — 将过期对话压缩为长期记忆",
+        "description": "长期记忆摘要模块 — 日总结、话题合并、上下文压缩",
         "group": "🧠 Core Agents"
-    },
-
-    # Paper analysis prompts
-    {
-        "name": "论文分析 Orchestrator",
-        "file": "prompts/paper_analysis/orchestrator.md",
-        "description": "论文分析主调度 — 协调7个子智能体按5阶段SOP",
-        "group": "📄 Paper Analysis"
-    },
-    {
-        "name": "论文分析 SOP (Agent目录)",
-        "file": "Agent/prompts/paper_analysis_sop.md",
-        "description": "论文分析SOP备用版 — 18条关键规则，强调直接输出JSON",
-        "group": "📄 Paper Analysis"
-    },
-    {
-        "name": "PDF Parser",
-        "file": "prompts/paper_analysis/pdf_parser.md",
-        "description": "PDF解析子智能体 — 提取元数据、章节、图表、公式",
-        "group": "📄 Paper Analysis"
-    },
-    {
-        "name": "Content Analysis",
-        "file": "prompts/paper_analysis/content_analysis.md",
-        "description": "内容分析子智能体 — 分析摘要、引言、方法等核心章节",
-        "group": "📄 Paper Analysis"
-    },
-    {
-        "name": "Tech Extraction",
-        "file": "prompts/paper_analysis/tech_extraction.md",
-        "description": "技术提取子智能体 — 提取可复用技术模块和创新点",
-        "group": "📄 Paper Analysis"
-    },
-    {
-        "name": "Fake Data Reproduction",
-        "file": "prompts/paper_analysis/fake_data_reproduction.md",
-        "description": "假数据复现子智能体 — 生成假数据及维度变化追踪",
-        "group": "📄 Paper Analysis"
-    },
-    {
-        "name": "Literature Analysis",
-        "file": "prompts/paper_analysis/literature_analysis.md",
-        "description": "文献分析子智能体 — 分析引用、分类、知识库覆盖",
-        "group": "📄 Paper Analysis"
-    },
-    {
-        "name": "Relation Analysis",
-        "file": "prompts/paper_analysis/relation_analysis.md",
-        "description": "关联分析子智能体 — 引用网络构建、SOTA判断",
-        "group": "📄 Paper Analysis"
-    },
-    {
-        "name": "Knowledge Integration",
-        "file": "prompts/paper_analysis/knowledge_integration.md",
-        "description": "知识库整合子智能体 — 分析结果整合和目录结构创建",
-        "group": "📄 Paper Analysis"
-    },
-
-    # System snippets
-    {
-        "name": "系统: Soul Section",
-        "file": "prompts/system/soul_section.md",
-        "description": "角色设定引导 — 引入SOUL.md",
-        "group": "⚙️ System Snippets"
-    },
-    {
-        "name": "系统: User Profile",
-        "file": "prompts/system/user_profile.md",
-        "description": "用户画像引导 — 引入USER.md",
-        "group": "⚙️ System Snippets"
-    },
-    {
-        "name": "系统: Memory",
-        "file": "prompts/system/memory.md",
-        "description": "长期记忆引导 — 引入MEMORY.md",
-        "group": "⚙️ System Snippets"
-    },
-    {
-        "name": "系统: Memory Background",
-        "file": "prompts/system/memory_background.md",
-        "description": "补充记忆引导",
-        "group": "⚙️ System Snippets"
-    },
-    {
-        "name": "系统: Tool Directory",
-        "file": "prompts/system/tool_directory.md",
-        "description": "工具目录引导 — 引入工具列表及Schema",
-        "group": "⚙️ System Snippets"
-    },
-    {
-        "name": "系统: Reflection Question",
-        "file": "prompts/system/reflection_question.md",
-        "description": "反思-问题 — 提供用户原始问题",
-        "group": "⚙️ System Snippets"
-    },
-    {
-        "name": "系统: Reflection History",
-        "file": "prompts/system/reflection_history.md",
-        "description": "反思-历史 — 对话与工具调用历史",
-        "group": "⚙️ System Snippets"
-    },
-    {
-        "name": "系统: Reflection Task",
-        "file": "prompts/system/reflection_task.md",
-        "description": "反思-任务 — 定义Reflection判断任务",
-        "group": "⚙️ System Snippets"
-    },
-    {
-        "name": "系统: Day Summary Contract",
-        "file": "prompts/system/day_summary_contract.md",
-        "description": "日总结契约 — 过期对话压缩JSON格式",
-        "group": "⚙️ System Snippets"
-    },
-    {
-        "name": "系统: Topic Merge Contract",
-        "file": "prompts/system/topic_merge_contract.md",
-        "description": "话题合并契约 — 合并重复topic文档的JSON格式",
-        "group": "⚙️ System Snippets"
-    },
-    {
-        "name": "系统: Review Turn",
-        "file": "prompts/system/review_turn.md",
-        "description": "复盘触发 — 每轮对话后触发用户画像复盘",
-        "group": "⚙️ System Snippets"
     },
 ]
 

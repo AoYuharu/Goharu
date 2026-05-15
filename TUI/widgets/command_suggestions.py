@@ -46,6 +46,11 @@ class CommandSuggestions(Container):
             "usage": "/clear"
         },
         {
+            "name": "/compact",
+            "description": "Summarize conversation via LLM",
+            "usage": "/compact"
+        },
+        {
             "name": "/config",
             "description": "View/set configuration parameters",
             "usage": "/config list"

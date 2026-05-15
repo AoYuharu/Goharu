@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from configurationLoader import config
-from Prompting.PromptSection import PromptSection
+from Core.PromptSection import PromptSection
 
 
 class PromptLoader:

@@ -38,9 +38,6 @@ class ConversationLogger:
         self._write(f"  Arguments: {json.dumps(arguments, ensure_ascii=False, indent=2)}\n")
         self._write(f"  Result: {result_preview}\n\n")
 
-    def log_reflection(self, step, reflection_text):
-        self._write(f"[{self._timestamp()}] REFLECTION (step {step}):\n{reflection_text}\n\n")
-
     def log_assistant_response(self, response):
         self._write(f"[{self._timestamp()}] ASSISTANT:\n{response}\n\n")
         self._write("-" * 80 + "\n\n")

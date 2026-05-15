@@ -12,6 +12,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Any, Optional
 
+from Agent.BackgroundTaskManager import BackgroundTaskManager
 from Agent.SubAgent import SubAgent
 from configurationLoader import config
 from Tools.registry import registry
@@ -37,7 +38,8 @@ class AgentDelegateManager:
         # 当前运行的子agent计数器（按类型分类）
         self.running_agents = {
             "explore": 0,
-            "plan": 0
+            "plan": 0,
+            "verify": 0,
         }
 
         # 锁，用于保护计数器
@@ -90,10 +92,6 @@ class AgentDelegateManager:
             agent_type_lower = agent_type.lower()
             if agent_type_lower in self.running_agents:
                 self.running_agents[agent_type_lower] = max(0, self.running_agents[agent_type_lower] - 1)
-
-    def get_timeout(self) -> int:
-        """获取子agent超时时间（秒）"""
-        return config.get("agent_delegate.timeout", 300)
 
     def set_output_callback(self, callback):
         """设置输出回调函数"""
@@ -203,14 +201,16 @@ def _execute_subagent_task(agent_type: str, task: str, agent_id: str, tools_regi
 
 async def AgentDelegate(
     agent_type: str,
-    task: str
+    task: str,
+    run_background: bool = False,
 ) -> str:
     """
     创建并执行子agent
 
     Args:
-        agent_type: agent类型（Explore、Plan等）
+        agent_type: agent类型（Explore、Plan、Verify等）
         task: 要执行的任务描述
+        run_background: 是否立即后台执行
 
     Returns:
         JSON格式的执行结果
@@ -218,7 +218,7 @@ async def AgentDelegate(
     start_time = time.time()
 
     # 验证agent类型
-    valid_types = ["explore", "plan"]
+    valid_types = ["explore", "plan", "verify"]
     if agent_type.lower() not in valid_types:
         return json.dumps({
             "error": f"不支持的agent类型: {agent_type}",
@@ -256,13 +256,30 @@ async def AgentDelegate(
     # 通知开始执行
     _manager.notify_output(f"🚀 启动 {agent_type} agent [{agent_id}]", "info")
 
-    # 获取事件循环并异步执行
+    # 超时时间与 tools.background_timeout 保持一致，由 runtime 层统一管理
+    timeout = config.get("tools.background_timeout", 120)
     loop = asyncio.get_event_loop()
-    timeout = _manager.get_timeout()
 
     # 跨线程共享状态：子agent线程写入 last_text_answer，超时后主线程读取
     shared_state = {}
 
+    if run_background:
+        task_mgr = BackgroundTaskManager()
+        task_id = task_mgr.submit_subagent(
+            agent_type, task, agent_id, tools_registry_instance, shared_state
+        )
+        _manager.notify_output(
+            f"⏳ {agent_type} agent [{agent_id}] 已显式转后台 (task #{task_id})", "info"
+        )
+        return json.dumps({
+            "backgrounded": True,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "agent_type": agent_type,
+            "message": f"SubAgent [{agent_id}] launched in background (task #{task_id})",
+        }, ensure_ascii=False)
+
+    result = None
     try:
         # 使用 run_in_executor 异步执行（不阻塞事件循环）
         result = await asyncio.wait_for(
@@ -279,31 +296,21 @@ async def AgentDelegate(
             timeout=timeout
         )
     except asyncio.TimeoutError:
-        # 超时：尝试从共享状态提取子agent最后一条文本/思考
-        last_text = shared_state.get("last_text_answer")
-        if last_text:
-            result = {
-                "agent_id": agent_id,
-                "agent_type": agent_type,
-                "status": "partial",
-                "content": last_text,
-                "warning": f"子agent执行超时（{timeout}秒），返回最后一条文本内容",
-                "token_count": 0,
-                "duration_ms": int(timeout * 1000),
-                "tool_calls_count": 0,
-                "iterations": 0,
-            }
-        else:
-            result = {
-                "agent_id": agent_id,
-                "agent_type": agent_type,
-                "status": "error",
-                "content": "",
-                "error": f"子agent执行超时（{timeout}秒），且未获取到任何文本输出",
-                "token_count": 0,
-                "duration_ms": 0,
-                "tool_calls_count": 0,
-            }
+        # 超时：移动到后台继续执行
+        task_mgr = BackgroundTaskManager()
+        task_id = task_mgr.submit_subagent(
+            agent_type, task, agent_id, tools_registry_instance, shared_state
+        )
+        _manager.notify_output(
+            f"⏳ {agent_type} agent [{agent_id}] 超时，已转后台 (task #{task_id})", "info"
+        )
+        return json.dumps({
+            "backgrounded": True,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "agent_type": agent_type,
+            "message": f"SubAgent [{agent_id}] moved to background (task #{task_id})",
+        }, ensure_ascii=False)
     except Exception as e:
         result = {
             "agent_id": agent_id,
@@ -322,14 +329,15 @@ async def AgentDelegate(
         # 注销任务
         _manager.unregister_task(agent_type, task)
 
-        # 通知完成
-        if result.get("status") == "success":
-            status_icon = "✅"
-        elif result.get("status") == "partial":
-            status_icon = "⚠️"
-        else:
-            status_icon = "❌"
-        _manager.notify_output(f"{status_icon} {agent_type} agent [{agent_id}] 完成", "info")
+        # 通知完成（超时路径已在 except 块中通知，此处仅处理正常/异常路径）
+        if result is not None:
+            if result.get("status") == "success":
+                status_icon = "✅"
+            elif result.get("status") == "partial":
+                status_icon = "⚠️"
+            else:
+                status_icon = "❌"
+            _manager.notify_output(f"{status_icon} {agent_type} agent [{agent_id}] 完成", "info")
 
     # 添加总体统计
     total_duration = int((time.time() - start_time) * 1000)
@@ -377,18 +385,29 @@ GOOD (split — concurrent):
 BAD (monolithic — slow):
   Explore task="Search entire C:/ and D:/ drives for 'keyword'"  ← DON'T do this
 
-Concurrent execution: max 3 Explore, max 2 Plan. Sub-agents are read-only. Auto-deduplicates identical tasks.""",
+VERIFY WHEN TO USE:
+- After non-trivial implementation work
+- When the user explicitly asks for verification, testing, adversarial review, or trying to break the change
+- For risky changes in Agent / Tools / Gateway / TUI / config / background / timeout / permission logic
+- Verify agents are read-only and should produce evidence-backed PASS / FAIL / PARTIAL reports
+
+Concurrent execution: max 3 Explore, max 2 Plan, max 1 Verify by config. Sub-agents are read-only. Auto-deduplicates identical tasks.""",
     arguments_schema={
         "type": "object",
         "properties": {
             "agent_type": {
                 "type": "string",
-                "enum": ["Explore", "Plan", "explore", "plan"],
-                "description": "Agent type: Explore (search/understand codebase) or Plan (design implementation plan)."
+                "enum": ["Explore", "Plan", "Verify", "explore", "plan", "verify"],
+                "description": "Agent type: Explore (search/understand codebase), Plan (design implementation plan), or Verify (adversarial read-only verification)."
             },
             "task": {
                 "type": "string",
-                "description": "Task for THIS specific area only. Each AgentDelegate call = ONE target. DO NOT bundle multiple areas in one call. Example: 'Search for config.yaml in C:/Users' rather than 'Search everywhere for config.yaml'. Be specific about path and target."
+                "description": "Task for THIS specific area only. Each AgentDelegate call = ONE target. DO NOT bundle multiple areas in one call. Example: 'Search for config.yaml in C:/Users' rather than 'Search everywhere for config.yaml'. Be specific about path and target. For verify, structure the task with original task, key files, implementation summary, expected behavior, risk points, and constraints when possible."
+            },
+            "run_background": {
+                "type": "boolean",
+                "description": "If true, launch the subagent directly in the background and return task metadata immediately. If false, run in foreground first and only background on timeout.",
+                "default": False
             }
         },
         "required": ["agent_type", "task"]

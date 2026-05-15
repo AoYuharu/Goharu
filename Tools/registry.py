@@ -1,3 +1,4 @@
+import functools
 from dataclasses import dataclass
 from typing import Any, Callable
 import asyncio
@@ -145,7 +146,14 @@ class ToolRegistry:
             validated_arguments = self._validate_arguments(entry, arguments)
             if entry.is_async:
                 return await entry.handler(**validated_arguments)
-            return entry.handler(**validated_arguments)
+            # Run sync handlers in thread pool to avoid blocking the event loop.
+            # Otherwise long-running sync tools (e.g. parse_pdf) freeze the TUI
+            # and prevent asyncio.wait_for timeout from firing.
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None,
+                functools.partial(entry.handler, **validated_arguments),
+            )
         except ToolValidationError as exc:
             return self._error_result(exc)
         except Exception as exc:

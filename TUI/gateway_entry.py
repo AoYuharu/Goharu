@@ -31,7 +31,8 @@ _real_stdout = sys.stdout
 _stdout_lock = threading.Lock()
 
 from Agent.ActorAgent import ActorAgent
-from Agent.ReflectionAgent import ReflectionAgent
+from Agent.BackgroundTaskManager import BackgroundTaskManager
+from Agent.MicroCompactor import MicroCompactor
 from Memory.MemoryManager import MemoryManager
 from Tools.runtime import create_tool_runtime
 from Tools.tool_process_tracker import tool_process_tracker
@@ -93,7 +94,6 @@ class GatewaySession:
     def __init__(self):
         self.memory_manager: Optional[MemoryManager] = None
         self.actor: Optional[ActorAgent] = None
-        self.reflector: Optional[ReflectionAgent] = None
         self.runtime = None
         self.session_store: Optional[SessionStore] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -106,6 +106,10 @@ class GatewaySession:
         self._batch_lock = threading.Lock()
         # Interrupt support
         self._interrupt_event = threading.Event()
+        # Micro-compact flag (once per session turn)
+        self._micro_compacted = False
+        # Background task reactivation dedup flag
+        self._bg_reactivation_queued: bool = False
 
     def queue_message(self, message: str, req_id):
         """Queue a user message for batching"""
@@ -127,6 +131,32 @@ class GatewaySession:
         """Check if there are pending messages"""
         with self._batch_lock:
             return len(self.pending_messages) > 0
+
+    def _drain_background_results(self):
+        """Thread-safe: drain background results → inject into memory → emit event.
+
+        Returns:
+            list: The drained BackgroundResult objects (empty list if none).
+        """
+        bg_results = BackgroundTaskManager().drain_pending()
+        if not bg_results:
+            return []
+        BackgroundTaskManager().inject_into_memory(self.memory_manager, bg_results)
+        write_json({
+            "jsonrpc": "2.0", "method": "event",
+            "params": {
+                "type": "task.background.completed",
+                "payload": {
+                    "count": len(bg_results),
+                    "task_ids": [r.task_id for r in bg_results],
+                }
+            }
+        })
+        logger.info(
+            "Drained %d background task result(s) into memory",
+            len(bg_results),
+        )
+        return bg_results
 
     async def initialize(self):
         """Initialize all components"""
@@ -153,9 +183,12 @@ class GatewaySession:
             await self.runtime.list_tools()  # populate last_tool_definitions
             logger.info("Tool runtime initialized")
 
+            # Inject WorkingMemory into snip tool (module loaded during initialize)
+            import Tools.builtin.snip_tool as snip_tool
+            snip_tool.set_working_memory(self.memory_manager.working)
+
             # Initialize agents
             self.actor = ActorAgent(self.runtime, self.memory_manager)
-            self.reflector = ReflectionAgent()
             logger.info("Agents initialized")
 
             # Initialize session store
@@ -169,6 +202,36 @@ class GatewaySession:
                 reset_idle_minutes=session_config.get("reset_idle_minutes", 1440),
             )
             logger.info("SessionStore initialized")
+
+            # Register background task completion callback for real-time TUI updates
+            def _on_bg_complete(task_id, bg_result):
+                # 1. Immediately notify TUI of status change
+                status = BackgroundTaskManager().get_status_summary()
+                write_json({
+                    "jsonrpc": "2.0", "method": "event",
+                    "params": {
+                        "type": "task.background.status",
+                        "payload": status,
+                    }
+                })
+                # 2. If agent is processing, step boundary will drain naturally
+                if self._processing:
+                    return
+                # 3. Idle: queue a synthetic message and wake up processing
+                if self._bg_reactivation_queued:
+                    return
+                self._bg_reactivation_queued = True
+                synthetic_msg = (
+                    f"[System: background results arrived after previous answer] "
+                    f"Background task(s) completed. Please review and respond if needed."
+                )
+                with self._batch_lock:
+                    self.pending_messages.append(synthetic_msg)
+                    self.pending_requests.append("bg_reactivation")
+                _start_processing("default")
+
+            BackgroundTaskManager().register_callback(_on_bg_complete)
+            logger.info("Background task completion callback registered")
 
             self._initialized = True
             logger.info("Gateway session initialized successfully")
@@ -193,6 +256,7 @@ class GatewaySession:
             await self.initialize()
 
         self._processing = True
+        self._micro_compacted = False  # reset per turn
 
         try:
             # 清除上一次可能残留的中断标记
@@ -212,6 +276,9 @@ class GatewaySession:
 
             # Check for pending messages that should be merged BEFORE first step
             pending_msgs, pending_reqs = self.get_pending_messages()
+            # If bg_reactivation was queued, clear the dedup flag for this turn
+            if "bg_reactivation" in pending_reqs:
+                self._bg_reactivation_queued = False
             all_messages = [message] + pending_msgs
             combined = "\n".join(all_messages)
 
@@ -280,6 +347,9 @@ class GatewaySession:
 
                 # Before each step: check for pending messages and merge
                 pending_msgs, pending_reqs = self.get_pending_messages()
+                # Clear dedup flag if bg_reactivation is being consumed
+                if "bg_reactivation" in pending_reqs:
+                    self._bg_reactivation_queued = False
                 if pending_msgs:
                     pending_text = "\n".join(pending_msgs)
                     # Add to memory so actor sees them
@@ -307,6 +377,39 @@ class GatewaySession:
                         }
                     })
 
+                # Drain completed background tasks before each step
+                self._drain_background_results()
+
+                # Micro-compact: collapse older tool results (once per turn)
+                if (
+                    not self._micro_compacted
+                    and config.get("agent.micro_compact.enabled", True)
+                ):
+                    messages = self.memory_manager.get_context()
+                    age_h = float(config.get("agent.micro_compact.age_threshold_hours", 1))
+                    keep_n = int(config.get("agent.micro_compact.keep_tool_results", 5))
+                    compacted = MicroCompactor.compact(
+                        messages, age_threshold_hours=age_h, keep_tool_results=keep_n
+                    )
+                    if compacted is not messages:
+                        removed = len(messages) - len(compacted)
+                        self.memory_manager.clear_context()
+                        for msg in compacted:
+                            self.memory_manager.append(msg)
+                        logger.info(
+                            "Micro-compact: removed %d older tool results (threshold=%sh, keep=%d)",
+                            removed, age_h, keep_n,
+                        )
+                        write_json({
+                            "jsonrpc": "2.0",
+                            "method": "event",
+                            "params": {
+                                "type": "context.micro_compact",
+                                "payload": {"removed_results": removed}
+                            }
+                        })
+                    self._micro_compacted = True
+
                 # Emit step event
                 write_json({
                     "jsonrpc": "2.0",
@@ -324,7 +427,7 @@ class GatewaySession:
                 # to emit tool.call events in real-time (not after completion)
                 current_step = step  # capture for closure
 
-                def _on_tool_call(tool_name, tool_args, *args):
+                def _on_tool_call(tool_name, tool_args, call_id="", *args):
                     write_json({
                         "jsonrpc": "2.0",
                         "method": "event",
@@ -333,6 +436,7 @@ class GatewaySession:
                             "payload": {
                                 "tool": tool_name,
                                 "arguments": tool_args,
+                                "call_id": str(call_id),
                                 "step": current_step
                             }
                         }
@@ -351,7 +455,7 @@ class GatewaySession:
                         }
                     })
 
-                def _on_tool_result(tool_name, result_text):
+                def _on_tool_result(tool_name, call_id, result_text):
                     write_json({
                         "jsonrpc": "2.0",
                         "method": "event",
@@ -359,6 +463,7 @@ class GatewaySession:
                             "type": "tool.result",
                             "payload": {
                                 "tool": tool_name,
+                                "call_id": str(call_id),
                                 "result": str(result_text)
                             }
                         }
@@ -379,6 +484,16 @@ class GatewaySession:
                 # Only emit events that are NOT covered by callbacks.
 
                 if response_type == "answer":
+                    # Don't return immediately if background tasks are pending
+                    if BackgroundTaskManager().has_pending():
+                        bg_results = self._drain_background_results()
+                        if bg_results:
+                            logger.info(
+                                "Background tasks completed during answer, injecting %d result(s) and continuing",
+                                len(bg_results),
+                            )
+                            continue
+
                     # Got final answer - return directly without streaming
                     answer = actor_response.get("answer", "")
 
@@ -401,6 +516,21 @@ class GatewaySession:
                 elif response_type == "tool_batch":
                     # tool.call and tool.result already emitted by callbacks — nothing more to emit
                     pass
+
+                elif response_type == "tool_backgrounded":
+                    # Tool(s) moved to background — notify TUI and continue
+                    has_bg = actor_response.get("has_backgrounded", False)
+                    if has_bg:
+                        write_json({
+                            "jsonrpc": "2.0",
+                            "method": "event",
+                            "params": {
+                                "type": "task.background.started",
+                                "payload": {
+                                    "tool_calls": actor_response.get("tool_calls", []),
+                                }
+                            }
+                        })
 
                 elif response_type == "continue":
                     # Thinking already emitted by on_thinking callback — just keep looping
@@ -461,6 +591,69 @@ class GatewaySession:
         """Clear a session's memory"""
         if self.memory_manager:
             self.memory_manager.clear_context()
+
+    async def compact_session(self, session_id: str):
+        """Summarize current conversation via LLM and replace with summary"""
+        if not self.memory_manager:
+            return
+
+        messages = self.memory_manager.get_context()
+        if not messages:
+            return
+
+        # Serialize messages for the LLM prompt
+        history_lines = []
+        for msg in messages:
+            role = msg.get("role", "unknown") if isinstance(msg, dict) else "unknown"
+            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        t = item.get("type", "")
+                        if t == "text":
+                            parts.append(item.get("text", ""))
+                        elif t == "tool_use":
+                            parts.append(f"[调用工具: {item.get('name', '?')}]")
+                        elif t == "tool_result":
+                            rc = item.get("content", "")
+                            parts.append(f"[工具结果: {str(rc)[:200]}]")
+                    else:
+                        parts.append(str(item))
+                content = " ".join(parts)
+            content = str(content)[:2000]
+            history_lines.append(f"[{role}] {content}")
+
+        history_text = "\n".join(history_lines)
+
+        # Build compact prompt
+        compact_prompt = (
+            "你是一个对话摘要助手。请用中文对以下对话进行精炼摘要，保留关键信息：\n"
+            "1. 用户的主要问题和需求\n"
+            "2. 助手给出的关键回答和结论\n"
+            "3. 任何重要的决策、代码修改或文件操作\n"
+            "4. 未解决的问题或待办事项\n\n"
+            "请用200字以内完成摘要，直接输出摘要文本，不要加任何前缀或标记。\n\n"
+            f"=== 对话记录 ===\n{history_text}\n=== 结束 ==="
+        )
+
+        try:
+            from Agent.LargeLanguageModel import LargeLanguageModel
+            llm = LargeLanguageModel()
+            summary = llm.query([{"role": "user", "content": compact_prompt}])
+            if not summary or not summary.strip():
+                summary = "(摘要生成失败)"
+        except Exception as e:
+            logger.warning(f"Compact summary generation failed: {e}")
+            summary = "(摘要生成失败)"
+
+        # Clear context and insert summary
+        self.memory_manager.clear_context()
+        self.memory_manager.append({
+            "role": "system",
+            "content": f"[对话摘要 - {datetime.now().strftime('%Y-%m-%d %H:%M')}]\n{summary.strip()}"
+        })
+        logger.info(f"Session compacted: {len(messages)} messages → summary ({len(summary)} chars)")
 
     def _get_prompt_loader(self):
         """Get or create PromptLoader"""
@@ -624,6 +817,42 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 try:
                     loop.run_until_complete(_session.clear_session(session_id))
                     # Emit updated token stats after clear
+                    token_stats = _session.calculate_token_stats()
+                    write_json({
+                        "jsonrpc": "2.0",
+                        "method": "event",
+                        "params": {
+                            "type": "token.stats",
+                            "payload": token_stats
+                        }
+                    })
+                    return {
+                        "jsonrpc": "2.0",
+                        "result": {"success": True},
+                        "id": req_id
+                    }
+                finally:
+                    loop.close()
+            finally:
+                _processing_lock.release()
+
+        elif method == "agent.compact":
+            session_id = params.get("session_id", "default")
+
+            acquired = _processing_lock.acquire(blocking=True, timeout=5.0)
+            if not acquired:
+                return {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32603, "message": "无法获取处理锁，请稍后重试"},
+                    "id": req_id
+                }
+
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(_session.compact_session(session_id))
+                    # Emit updated token stats after compact
                     token_stats = _session.calculate_token_stats()
                     write_json({
                         "jsonrpc": "2.0",
@@ -861,6 +1090,49 @@ def _process_queued_messages(session_id: str):
                     "payload": {"answer": answer}
                 }
             })
+
+            # ── Post-answer background watcher ─────────────────
+            # After answering, watch for late background task completions.
+            # If new results arrive, inject them as synthetic messages
+            # and re-trigger processing so the agent can respond.
+            from configurationLoader import config
+            watch_window = int(config.get("agent.background_watch_window", 1800))
+            max_reactivations = int(config.get("agent.background_max_reactivations", 3))
+            task_mgr = BackgroundTaskManager()
+
+            if watch_window > 0 and task_mgr._reactivation_count < max_reactivations:
+                start_watch = time.time()
+                while (time.time() - start_watch) < watch_window:
+                    # 用户发了新消息，立即退出 watcher 处理消息
+                    if _session.has_pending():
+                        break
+                    if task_mgr.has_pending():
+                        bg_results = task_mgr.drain_pending()
+                        task_mgr.increment_reactivation()
+                        logger.info(
+                            "[bg-task] Post-answer reactivation #%d: %d results arrived",
+                            task_mgr._reactivation_count, len(bg_results),
+                        )
+                        # Inject results into memory so agent sees them
+                        if _session.memory_manager:
+                            BackgroundTaskManager().inject_into_memory(
+                                _session.memory_manager, bg_results
+                            )
+                        # Only queue synthetic message if callback didn't already
+                        if not _session._bg_reactivation_queued:
+                            synthetic_msg = (
+                                f"[System: background results arrived after previous answer] "
+                                f"{len(bg_results)} background task(s) completed. "
+                                f"Please review and respond if needed."
+                            )
+                            with _session._batch_lock:
+                                _session.pending_messages.append(synthetic_msg)
+                                _session.pending_requests.append("bg_reactivation")
+
+                        # Release lock before re-starting
+                        break
+                    time.sleep(1.0)  # Poll every second
+
     except Exception as e:
         logger.error(f"Error in message processor: {e}", exc_info=True)
         log_crash(f"Message processor error: {e}", sys.exc_info())

@@ -27,26 +27,6 @@ CONFIG_CATALOG = [
         "tips": "过高会增加响应时间和成本，过低可能无法完成复杂任务",
         "group": "🤖 Agent 配置"
     },
-    {
-        "key": "agent.reflection_mode",
-        "name": "反思模式",
-        "type": "choice",
-        "description": "反思模式：never(从不), always(总是), answer_review(仅在回答时审核)",
-        "default": "never",
-        "choices": ["never", "always", "answer_review"],
-        "tips": "answer_review 模式在生成最终答案前会进行审核，提高回答质量",
-        "group": "🤖 Agent 配置"
-    },
-    {
-        "key": "agent.max_review_cycles",
-        "name": "最大审核循环次数",
-        "type": "int",
-        "description": "最大审核循环次数，防止审核陷入无限循环",
-        "default": 3,
-        "range": (1, 10),
-        "tips": "仅在 reflection_mode 为 answer_review 时生效",
-        "group": "🤖 Agent 配置"
-    },
 
     # 子智能体配置
     {
@@ -77,16 +57,6 @@ CONFIG_CATALOG = [
         "default": 2,
         "range": (1, 5),
         "tips": "规划任务通常需要顺序执行，不建议设置过高",
-        "group": "🔧 子智能体配置"
-    },
-    {
-        "key": "agent_delegate.timeout",
-        "name": "子智能体超时时间",
-        "type": "int",
-        "description": "子智能体超时时间（秒），超时后会被强制终止",
-        "default": 300,
-        "range": (30, 1800),
-        "tips": "复杂任务可能需要更长时间，建议根据实际情况调整",
         "group": "🔧 子智能体配置"
     },
     {
@@ -239,15 +209,6 @@ CONFIG_CATALOG = [
         "description": "是否显示详细日志",
         "default": False,
         "tips": "启用后会显示更多调试信息",
-        "group": "🎨 UI 配置"
-    },
-    {
-        "key": "ui.show_reflections",
-        "name": "显示反思过程",
-        "type": "bool",
-        "description": "是否在界面中显示反思过程",
-        "default": False,
-        "tips": "启用后可以看到智能体的思考过程",
         "group": "🎨 UI 配置"
     },
     {

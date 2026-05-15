@@ -230,8 +230,8 @@ async def Read(path: str, start_line: int = 1, end_line: int | None = None, acto
     if end_line is not None and end_line < start_line:
         return _error("end_line 必须大于等于 start_line")
 
-    # 限制单次最多读取 300 行
-    MAX_READ_LINES = 300
+    # 限制单次最多读取 200 行
+    MAX_READ_LINES = 200
     if end_line is None:
         end_line = start_line + MAX_READ_LINES - 1
     elif end_line - start_line + 1 > MAX_READ_LINES:

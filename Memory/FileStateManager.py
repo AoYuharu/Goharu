@@ -130,20 +130,6 @@ class FileStateManager:
 
         return "\n".join(summary_lines)
 
-    def get_reflection_context(self) -> dict:
-        """
-        获取 Reflection 所需的完整上下文
-
-        Returns:
-            包含文件内容和工具调用记录的字典
-        """
-        return {
-            "files": self.files,
-            "tool_calls": self.tool_calls,
-            "files_summary": self.get_files_summary(),
-            "tool_calls_summary": self.get_tool_calls_summary(),
-        }
-
     def clear(self):
         """清空所有记录"""
         self.files.clear()

@@ -17,15 +17,14 @@ There is no repo-defined `pytest`/`unittest` test suite, lint configuration, or 
 **Interactive code** (has `input()`, GUI, infinite loops): Create standalone test files (e.g., `test_xxx.py`) that test core functions without running the interactive loop. Run specific tests directly with `python test_xxx.py`.
 **Standalone scripts** (pure functions/classes): Run directly with `python script.py`.
 
-The `reflection_mode: never` in `config.yaml` is the current default. Other modes include `always` (reflect after every step) and `answer_review` (review before final answer via `Agent/answer_review_flow.py`).
+The agent uses a simple ReAct loop: the actor calls tools step by step, then generates a final answer. No reflection or review is needed.
 
 ## Architecture
 
 - `run_tui.py` is the primary runtime entrypoint.
   - Launches a Textual TUI (`TUI/app.py`) which starts the agent backend as a subprocess (`TUI/gateway_entry.py`) and communicates via JSON-RPC over stdio.
-  - `TUI/gateway_entry.py` initializes `MemoryManager`, `ActorAgent`, `ReflectionAgent`, and the in-process tool runtime, then runs the agent loop in `GatewaySession.process_message()`.
-  - The shared agent execution loop (`Agent/agent_loop.py`) is used by the Gateway path (`Gateway/agent_bridge.py`) and answer-review flow.
-  - Three execution modes selected by `agent.reflection_mode`: `never` (no reflection), `always` (reflect after every step), and `answer_review` (review before final answer via `Agent/answer_review_flow.py`).
+  - `TUI/gateway_entry.py` initializes `MemoryManager`, `ActorAgent`, and the in-process tool runtime, then runs the agent loop in `GatewaySession.process_message()`.
+  - The shared agent execution loop (`Agent/agent_loop.py`) is used by the Gateway path (`Gateway/agent_bridge.py`).
 
 - `Agent/LargeLanguageModel.py` is a thin wrapper over the singleton `Agent/LLMCore.py`.
   - `LargeLanguageModel.query()` delegates to `LLMCore.generate()`.
@@ -33,7 +32,6 @@ The `reflection_mode: never` in `config.yaml` is the current default. Other mode
 
 - Prompt locations are split by role.
   - Tool-use prompt: `Agent/ActorAgent.py`
-  - Reflection prompt: `Agent/ReflectionAgent.py`
   - Summarization prompt: `Agent/SummarizerAgent.py`
 
 - Memory is coordinated by `Memory/MemoryManager.py`.
@@ -85,7 +83,7 @@ The `reflection_mode: never` in `config.yaml` is the current default. Other mode
 
 - `config.yaml` controls model paths, memory paths and retention, tool settings, and the retained embedding/rerank settings for the unused RAG shell. The checked-in paths are Windows-specific absolute local paths.
 - This repository is centered on local agent/runtime code. Fine-tuning scripts and runtime LoRA loading have been removed.
-- `run_tui.py` is the active execution mode: TUI-based multi-step agent workflow with actor/reflection/memory management
+- `run_tui.py` is the active execution mode: TUI-based multi-step agent workflow with actor/memory management
 
 ## 开发理念
 - **模块化**：将代码分解为独立的模块和类，以便于理解和维护与后期延展

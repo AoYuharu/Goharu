@@ -105,13 +105,11 @@ class ToolPanel(Container):
         self.set_interval(1.0, self._tick)
 
     def _tick(self):
-        """Called every second — drain pending tool events, then refresh UI"""
+        """Called every second — drain pending tool events, then update elapsed timers"""
         # Drain pending events from reader thread (thread-safe queue)
-        had_events = False
         while True:
             try:
                 event_type, data = self._event_queue.get_nowait()
-                had_events = True
             except queue.Empty:
                 break
 
@@ -120,23 +118,26 @@ class ToolPanel(Container):
                     data.get("tool_name", "unknown"),
                     data.get("arguments", {}),
                     data.get("step", 0),
+                    data.get("call_id", ""),
                 )
             elif event_type == "result":
                 self.add_tool_result(
                     data.get("tool_name", "unknown"),
                     data.get("result", ""),
+                    data.get("call_id", ""),
                 )
 
-        # Always refresh UI if there are active calls or new results
-        if had_events or self._active_calls:
+        # Only refresh calling section to update elapsed timers.
+        # Results section is NOT refreshed here — it only updates on new results
+        # via add_tool_result(), avoiding the auto-scroll-to-bottom on every tick.
+        if self._active_calls:
             self._refresh_calling()
-        if had_events or self._completed_results:
-            self._refresh_results()
 
-    def add_tool_call(self, tool_name: str, arguments: dict, step: int):
+    def add_tool_call(self, tool_name: str, arguments: dict, step: int, call_id: str = ""):
         """Add a tool call to the active (Calling) section"""
-        call_id = f"{tool_name}_{self._call_counter}_{int(time.time() * 1000)}"
-        self._call_counter += 1
+        if not call_id:
+            call_id = f"{tool_name}_{self._call_counter}_{int(time.time() * 1000)}"
+            self._call_counter += 1
 
         self._active_calls[call_id] = {
             "tool_name": tool_name,
@@ -146,14 +147,17 @@ class ToolPanel(Container):
 
         self._refresh_calling()
 
-    def add_tool_result(self, tool_name: str, result: str):
+    def add_tool_result(self, tool_name: str, result: str, call_id: str = ""):
         """Move tool from Calling to Result section"""
-        # Find and remove the first matching active call
+        # Find by exact call_id first, fallback to name matching
         call_id_to_remove = None
-        for cid, call in self._active_calls.items():
-            if call["tool_name"] == tool_name:
-                call_id_to_remove = cid
-                break
+        if call_id and call_id in self._active_calls:
+            call_id_to_remove = call_id
+        else:
+            for cid, call in self._active_calls.items():
+                if call["tool_name"] == tool_name:
+                    call_id_to_remove = cid
+                    break
 
         if call_id_to_remove:
             call_info = self._active_calls.pop(call_id_to_remove)

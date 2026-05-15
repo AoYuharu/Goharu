@@ -7,8 +7,8 @@ from Tools.security import check_command_safety
 from Tools.tool_process_tracker import tool_process_tracker
 from Tools.platform_utils import (
     get_subprocess_env,
-    get_system_encoding,
     get_subprocess_creation_flags,
+    is_windows,
     kill_process_tree,
 )
 
@@ -40,12 +40,12 @@ async def run_cmd(cmd: str) -> str:
     # 🔒 安全检查：拦截危险命令
     is_safe, error_message = check_command_safety(cmd)
     if not is_safe:
-        return error_message
+        return json.dumps({"error": error_message}, ensure_ascii=False)
 
     # 检测 echo 命令用于文件操作
     # 匹配: echo ... > file, echo ... >> file
     if re.search(r'\becho\b.*?(?:>>?)\s*\S+', cmd_lower):
-        return """ERROR: File operation with 'echo' is not allowed.
+        return json.dumps({"error": """File operation with 'echo' is not allowed.
 
 You attempted to use 'echo' for file operations, which is prohibited.
 
@@ -59,7 +59,7 @@ Please use the dedicated tools instead:
   2. {"tool": "Edit", "arguments": {"path": "file.txt", "old_string": "old text", "new_string": "new text"}}
 
 These tools are safer, provide better error handling, and ensure you know what you're changing.
-DO NOT retry with run_cmd. Use the dedicated tools."""
+DO NOT retry with run_cmd. Use the dedicated tools."""}, ensure_ascii=False)
 
     # 检测其他被禁止的文件操作命令
     forbidden_patterns = [
@@ -73,26 +73,30 @@ DO NOT retry with run_cmd. Use the dedicated tools."""
 
     for pattern, cmd_name in forbidden_patterns:
         if re.search(pattern, cmd_lower):
-            return f"""ERROR: Using '{cmd_name}' for file operations is not allowed.
+            return json.dumps({"error": f"""Using '{cmd_name}' for file operations is not allowed.
 
 Please use the dedicated tools instead:
 - To READ a file: Use the Read tool
 - To SEARCH in files: Use the Grep tool
 - To MODIFY a file: Use Read + Edit tools
 
-DO NOT retry with run_cmd. Use the dedicated tools."""
+DO NOT retry with run_cmd. Use the dedicated tools."""}, ensure_ascii=False)
 
     # 执行命令（带超时，默认30s；平台适配的进程组确保超时能杀死子进程树）
     env = get_subprocess_env()
-    sys_encoding = get_system_encoding()
+    # Windows: 统一使用 UTF-8 编码，避免 cp936 与 Python 子进程 UTF-8 输出不一致导致中文乱码
+    # chcp 65001 强制 cmd.exe 使用 UTF-8 代码页；env 中 PYTHONUTF8=1 强制 Python 子进程用 UTF-8
+    actual_cmd = cmd
+    if is_windows() and cmd.strip():
+        actual_cmd = f'chcp 65001 >nul 2>nul && {cmd}'
     try:
         p = subprocess.Popen(
-            cmd,
+            actual_cmd,
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            encoding=sys_encoding,
+            encoding='utf-8',
             errors='replace',
             env=env,
             creationflags=get_subprocess_creation_flags(),
@@ -100,13 +104,26 @@ DO NOT retry with run_cmd. Use the dedicated tools."""
         tool_process_tracker.register(p.pid)
         try:
             stdout, stderr = await asyncio.to_thread(p.communicate, timeout=30)
-            output = (stdout or "").strip()
-            if not output:
-                output = (stderr or "").strip()
-            return output if output else "(no output)"
+            return json.dumps({
+                "exit_code": p.returncode,
+                "stdout": (stdout or "").strip(),
+                "stderr": (stderr or "").strip(),
+                "timed_out": False,
+                "interrupted": False,
+            }, ensure_ascii=False)
         except asyncio.CancelledError:
             kill_process_tree(p.pid)
-            raise
+            try:
+                stdout, stderr = await asyncio.to_thread(p.communicate, timeout=5)
+            except Exception:
+                stdout, stderr = "", ""
+            return json.dumps({
+                "exit_code": -1,
+                "stdout": (stdout or "").strip(),
+                "stderr": (stderr or "").strip(),
+                "timed_out": False,
+                "interrupted": True,
+            }, ensure_ascii=False)
         finally:
             tool_process_tracker.unregister(p.pid)
     except subprocess.TimeoutExpired:
@@ -115,25 +132,57 @@ DO NOT retry with run_cmd. Use the dedicated tools."""
             stdout, stderr = await asyncio.to_thread(p.communicate, timeout=5)
         except subprocess.TimeoutExpired:
             p.kill()
-            await asyncio.to_thread(p.communicate)
-        partial = ((stdout or "") + (stderr or "")).strip()
-        msg = "ERROR: Command timed out after 30s."
-        if partial:
-            msg += f"\nPartial output:\n{partial}"
-        return msg
+            try:
+                stdout, stderr = await asyncio.to_thread(p.communicate, timeout=2)
+            except Exception:
+                stdout, stderr = "", ""
+        except Exception:
+            stdout, stderr = "", ""
+        return json.dumps({
+            "exit_code": -1,
+            "stdout": (stdout or "").strip(),
+            "stderr": (stderr or "").strip(),
+            "timed_out": True,
+            "interrupted": False,
+        }, ensure_ascii=False)
 
 
 
 
 registry.register(
     name="run_cmd",
-    description="Execute a shell command. ONLY for system operations that dedicated file tools (Write/Read/Edit/Grep) cannot handle. Use the native shell for the current platform.",
+    description=(
+        "Execute a shell command. STRICTLY for system-level operations that CANNOT be done with dedicated tools. "
+        "Commands time out after 30s. Returns JSON with exit_code/stdout/stderr/timed_out/interrupted.\n\n"
+        "ALLOWED (examples): 'python script.py' / 'pytest test_xxx.py' / 'pip install pkg' / "
+        "'git add file && git commit -m msg' / 'gh pr create ...' / 'mkdir new_dir' / 'ls' / 'dir'.\n\n"
+        "BLOCKED — file reading/writing: echo >, echo >>, cat, head, tail, sed, awk, type | . "
+        "These MUST use dedicated tools instead: Read for reading, Write for creating, Edit for modifying, Grep for searching, Glob for listing files.\n\n"
+        "BLOCKED — dangerous: shutdown, rm -rf, format, diskpart, del /s, reg delete, sudo, chmod 777, and any destructive system commands. "
+        "Also BLOCKED: any command that attempts to bypass the blocked-file-ops restriction (e.g. 'python -c \"open(...).write(...)\"'). "
+        "The security layer will reject these at runtime — do NOT retry with variations."
+    ),
     arguments_schema={
         "type": "object",
         "properties": {
             "cmd": {
                 "type": "string",
-                "description": "Shell command. Use the native shell for the current OS. Examples (cross-platform): 'python script.py', 'pip install requests', 'mkdir new_folder'. Use 'ls' / 'dir' depending on platform. BLOCKED: shutdown, rm -rf, format, diskpart, del /s, reg delete, sudo. BLOCKED file ops: echo >, cat, sed, awk, type | (use Write/Read/Edit/Grep instead).",
+                "description": (
+                    "The shell command to execute. Use the native shell for the current OS (cmd.exe on Windows, bash on Unix).\n\n"
+                    "ALLOWED: python/pytest/pip/git/gh/mkdir/ls/dir/cd/mv/cp/docker/npm/npx/git-lfs and similar system tools — "
+                    "anything that genuinely needs a shell because no dedicated tool exists.\n\n"
+                    "BLOCKED — use dedicated tools instead:\n"
+                    "  echo ... > file  →  Use Write\n"
+                    "  echo ... >> file →  Use Edit\n"
+                    "  cat / head / tail →  Use Read\n"
+                    "  sed / awk         →  Use Edit\n"
+                    "  grep / rg         →  Use Grep\n"
+                    "  find / ls pattern →  Use Glob\n"
+                    "  type file | ...   →  Use Read\n\n"
+                    "BLOCKED — dangerous (no dedicated tool to handle, MUST reject):\n"
+                    "  shutdown, reboot, rm -rf, format, diskpart, del /s, reg delete, sudo, chmod 777, "
+                    "dd, mkfs, and any command that could damage the system. Do NOT attempt these."
+                ),
             },
         },
         "required": ["cmd"],

@@ -2,7 +2,7 @@ from Agent.LargeLanguageModel import LargeLanguageModel
 import asyncio
 import json
 
-from Memory.ToolCall import ToolCall
+from Core.ToolCall import ToolCall
 from Prompting.PromptAssembler import PromptAssembler
 from Prompting.PromptRenderer import PromptRenderer
 from Tools.guard import ToolCallGuard
@@ -41,6 +41,30 @@ class ActorAgent(LargeLanguageModel):
         if len(compact) <= max_length:
             return compact
         return compact[: max_length - 3] + "..."
+
+    @staticmethod
+    def _apply_tool_result_budget(results):
+        """Apply token budget to tool results. Saves oversized results to cache dir.
+
+        Called after tool execution, before recording to working memory.
+        """
+        from Agent.ToolResultBudget import ToolResultBudget
+
+        max_single = config.get("tools.result_budget.max_single_tokens", 8000)
+        max_batch = config.get("tools.result_budget.max_batch_tokens", 24000)
+        cache_dir = config.get(
+            "tools.result_budget.cache_dir", "./runtime_memory/tool_cache"
+        )
+        return ToolResultBudget.apply(results, cache_dir, max_single, max_batch)
+
+    @staticmethod
+    def _is_backgrounded(result_text):
+        """Check if a tool result indicates the task was moved to background."""
+        try:
+            parsed = json.loads(result_text)
+            return parsed.get("backgrounded", False)
+        except (json.JSONDecodeError, TypeError):
+            return False
 
     @staticmethod
     def _summarize_arguments(args, max_length=120):
@@ -131,6 +155,25 @@ class ActorAgent(LargeLanguageModel):
         )
 
     @staticmethod
+    async def _run_llm_with_interrupt(query_fn, interrupt_check, poll_interval=0.3):
+        """在后台线程运行阻塞的 LLM 查询，定期检查中断标志。
+
+        如果 interrupt_check 返回 True，立即放弃等待（后台线程仍会完成但结果被丢弃），返回 None。
+        否则等待查询完成并返回结果。
+        """
+        if not interrupt_check:
+            return query_fn()
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, query_fn)
+        while True:
+            if interrupt_check():
+                return None  # 用户中断，放弃等待
+            try:
+                return await asyncio.wait_for(asyncio.shield(future), timeout=poll_interval)
+            except asyncio.TimeoutError:
+                pass  # 超时后再次检查中断标志
+
+    @staticmethod
     async def _run_tasks_with_interrupt(tasks: list, interrupt_check):
         """执行一组 asyncio.Task，每隔 0.1s 检查中断标志。
         如果中断触发，取消所有未完成任务，返回 None。
@@ -161,7 +204,7 @@ class ActorAgent(LargeLanguageModel):
                 t.cancel()
             raise
 
-    async def act(self, max_retries=3, on_tool_call_start=None, on_thinking=None, on_tool_result=None, _interrupt_check=None):
+    async def act(self, max_retries=3, on_tool_call_start=None, on_thinking=None, on_tool_result=None, _interrupt_check=None, extra_system_prompt=None):
         """
         执行一次推理，支持工具调用重试和并发执行多个工具
 
@@ -171,6 +214,7 @@ class ActorAgent(LargeLanguageModel):
             on_thinking: 收到 thinking 块时立即回调，接收(thinking_text)，在工具执行前触发
             on_tool_result: 单个工具执行完成时立即回调，接收(tool_name, result_text)，不等其他工具
             _interrupt_check: 可选中断检查回调，返回 True 表示用户请求了中断
+            extra_system_prompt: 额外的系统提示词（如 Snip 提醒），注入到本步 prompt 中
         """
         # 确保工具定义已加载（防止首次调用来不及加载）
         tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
@@ -182,7 +226,7 @@ class ActorAgent(LargeLanguageModel):
                 pass
 
         # 先构建消息（这会触发工具定义的加载）
-        build_result = self.build_messages_with_document()
+        build_result = self.build_messages_with_document(extra_system_prompt)
         messages = build_result["messages"]
         tool_definitions = build_result["tool_definitions"]
 
@@ -236,8 +280,13 @@ class ActorAgent(LargeLanguageModel):
         if _interrupt_check and _interrupt_check():
             return {"type": "interrupted"}
 
-        # 调用 LLM
-        response = self.query(messages, **gen_kwargs)
+        # 调用 LLM（可被 ESC 中断：查询在后台线程运行，主循环轮询中断标志）
+        response = await self._run_llm_with_interrupt(
+            lambda: self.query(messages, **gen_kwargs),
+            _interrupt_check
+        )
+        if response is None:
+            return {"type": "interrupted"}
 
         # 提取usage信息
         usage = self._extract_usage(response)
@@ -245,7 +294,7 @@ class ActorAgent(LargeLanguageModel):
         # 解析响应
         if not hasattr(response, "content"):
             # 降级到文本模式
-            return await self._act_with_text_tools(max_retries, on_tool_call_start)
+            return await self._act_with_text_tools(max_retries, on_tool_call_start, _interrupt_check=_interrupt_check)
 
         # 提取所有 tool_use、text、thinking 块
         tool_use_blocks = []
@@ -361,8 +410,9 @@ class ActorAgent(LargeLanguageModel):
             args = guard_result["arguments"] if guard_result else raw_args
 
             # 通知工具调用开始
+            call_id = tool_use_block.get("id", "")
             if on_tool_call_start:
-                on_tool_call_start(tool_name, args, str(tool_use_block), guard_result)
+                on_tool_call_start(tool_name, args, call_id, guard_result)
 
             # 执行工具调用
             try:
@@ -376,7 +426,7 @@ class ActorAgent(LargeLanguageModel):
 
             # 立即通过回调发出单个工具结果（不等其他工具）
             if on_tool_result:
-                on_tool_result(tool_name, self._preview_text(result_text))
+                on_tool_result(tool_name, call_id, self._preview_text(result_text))
 
             return {
                 "tool_use_id": tool_use_block.get("id"),
@@ -397,19 +447,22 @@ class ActorAgent(LargeLanguageModel):
         if results is None:
             return {"type": "interrupted"}
 
+        # 对工具结果施加 token 预算（大批量结果缓存到文件）
+        self._apply_tool_result_budget(results)
+
         # 检查是否有错误
         errors = [r for r in results if "error" in r]
         if errors and max_retries > 0:
             # 构建错误反馈消息
             error_msgs = [r["error"] for r in errors]
 
-            # 将原始响应和错误反馈添加到上下文
+            # 将原始响应的 tool_use 块存入上下文
             self.working.append({
                 "role": "assistant",
                 "content": [block for block in response.content],
             })
 
-            # 为每个失败的工具调用添加 tool_result（错误）
+            # 为所有工具调用添加 tool_result（成功和失败都要配对，避免 400/2013 错误）
             tool_results = []
             for r in results:
                 if "error" in r:
@@ -418,6 +471,15 @@ class ActorAgent(LargeLanguageModel):
                             r["tool_use_id"],
                             r["error"],
                             is_error=True,
+                        )
+                    )
+                else:
+                    is_error = ToolCall.classify_is_error(r.get("tool_name", ""), r["result_text"])
+                    tool_results.append(
+                        ToolCall.create_anthropic_tool_result(
+                            r["tool_use_id"],
+                            r["result_text"],
+                            is_error=is_error,
                         )
                     )
 
@@ -432,8 +494,11 @@ class ActorAgent(LargeLanguageModel):
             return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check)
 
         # 记录所有成功的工具调用到 working memory
+        # Separate backgrounded results from synchronous results
         assistant_content = []
         user_content = []
+        backgrounded_results = []
+        synchronous_results = []
 
         # 1. 如果有 text 内容，先添加 text 块（保留 LLM 的说明文字）
         if text_content:
@@ -441,22 +506,57 @@ class ActorAgent(LargeLanguageModel):
             if text_str:
                 assistant_content.append({"type": "text", "text": text_str})
 
-        # 2. 添加所有 tool_use 块
+        # 2. 分类处理 tool_use 块
         for i, result in enumerate(results):
-            if "error" not in result:
-                # 添加 tool_use 块
+            if "error" in result:
+                continue
+            is_bg = self._is_backgrounded(result["result_text"])
+            if is_bg:
+                backgrounded_results.append(result)
                 assistant_content.append(tool_use_blocks[i])
-
-                # 添加 tool_result 块
+                # Extract background task info
+                try:
+                    bg_info = json.loads(result["result_text"])
+                    task_id = bg_info.get("task_id", "?")
+                except (json.JSONDecodeError, TypeError):
+                    task_id = "?"
+                # MUST include a tool_result to pair with tool_use (Anthropic API requirement)
+                # Without this, the next LLM call triggers error 2013:
+                #   "tool call result does not follow tool call"
+                user_content.append(
+                    ToolCall.create_anthropic_tool_result(
+                        result["tool_use_id"],
+                        json.dumps({
+                            "backgrounded": True,
+                            "task_id": task_id,
+                            "message": f"Tool '{result['tool_name']}' moved to background (task #{task_id}). Results will be injected when ready."
+                        }, ensure_ascii=False),
+                        is_error=False,
+                    )
+                )
+                # Also inject system-level note for the LLM's attention
+                self.working.append({
+                    "role": "user",
+                    "content": (
+                        f"[System: task-background] Tool '{result['tool_name']}' "
+                        f"has moved to background (task #{task_id}). "
+                        f"You can continue other work — results will be "
+                        f"injected when ready."
+                    ),
+                })
+            else:
+                synchronous_results.append(result)
+                assistant_content.append(tool_use_blocks[i])
+                is_error = ToolCall.classify_is_error(result["tool_name"], result["result_text"])
                 user_content.append(
                     ToolCall.create_anthropic_tool_result(
                         result["tool_use_id"],
                         result["result_text"],
-                        is_error=False,
+                        is_error=is_error,
                     )
                 )
 
-        # 记录到 working memory
+        # 记录到 working memory (all results include tool_result for API pairing)
         if assistant_content:
             self.working.append({
                 "role": "assistant",
@@ -469,9 +569,20 @@ class ActorAgent(LargeLanguageModel):
                 "content": user_content,
             })
 
-        # 返回多个工具调用的结果
+        # Determine response type
+        all_sync = [r for r in results if "error" not in r and not self._is_backgrounded(r["result_text"])]
+
+        if backgrounded_results and not all_sync:
+            response_type = "tool_backgrounded"
+        elif all_sync:
+            response_type = "tool_batch" if len(all_sync) > 1 else "tool"
+        else:
+            # All results are backgrounded
+            response_type = "tool_backgrounded"
+
+        # 返回结果
         result = {
-            "type": "tool_batch",
+            "type": response_type,
             "tool_calls": [
                 {
                     "tool_name": r["tool_name"],
@@ -479,11 +590,13 @@ class ActorAgent(LargeLanguageModel):
                     "arguments_summary": self._summarize_arguments(r["arguments"]),
                     "result_preview": self._preview_text(r["result_text"]),
                     "guard_logs": r["guard_result"].get("logs") if r.get("guard_result") else None,
+                    "backgrounded": self._is_backgrounded(r["result_text"]),
                 }
                 for r in results if "error" not in r
             ],
+            "has_backgrounded": len(backgrounded_results) > 0,
             "raw_reply": str(response),
-            "usage": usage
+            "usage": usage,
         }
         if thinking_content:
             thinking_text = "\n".join(thinking_content).strip()
@@ -503,7 +616,13 @@ class ActorAgent(LargeLanguageModel):
         if _interrupt_check and _interrupt_check():
             return {"type": "interrupted"}
 
-        reply = self.query(messages)
+        # 调用 LLM（可被 ESC 中断：查询在后台线程运行，主循环轮询中断标志）
+        reply = await self._run_llm_with_interrupt(
+            lambda: self.query(messages),
+            _interrupt_check
+        )
+        if reply is None:
+            return {"type": "interrupted"}
         thinking = self.get_last_thinking()
         usage = self.get_last_usage()
 
@@ -541,8 +660,9 @@ class ActorAgent(LargeLanguageModel):
                 args = guard_result["arguments"] if guard_result else raw_args
 
                 # 通知工具调用开始（在执行之前）
+                text_call_id = f"txt_{id(tool_call_obj)}"
                 if on_tool_call_start:
-                    on_tool_call_start(tool_name, args, reply, guard_result)
+                    on_tool_call_start(tool_name, args, text_call_id, guard_result)
 
                 # 执行工具调用
                 try:
@@ -557,7 +677,7 @@ class ActorAgent(LargeLanguageModel):
 
                 # 立即通过回调发出单个工具结果
                 if on_tool_result:
-                    on_tool_result(tool_name, self._preview_text(result_text))
+                    on_tool_result(tool_name, text_call_id, self._preview_text(result_text))
 
                 return {
                     "tool_call": tool_call_obj,
@@ -578,6 +698,9 @@ class ActorAgent(LargeLanguageModel):
             if results is None:
                 return {"type": "interrupted"}
 
+            # 对工具结果施加 token 预算
+            self._apply_tool_result_budget(results)
+
             # 检查是否有错误
             errors = [r for r in results if "error" in r]
             if errors and max_retries > 0:
@@ -591,21 +714,50 @@ class ActorAgent(LargeLanguageModel):
                     "role": "user",
                     "content": f"部分工具调用失败: {'; '.join(error_msgs)}\n请重新生成正确的工具调用。",
                 })
-                return await self.act(max_retries=max_retries - 1, on_tool_call_start=on_tool_call_start, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check)
+                return await self.act(max_retries=max_retries - 1, on_tool_call_start=on_tool_call_start, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check, extra_system_prompt=extra_system_prompt)
 
             # 记录所有成功的工具调用到 working memory
+            backgrounded_results = []
             for result in results:
                 if "error" not in result:
-                    self.working.append(result["tool_call"])
-                    self.working.append({
-                        "role": "tool",
-                        "name": result["tool_name"],
-                        "content": result["result_text"],
-                    })
+                    if self._is_backgrounded(result["result_text"]):
+                        backgrounded_results.append(result)
+                        self.working.append(result["tool_call"])
+                        try:
+                            bg_info = json.loads(result["result_text"])
+                            task_id = bg_info.get("task_id", "?")
+                        except (json.JSONDecodeError, TypeError):
+                            task_id = "?"
+                        self.working.append({
+                            "role": "user",
+                            "content": (
+                                f"[System: task-background] Tool '{result['tool_name']}' "
+                                f"has moved to background (task #{task_id}). "
+                                f"You can continue other work — results will be "
+                                f"injected when ready."
+                            ),
+                        })
+                    else:
+                        self.working.append(result["tool_call"])
+                        content = result["result_text"]
+                        if ToolCall.classify_is_error(result.get("tool_name", ""), content):
+                            content = f"[ERROR] {content}"
+                        self.working.append({
+                            "role": "tool",
+                            "name": result["tool_name"],
+                            "content": content,
+                        })
+
+            # Determine response type
+            all_sync = [r for r in results if "error" not in r and not self._is_backgrounded(r["result_text"])]
+            if backgrounded_results and not all_sync:
+                response_type = "tool_backgrounded"
+            else:
+                response_type = "tool_batch"
 
             # 返回多个工具调用的结果
             result = {
-                "type": "tool_batch",
+                "type": response_type,
                 "tool_calls": [
                     {
                         "tool_name": r["tool_name"],
@@ -613,9 +765,11 @@ class ActorAgent(LargeLanguageModel):
                         "arguments_summary": self._summarize_arguments(r["arguments"]),
                         "result_preview": self._preview_text(r["result_text"]),
                         "guard_logs": r["guard_result"].get("logs") if r.get("guard_result") else None,
+                        "backgrounded": self._is_backgrounded(r["result_text"]),
                     }
                     for r in results if "error" not in r
                 ],
+                "has_backgrounded": len(backgrounded_results) > 0,
                 "raw_reply": reply,
                 "usage": usage,
             }
@@ -649,7 +803,7 @@ class ActorAgent(LargeLanguageModel):
                             "role": "user",
                             "content": f"工具调用失败: {error_msg}\n请重新生成正确的工具调用。",
                         })
-                        return await self.act(max_retries=max_retries - 1, on_tool_call_start=on_tool_call_start, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check)
+                        return await self.act(max_retries=max_retries - 1, on_tool_call_start=on_tool_call_start, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check, extra_system_prompt=extra_system_prompt)
                     else:
                         # 重试次数耗尽，返回错误
                         error_response = f"工具调用失败（已重试 3 次）: {error_msg}"
@@ -666,8 +820,9 @@ class ActorAgent(LargeLanguageModel):
             args = guard_result["arguments"] if guard_result else raw_args
 
             # 通知工具调用开始（在执行之前）
+            seq_call_id = f"seq_{id(tool_call)}_{int(time.time() * 1000)}"
             if on_tool_call_start:
-                on_tool_call_start(tool_name, args, reply, guard_result)
+                on_tool_call_start(tool_name, args, seq_call_id, guard_result)
 
             # 执行工具调用（可中断）
             tool_task = asyncio.create_task(self.tool_runtime.call_tool(tool_name, args))
@@ -677,8 +832,12 @@ class ActorAgent(LargeLanguageModel):
             result = results[0]
             result_text = self._stringify_tool_result(result)
 
+            # 对工具结果施加 token 预算（原地修改 result_text）
+            self._apply_tool_result_budget(results)
+            result_text = self._stringify_tool_result(result)  # 刷新，可能已被替换
+
             # 检查工具执行结果是否为错误
-            if isinstance(result.content, str) and result.content.startswith('{"error":'):
+            if ToolCall.classify_is_error(tool_name, result_text):
                 # 工具执行失败，尝试重试
                 if max_retries > 0:
                     self.working.append(tool_call)
@@ -691,15 +850,36 @@ class ActorAgent(LargeLanguageModel):
                         "role": "user",
                         "content": f"工具执行失败: {result_text}\n请检查参数并重新调用。",
                     })
-                    return await self.act(max_retries=max_retries - 1, on_tool_call_start=on_tool_call_start, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check)
+                    return await self.act(max_retries=max_retries - 1, on_tool_call_start=on_tool_call_start, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check, extra_system_prompt=extra_system_prompt)
 
-            # 成功执行，记录到 working memory
+            # 成功执行 — 检查是否被后台化
+            is_bg = self._is_backgrounded(result_text)
+
+            # 记录到 working memory
             self.working.append(tool_call)
-            self.working.append({
-                "role": "tool",
-                "name": tool_name,
-                "content": result_text,
-            })
+            if is_bg:
+                try:
+                    bg_info = json.loads(result_text)
+                    task_id = bg_info.get("task_id", "?")
+                except (json.JSONDecodeError, TypeError):
+                    task_id = "?"
+                self.working.append({
+                    "role": "user",
+                    "content": (
+                        f"[System: task-background] Tool '{tool_name}' "
+                        f"has moved to background (task #{task_id}). "
+                        f"You can continue other work — results will be "
+                        f"injected when ready."
+                    ),
+                })
+            else:
+                is_err = ToolCall.classify_is_error(tool_name, result_text)
+                content = f"[ERROR] {result_text}" if is_err else result_text
+                self.working.append({
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": content,
+                })
 
             # 任务引导：检测重复行为
             if self.task_guide:
@@ -711,7 +891,7 @@ class ActorAgent(LargeLanguageModel):
                     })
 
             result = {
-                "type": "tool",
+                "type": "tool_backgrounded" if is_bg else "tool",
                 "tool_name": tool_name,
                 "arguments": args,
                 "arguments_summary": self._summarize_arguments(args),
@@ -719,6 +899,7 @@ class ActorAgent(LargeLanguageModel):
                 "raw_reply": reply,
                 "usage": usage,
                 "guard_logs": guard_result.get("logs") if guard_result else None,
+                "has_backgrounded": is_bg,
             }
             if thinking:
                 result["thinking"] = thinking

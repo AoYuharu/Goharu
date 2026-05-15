@@ -1,9 +1,10 @@
 import json
+import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from configurationLoader import config
-from Memory.ToolCall import ToolCall
+from Core.ToolCall import ToolCall
 
 
 class WorkingMemory:
@@ -64,7 +65,11 @@ class WorkingMemory:
 
         tool_call = ToolCall.from_record(message)
         if tool_call is not None:
-            return tool_call.to_record(timestamp=message.get("timestamp"))
+            record = tool_call.to_record(timestamp=message.get("timestamp"))
+            # 保留原始消息的 id（to_record 不包含 id 字段）
+            if "id" in message:
+                record["id"] = message["id"]
+            return record
 
         return dict(message)
 
@@ -77,6 +82,8 @@ class WorkingMemory:
         normalized["timestamp"] = (
             source_message.get("timestamp") or fallback_timestamp or self._now()
         )
+        if "id" not in normalized:
+            normalized["id"] = f"msg_{uuid.uuid4().hex[:8]}"
         return normalized
 
     def _read_day_file(self, path: Path):

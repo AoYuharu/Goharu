@@ -3,7 +3,7 @@ import os
 import re
 
 from configurationLoader import config
-from Memory.ToolCall import ToolCall
+from Core.ToolCall import ToolCall
 
 
 class LLMCore:
