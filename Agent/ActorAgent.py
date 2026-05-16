@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # PromptRenderer 会为每条历史消息注入 [ID:msg_xxxxxxxx] 前缀（供 snip 工具使用），
 # LLM 可能模仿这个格式在输出开头写入同样的 ID 标记。这里用正则剥离这些前缀。
-_ID_PREFIX_PATTERN = re.compile(r'^(\[ID:msg_[a-f0-9]+\]\s*)+', re.MULTILINE)
+_ID_PREFIX_PATTERN = re.compile(r'^(\[ID:msg_[a-f0-9]+\]\s*)+')
 
 
 def _strip_id_prefixes(text):
