@@ -11,9 +11,20 @@ from Prompting.PromptAssembler import PromptAssembler
 from Prompting.PromptRenderer import PromptRenderer
 from Tools.guard import ToolCallGuard
 from Tools.task_guide import TaskGuide
+import re
+
 from configurationLoader import config
 
 logger = logging.getLogger(__name__)
+
+# PromptRenderer 会为每条历史消息注入 [ID:msg_xxxxxxxx] 前缀（供 snip 工具使用），
+# LLM 可能模仿这个格式在输出开头写入同样的 ID 标记。这里用正则剥离这些前缀。
+_ID_PREFIX_PATTERN = re.compile(r'^(\[ID:msg_[a-f0-9]+\]\s*)+', re.MULTILINE)
+
+
+def _strip_id_prefixes(text):
+    """移除 LLM 输出中从 Prompt 上下文模仿的 [ID:xxx] 前缀。"""
+    return _ID_PREFIX_PATTERN.sub('', text)
 
 # 专用 executor，不受事件循环生命周期影响
 # Python 3.9+ 的 ThreadPoolExecutor 会在 __init__ 注册 atexit handler，
@@ -391,7 +402,7 @@ class ActorAgent(LargeLanguageModel):
 
         # 立即通过回调发出 thinking（在工具执行之前）
         if thinking_content and on_thinking:
-            thinking_text = "\n".join(thinking_content).strip()
+            thinking_text = _strip_id_prefixes("\n".join(thinking_content).strip())
             if thinking_text:
                 on_thinking(thinking_text)
 
@@ -399,12 +410,13 @@ class ActorAgent(LargeLanguageModel):
         MAX_AUTO_CONTINUE = 2
         stop_reason = getattr(response, "stop_reason", None)
         if stop_reason == "max_tokens" and not tool_use_blocks and _auto_continue_count < MAX_AUTO_CONTINUE:
-            # 记录截断的输出
+            # 记录截断的输出（剥离 LLM 可能模仿的 [ID:xxx] 前缀）
             if thinking_content:
-                thinking_text = "\n".join(thinking_content).strip()
+                thinking_text = _strip_id_prefixes("\n".join(thinking_content).strip())
                 self.working.append({"role": "assistant", "content": thinking_text})
             if text_content:
-                self.working.append({"role": "assistant", "content": "\n".join(text_content).strip()})
+                partial = _strip_id_prefixes("\n".join(text_content).strip())
+                self.working.append({"role": "assistant", "content": partial})
             # 注入续写指令
             self.working.append({
                 "role": "user",
@@ -421,7 +433,7 @@ class ActorAgent(LargeLanguageModel):
 
         # 仅包含 thinking 块 → 模型还在思考，继续循环
         if thinking_content and not text_content and not tool_use_blocks:
-            thinking_text = "\n".join(thinking_content).strip()
+            thinking_text = _strip_id_prefixes("\n".join(thinking_content).strip())
             if thinking_text:
                 self.working.append({"role": "assistant", "content": thinking_text})
                 return {
@@ -432,9 +444,9 @@ class ActorAgent(LargeLanguageModel):
                     "usage": usage
                 }
 
-        # 如果没有工具调用，返回文本答案
+        # 如果没有工具调用，返回文本答案（剥离 LLM 可能模仿的 [ID:xxx] 前缀）
         if not tool_use_blocks:
-            answer = "\n".join(text_content).strip()
+            answer = _strip_id_prefixes("\n".join(text_content).strip())
             if answer:
                 self.working.append({"role": "assistant", "content": answer})
                 result = {
@@ -702,6 +714,7 @@ class ActorAgent(LargeLanguageModel):
         usage = self.get_last_usage()
 
         # 立即通过回调发出 thinking
+        thinking = _strip_id_prefixes(thinking) if thinking else ""
         if thinking and on_thinking:
             on_thinking(thinking)
 
@@ -980,6 +993,7 @@ class ActorAgent(LargeLanguageModel):
                 result["thinking"] = thinking
             return result
 
+        reply = _strip_id_prefixes(reply)
         self.working.append({"role": "assistant", "content": reply})
         result = {
             "type": "answer",
