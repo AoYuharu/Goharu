@@ -24,3 +24,12 @@ PyMuPDF>=1.23.0
 pdfplumber>=0.10.0
 Pillow>=10.0.0
 pytesseract>=0.3.10
+
+# BM25 + jieba 中文分词
+jieba>=0.42.1
+
+# 本地 GGUF embedding 模型加载
+llama-cpp-python>=0.3.0
+
+# 从 HuggingFace 下载 GGUF 文件
+huggingface_hub>=0.25.0

@@ -5,12 +5,46 @@ Manages subprocess communication with the Gateway server
 """
 
 import json
+import logging
+import os
 import subprocess
 import sys
 import threading
-from typing import Dict, Any, Callable, Optional
+from datetime import datetime
 from pathlib import Path
 from queue import Queue
+from typing import Dict, Any, Callable, Optional
+
+# TUI 侧日志 — 写入 runtime_memory/logs/tui/gateway_client.log
+_TUI_LOG_BASE = Path(__file__).parent.parent / "runtime_memory" / "logs" / "tui"
+_TUI_LOG_BASE.mkdir(parents=True, exist_ok=True)
+_tui_handler = logging.FileHandler(
+    _TUI_LOG_BASE / "gateway_client.log",
+    encoding="utf-8",
+)
+_tui_handler.setFormatter(logging.Formatter(
+    '%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+))
+_log = logging.getLogger("TUI.GatewayClient")
+_log.setLevel(logging.DEBUG)
+_log.addHandler(_tui_handler)
+_log.propagate = False  # 不向 root logger 传播
+
+# trace 文件（直接 fsync，绕过 logging）
+_TRACE_PATH = _TUI_LOG_BASE / "trace.log"
+
+
+def _trace(msg: str):
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.")
+        ts += f"{datetime.now().microsecond // 1000:03d}"
+        with open(_TRACE_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{ts} [GC] {msg}\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
 
 
 class GatewayClient:
@@ -44,10 +78,7 @@ class GatewayClient:
         if not gateway_entry.exists():
             raise FileNotFoundError(f"Gateway entry script not found: {gateway_entry}")
 
-        # Start subprocess with unbuffered output and UTF-8 encoding
-        # IMPORTANT: On Windows, we need to be very explicit about UTF-8
-        import locale
-        import os
+        _log.info("Starting gateway subprocess: %s -u %s", python, gateway_entry)
 
         # Force UTF-8 environment
         env = os.environ.copy()
@@ -67,6 +98,7 @@ class GatewayClient:
         )
 
         self._running = True
+        _log.info("Gateway subprocess started, pid=%d", self.process.pid)
 
         # Start reader thread
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -77,16 +109,21 @@ class GatewayClient:
 
     def stop(self):
         """Stop the gateway subprocess"""
+        _trace("GatewayClient.stop() called")
         self._running = False
 
         if self.process:
             try:
+                _trace("GatewayClient.stop() closing stdin...")
                 self.process.stdin.close()
                 self.process.wait(timeout=2)
+                _trace("GatewayClient.stop() gateway exited cleanly")
             except:
+                _trace("GatewayClient.stop() killing gateway...")
                 self.process.kill()
             finally:
                 self.process = None
+                _trace("GatewayClient.stop() done")
 
     def force_kill(self):
         """Force kill gateway subprocess and all children (cross-platform)"""
@@ -186,11 +223,16 @@ class GatewayClient:
         if not self.process or not self.process.stdout:
             return
 
+        _trace("Reader thread started")
+        _log.info("Gateway reader thread started")
+        msg_count = 0
         try:
             for line in self.process.stdout:
                 if not self._running:
+                    _log.info("Reader stopping (not running)")
                     break
 
+                msg_count += 1
                 line = line.strip()
                 if not line:
                     continue
@@ -199,13 +241,18 @@ class GatewayClient:
                     message = json.loads(line)
                     if message.get("method") == "event":
                         params = message.get("params", {})
-                        if params.get("type") == "gateway.ready":
+                        event_type = params.get("type", "")
+                        if event_type == "gateway.ready":
                             self._ready_received = True
+                            _log.info("Gateway ready signal received")
+                        # 不记录高频事件（streaming, thinking_content）
+                        if event_type not in ("agent.streaming", "agent.thinking_content", "token.stats"):
+                            _log.debug("Event: %s", event_type)
                     self._handle_message(message)
                 except json.JSONDecodeError:
-                    # Ignore malformed JSON
-                    pass
-        except Exception:
+                    _log.debug("Skipped malformed JSON: %.100s", line)
+        except Exception as e:
+            _log.error("Reader thread exception: %s", e, exc_info=True)
             # If killed intentionally, don't emit crash error
             if self._killed_intentionally:
                 return
@@ -222,6 +269,8 @@ class GatewayClient:
                     }
                 })
         finally:
+            _trace(f"Reader thread exit: {msg_count} messages processed")
+            _log.info("Reader thread exit: %d messages processed", msg_count)
             # If killed intentionally, don't emit crash error
             if self._killed_intentionally:
                 return
@@ -229,6 +278,7 @@ class GatewayClient:
             # the subprocess crashed during init → emit error to TUI
             if not self._ready_received and self._running:
                 stderr_tail = "\n".join(self._stderr_lines[-5:]) if self._stderr_lines else "(no stderr output)"
+                _log.error("Gateway exited before ready. Stderr tail: %s", stderr_tail)
                 self._handle_message({
                     "method": "event",
                     "params": {
@@ -240,7 +290,7 @@ class GatewayClient:
                 })
 
     def _read_stderr(self):
-        """Read stderr from gateway (for debugging)"""
+        """Read stderr from gateway (for debugging). 同时写一份到 TUI 日志。"""
         if not self.process or not self.process.stderr:
             return
 
@@ -250,9 +300,12 @@ class GatewayClient:
                     break
                 stripped = line.strip()
                 self._stderr_lines.append(stripped)
+                _log.debug("stderr: %s", stripped)
                 print(f"[gateway stderr] {stripped}", file=sys.stderr)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.error("Stderr reader exception: %s", e)
+        finally:
+            _trace("Stderr reader exit")
 
     def _handle_message(self, message: Dict[str, Any]):
         """Handle a message from gateway"""

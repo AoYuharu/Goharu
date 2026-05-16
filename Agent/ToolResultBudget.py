@@ -119,6 +119,36 @@ class ToolResultBudget:
     # ── 内部方法 ───────────────────────────────────
 
     @classmethod
+    def _extract_readable_text(cls, result_text: str) -> str:
+        """Try to extract human-readable text from a structured JSON result.
+
+        For run_cmd results (JSON with stdout/stderr), returns the plain text
+        output instead of the compact JSON wrapper, so the persisted file has
+        natural line breaks and is readable line-by-line with the Read tool.
+        """
+        try:
+            parsed = json.loads(result_text)
+            if isinstance(parsed, dict) and "exit_code" in parsed:
+                stdout = (parsed.get("stdout") or "").strip()
+                stderr = (parsed.get("stderr") or "").strip()
+                parts = []
+                if stderr:
+                    parts.append(f"stderr:\n{stderr}")
+                if stdout:
+                    parts.append(f"stdout:\n{stdout}")
+                if not parts:
+                    parts.append("(no output)")
+                parts.append(
+                    f"\n---\nexit_code: {parsed.get('exit_code')}"
+                    f"  timed_out: {parsed.get('timed_out', False)}"
+                    f"  interrupted: {parsed.get('interrupted', False)}"
+                )
+                return "\n".join(parts)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return str(result_text)
+
+    @classmethod
     def _save_and_replace(
         cls,
         tool_name: str,
@@ -134,8 +164,11 @@ class ToolResultBudget:
         filename = f"tool_{safe_name}_{ts}_{short_id}.txt"
         filepath = cache_dir / filename
 
+        # 提取可读文本（拆开 JSON 包装，保留原始换行）
+        readable = cls._extract_readable_text(result_text)
+
         try:
-            filepath.write_text(str(result_text), encoding="utf-8")
+            filepath.write_text(readable, encoding="utf-8")
         except Exception as exc:
             return json.dumps(
                 {"error": f"Failed to save tool result: {exc}"},

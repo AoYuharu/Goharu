@@ -15,6 +15,7 @@ from rich.markdown import Markdown
 from datetime import datetime
 
 from .command_suggestions import CommandSuggestions
+from .prompt_cache import detect_and_cache
 
 
 class ChatPanel(Container):
@@ -78,7 +79,7 @@ class ChatPanel(Container):
     def compose(self) -> ComposeResult:
         """Create child widgets"""
         yield Vertical(
-            RichLog(id="chat-log", wrap=True, highlight=True, markup=True, auto_scroll=True),
+            RichLog(id="chat-log", wrap=True, highlight=True, markup=True, auto_scroll=True, max_lines=5000),
             CommandSuggestions(id="command-suggestions"),
             Container(
                 Input(placeholder="Type your message or / for commands...", id="chat-input"),
@@ -157,6 +158,9 @@ class ChatPanel(Container):
         if message.startswith("/"):
             self.handle_command(message)
             return
+
+        # Auto-cache long prompts (15+ chars) for /prompt-cache reuse
+        detect_and_cache(message)
 
         # Add user message to display IMMEDIATELY
         self.add_user_message(message)
@@ -246,6 +250,25 @@ class ChatPanel(Container):
 
             self.app.push_screen(PromptListScreen(), on_prompt_editor_done)
 
+        elif cmd == "/prompt-cache":
+            # Browse & reuse cached long prompts
+            from .prompt_cache import PromptCacheScreen, get_cached_prompts
+            entries = get_cached_prompts()
+            if not entries:
+                self.add_system_message("Prompt cache is empty. Type a message of 15+ characters to start caching.")
+                return
+
+            def on_cache_done(text):
+                if text:
+                    self.chat_input.value = text
+                    self.chat_input.focus()
+                    self.chat_input.cursor_position = len(text)
+                    self.add_system_message("📋 Prompt loaded into input — press Enter to send or edit first")
+                else:
+                    self.focus_input()
+
+            self.app.push_screen(PromptCacheScreen(), on_cache_done)
+
         elif cmd == "/config":
             # Open interactive config editor
             from ..screens.config_editor import ConfigEditorScreen
@@ -272,6 +295,7 @@ class ChatPanel(Container):
             self.add_system_message("  /export - Export chat history to file")
             self.add_system_message("  /help - Show this help")
             self.add_system_message("  /prompt - Browse & edit prompt files")
+            self.add_system_message("  /prompt-cache - Browse & reuse recent long prompts")
             self.add_system_message("  /exit or /quit - Exit application")
             self.add_system_message("\nKeyboard shortcuts:")
             self.add_system_message("  Ctrl+C - Exit")

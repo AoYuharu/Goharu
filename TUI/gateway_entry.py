@@ -32,6 +32,7 @@ _stdout_lock = threading.Lock()
 
 from Agent.ActorAgent import ActorAgent
 from Agent.BackgroundTaskManager import BackgroundTaskManager
+from Agent.MemoryOrchestrator import MemoryOrchestrator
 from Agent.MicroCompactor import MicroCompactor
 from Memory.MemoryManager import MemoryManager
 from Tools.runtime import create_tool_runtime
@@ -39,16 +40,13 @@ from Tools.tool_process_tracker import tool_process_tracker
 from configurationLoader import config
 from Gateway.session import SessionStore
 
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    handlers=[logging.StreamHandler(sys.stderr)]
-)
-logger = logging.getLogger(__name__)
+# Logging setup — centralized, per-module file output
+from Core.LogManager import init_logging, get_logger
+init_logging()
+logger = get_logger(__name__)
 
-# Crash log path
-CRASH_LOG = project_root / "logs" / "tui_gateway_crash.log"
+# Crash log path (独立 crash 文件，同时 LogManager 也会捕获 ERROR+ 到 logs/gateway/crash.log)
+CRASH_LOG = project_root / "runtime_memory" / "logs" / "gateway" / "crash.log"
 
 
 def write_json(obj: Dict[str, Any]) -> bool:
@@ -64,17 +62,21 @@ def write_json(obj: Dict[str, Any]) -> bool:
             _real_stdout.write(line)
             _real_stdout.flush()
         return True
-    except (BrokenPipeError, ValueError) as e:
+    except (BrokenPipeError, OSError, ValueError) as e:
+        # Pipe broken during shutdown — expected, not an error
         if isinstance(e, ValueError) and "closed file" not in str(e):
             raise
-        return False
-    except Exception as e:
-        logger.error(f"write_json error: {e}")
         return False
 
 
 def log_crash(reason: str, exc_info=None):
-    """Log crash information to file and stderr"""
+    """Log crash information to crash log and stderr.
+
+    LogManager 的 root logger 已附加 crash handler 和 stderr handler，
+    直接使用 logger.error() 会同时写入 crash.log 和 stderr。
+    同时保留原始 crash 格式写入独立文件以便快速 grep。
+    """
+    logger.error("CRASH: %s", reason, exc_info=exc_info if exc_info else None)
     try:
         CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(CRASH_LOG, "a", encoding="utf-8") as f:
@@ -85,14 +87,13 @@ def log_crash(reason: str, exc_info=None):
     except Exception:
         pass
 
-    print(f"[gateway-crash] {reason}", file=sys.stderr, flush=True)
-
 
 class GatewaySession:
     """Gateway session managing agent components"""
 
     def __init__(self):
         self.memory_manager: Optional[MemoryManager] = None
+        self.memory_orchestrator: Optional[MemoryOrchestrator] = None
         self.actor: Optional[ActorAgent] = None
         self.runtime = None
         self.session_store: Optional[SessionStore] = None
@@ -158,6 +159,15 @@ class GatewaySession:
         )
         return bg_results
 
+    def _run_post_turn_review(self, turn_context):
+        """Fire-and-forget: run post-turn user profile review in background thread."""
+        try:
+            events = self.memory_orchestrator.post_turn_review(turn_context)
+            for evt in events:
+                logger.info(f"[MemoryOrch] {evt}")
+        except Exception as e:
+            logger.warning(f"post_turn_review failed: {e}")
+
     async def initialize(self):
         """Initialize all components"""
         if self._initialized:
@@ -176,6 +186,10 @@ class GatewaySession:
             # Initialize memory manager
             self.memory_manager = MemoryManager()
             logger.info("MemoryManager initialized")
+
+            # Initialize memory orchestrator (overflow detection, daily summarization, etc.)
+            self.memory_orchestrator = MemoryOrchestrator(self.memory_manager)
+            logger.info("MemoryOrchestrator initialized")
 
             # Initialize tool runtime
             self.runtime = create_tool_runtime(config.get("tools.runtime", "in_process"))
@@ -257,6 +271,20 @@ class GatewaySession:
 
         self._processing = True
         self._micro_compacted = False  # reset per turn
+
+        logger.debug(
+            "process_message start: session=%s msg_len=%d",
+            session_id, len(message),
+        )
+
+        # Periodic memory maintenance: check for expired daily files to summarize
+        if self.memory_orchestrator:
+            try:
+                events = self.memory_orchestrator.detectOverflow()
+                for evt in events:
+                    logger.info(f"[MemoryOrch] {evt}")
+            except Exception as e:
+                logger.warning(f"detectOverflow failed: {e}")
 
         try:
             # 清除上一次可能残留的中断标记
@@ -469,12 +497,23 @@ class GatewaySession:
                         }
                     })
 
+                logger.debug("Actor step %d/%d starting...", step, max_steps)
                 actor_response = await self.actor.act(
                     on_tool_call_start=_on_tool_call,
                     on_thinking=_on_thinking,
                     on_tool_result=_on_tool_result,
                     _interrupt_check=lambda: self._interrupt_event.is_set()
                 )
+                logger.debug(
+                    "Actor step %d response: type=%s",
+                    step, actor_response.get("type"),
+                )
+
+                # Drain background results that completed during actor.act()
+                # before checking the response type. Without this, a background
+                # task that finishes mid-act() is invisible until the next step's
+                # drain (one full step of latency).
+                self._drain_background_results()
 
                 # Check response type
                 response_type = actor_response.get("type")
@@ -506,6 +545,16 @@ class GatewaySession:
                             "payload": {"answer": answer}
                         }
                     })
+
+                    # Fire post-turn user profile review in background (non-blocking)
+                    if self.memory_orchestrator:
+                        ctx = self.memory_manager.get_context()
+                        turn_slice = ctx[-24:] if len(ctx) > 24 else ctx
+                        threading.Thread(
+                            target=self._run_post_turn_review,
+                            args=(turn_slice,),
+                            daemon=True
+                        ).start()
 
                     return answer
 
@@ -567,6 +616,7 @@ class GatewaySession:
                     break
 
             # Max steps reached
+            logger.warning("Max steps (%d) reached for session %s", max_steps, session_id)
             return "I apologize, but I've reached the maximum number of steps. Please try rephrasing your question."
 
         except Exception as e:
@@ -760,6 +810,7 @@ _session: Optional[GatewaySession] = None
 _request_queue: queue.Queue = queue.Queue()  # Incoming request queue
 _bg_reader_running = False
 _processing_lock = threading.Lock()  # Prevent concurrent background processing
+_SHUTTING_DOWN = False  # Set to True during process shutdown to stop new processing
 
 
 def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1095,6 +1146,11 @@ def _process_queued_messages(session_id: str):
             # After answering, watch for late background task completions.
             # If new results arrive, inject them as synthetic messages
             # and re-trigger processing so the agent can respond.
+            #
+            # IMPORTANT: Uses asyncio.sleep (not time.sleep) so the event
+            # loop stays alive.  BackgroundTaskManager.track_task() relies on
+            # task.add_done_callback() to populate _pending_results, and those
+            # callbacks only fire while the event loop is running.
             from configurationLoader import config
             watch_window = int(config.get("agent.background_watch_window", 1800))
             max_reactivations = int(config.get("agent.background_max_reactivations", 3))
@@ -1102,43 +1158,56 @@ def _process_queued_messages(session_id: str):
 
             if watch_window > 0 and task_mgr._reactivation_count < max_reactivations:
                 start_watch = time.time()
-                while (time.time() - start_watch) < watch_window:
-                    # 用户发了新消息，立即退出 watcher 处理消息
-                    if _session.has_pending():
-                        break
-                    if task_mgr.has_pending():
-                        bg_results = task_mgr.drain_pending()
-                        task_mgr.increment_reactivation()
-                        logger.info(
-                            "[bg-task] Post-answer reactivation #%d: %d results arrived",
-                            task_mgr._reactivation_count, len(bg_results),
-                        )
-                        # Inject results into memory so agent sees them
-                        if _session.memory_manager:
-                            BackgroundTaskManager().inject_into_memory(
-                                _session.memory_manager, bg_results
-                            )
-                        # Only queue synthetic message if callback didn't already
-                        if not _session._bg_reactivation_queued:
-                            synthetic_msg = (
-                                f"[System: background results arrived after previous answer] "
-                                f"{len(bg_results)} background task(s) completed. "
-                                f"Please review and respond if needed."
-                            )
-                            with _session._batch_lock:
-                                _session.pending_messages.append(synthetic_msg)
-                                _session.pending_requests.append("bg_reactivation")
 
-                        # Release lock before re-starting
-                        break
-                    time.sleep(1.0)  # Poll every second
+                async def _bg_watcher():
+                    while (time.time() - start_watch) < watch_window:
+                        # 用户发了新消息，立即退出 watcher 处理消息
+                        if _session.has_pending():
+                            return True
+                        if task_mgr.has_pending():
+                            bg_results = task_mgr.drain_pending()
+                            task_mgr.increment_reactivation()
+                            logger.info(
+                                "[bg-task] Post-answer reactivation #%d: %d results arrived",
+                                task_mgr._reactivation_count, len(bg_results),
+                            )
+                            # Inject results into memory so agent sees them
+                            if _session.memory_manager:
+                                BackgroundTaskManager().inject_into_memory(
+                                    _session.memory_manager, bg_results
+                                )
+                            # Only queue synthetic message if callback didn't already
+                            if not _session._bg_reactivation_queued:
+                                synthetic_msg = (
+                                    f"[System: background results arrived after previous answer] "
+                                    f"{len(bg_results)} background task(s) completed. "
+                                    f"Please review and respond if needed."
+                                )
+                                with _session._batch_lock:
+                                    _session.pending_messages.append(synthetic_msg)
+                                    _session.pending_requests.append("bg_reactivation")
+                            return True
+                        await asyncio.sleep(1.0)
+                    return False
+
+                loop.run_until_complete(_bg_watcher())
 
     except Exception as e:
-        logger.error(f"Error in message processor: {e}", exc_info=True)
-        log_crash(f"Message processor error: {e}", sys.exc_info())
-        # Emit error event to TUI
         err_type = type(e).__name__
         err_msg = str(e) or "(no message)"
+
+        # "cannot schedule new futures after shutdown" 是 executor 生命周期问题
+        # 不视为严重 crash，记录后尝试从新线程恢复
+        if "cannot schedule new futures" in err_msg:
+            logger.warning(
+                "LLM executor shutdown detected, restarting processor thread: %s",
+                err_msg,
+            )
+        else:
+            logger.error(f"Error in message processor: {e}", exc_info=True)
+            log_crash(f"Message processor error: {e}", sys.exc_info())
+
+        # Emit error event to TUI
         write_json({
             "jsonrpc": "2.0",
             "method": "event",
@@ -1164,6 +1233,9 @@ def _start_processing(session_id: str):
     Start a background processing thread if one isn't already running.
     Thread-safe, can be called from any thread.
     """
+    global _SHUTTING_DOWN
+    if _SHUTTING_DOWN:
+        return
     if _processing_lock.acquire(blocking=False):
         thread = threading.Thread(
             target=_process_queued_messages,
@@ -1248,7 +1320,12 @@ def main():
         log_crash(f"Unhandled exception: {e}", sys.exc_info())
         sys.exit(1)
     finally:
-        # Cleanup
+        global _SHUTTING_DOWN
+        # Mark processing as stopped so pending daemon threads don't
+        # keep submitting LLM queries during executor shutdown
+        _SHUTTING_DOWN = True
+
+        # Cleanup gateway
         if _session:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -1256,6 +1333,13 @@ def main():
                 loop.run_until_complete(_session.shutdown())
             finally:
                 loop.close()
+
+        # Shutdown the persistent LLM executor last
+        try:
+            from Agent.ActorAgent import shutdown_llm_executor
+            shutdown_llm_executor(wait=False)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

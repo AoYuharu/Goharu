@@ -1,9 +1,13 @@
 import json
+import logging
 import os
 import re
+import time as _time_module
 
 from configurationLoader import config
 from Core.ToolCall import ToolCall
+
+logger = logging.getLogger(__name__)
 
 
 class LLMCore:
@@ -474,6 +478,20 @@ class LLMCore:
             request_kwargs["tool_choice"] = tool_choice
 
         last_response = None
+        tool_names = ""
+        if tools:
+            tool_names = ", ".join(t.get("name", "?") for t in tools[:6])
+            if len(tools) > 6:
+                tool_names += f" (+{len(tools) - 6} more)"
+
+        msg_count = len(remote_messages)
+        sys_blocks_count = len(system_blocks)
+        logger.info(
+            "API request: model=%s messages=%d system_blocks=%d tools=%d [%s] max_tokens=%d temp=%.2f",
+            request_kwargs["model"], msg_count, sys_blocks_count,
+            len(tools) if tools else 0, tool_names,
+            request_kwargs["max_tokens"], request_kwargs["temperature"],
+        )
 
         # 记录API请求
         try:
@@ -490,20 +508,25 @@ class LLMCore:
         except Exception:
             call_id = None
 
+        t_start = _time_module.time()
         try:
-            for _ in range(2):
+            for retry_i in range(2):
                 try:
                     last_response = self.client.messages.create(**request_kwargs)
                 except Exception as api_error:
                     # 瞬态错误重试（HTTP 5xx, 429 rate limit）
                     if self._is_retryable_error(api_error):
-                        import time as _time
-                        _time.sleep(1.0)
+                        logger.warning(
+                            "API retry %d/1: %s",
+                            retry_i + 1,
+                            type(api_error).__name__,
+                        )
+                        _time_module.sleep(1.0)
                         last_response = self.client.messages.create(**request_kwargs)
                     else:
                         raise
 
-
+                t_elapsed = (_time_module.time() - t_start) * 1000
                 # 记录API响应
                 if call_id is not None:
                     try:
@@ -512,18 +535,40 @@ class LLMCore:
                         pass
 
                 self._last_usage = self._extract_usage(last_response)
+                usage_str = ""
+                if self._last_usage:
+                    usage_str = (
+                        f" in={self._last_usage.get('input_tokens', 0)} "
+                        f"out={self._last_usage.get('output_tokens', 0)} "
+                        f"cache_read={self._last_usage.get('cache_read_input_tokens', 0)}"
+                    )
 
                 # 如果使用了工具，返回完整的响应对象（包含 tool_use 块）
                 if tools:
+                    stop_reason = getattr(last_response, "stop_reason", "?")
+                    logger.info(
+                        "API response: %.0fms stop=%s%s",
+                        t_elapsed, stop_reason, usage_str,
+                    )
                     return last_response
 
                 # 否则提取文本内容和 thinking（向后兼容）
                 self._last_thinking = self._extract_thinking_text(last_response)
                 response_text = self._extract_response_text(last_response)
                 if response_text:
+                    logger.info(
+                        "API response: %.0fms text_len=%d%s",
+                        t_elapsed, len(response_text), usage_str,
+                    )
                     return self._strip_json_fence(response_text)
                 request_kwargs["temperature"] = 0
-        except Exception:
+                logger.debug("API empty response, retrying with temperature=0")
+        except Exception as exc:
+            t_elapsed = (_time_module.time() - t_start) * 1000
+            logger.error(
+                "API error after %.0fms: %s", t_elapsed, type(exc).__name__,
+                exc_info=True,
+            )
             raise
 
         response_payload = None

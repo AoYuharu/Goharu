@@ -1,5 +1,32 @@
 memory:
   root_dir: ./runtime_memory
+  sqlite:
+    enabled: true
+    path: ./runtime_memory/memory.db
+  retrieval:
+    enabled: true
+    fts_top_k: 8
+    embedding_top_k: 8
+    bm25_enabled: true
+    bm25_top_k: 8
+    final_top_k: 6
+    query_window_messages: 6
+    use_reranker: false
+    embedding_model_name: Qwen3-Embedding-0.6B
+    embedding_model_path: ./models/embedding_model/Qwen3-Embedding-0.6B
+    embedding_provider: local
+    embedding_base_url: ""
+    embedding_api_key_env: ""
+    embedding_dimensions: 768
+    embedding_timeout: 30
+    reranker_model_path: ./models/rerank_model/bge-reranker-v2-m3
+  pipeline:
+    db_enabled: true
+  prompt:
+    use_legacy_memory_markdown: false
+  export:
+    daily_json_enabled: true
+  session_id: default
   daily:
     dir: ./runtime_memory/daily
     retention_days: 7
@@ -60,7 +87,6 @@ tools:
   - Tools.builtin.skill_tool
   - Tools.builtin.snip_tool
   - Tools.builtin.sleep_tool
-  - Tools.builtin.agent_verify
   security:
     dangerous_commands:
     - shutdown
@@ -79,7 +105,6 @@ tools:
     - dd
     - sudo
     - runas
-    - taskkill /f
     - killall
     - pkill
     - reg delete
@@ -118,6 +143,9 @@ debug:
   enabled: true
 logging:
   base_dir: ./runtime_memory/logs
+  level: INFO
+  max_mb: 5
+  backup_count: 3
   api:
     enabled: true
   agents:

@@ -59,6 +59,9 @@ class PromptAssembler:
 
     _SOUL_GUIDE = "以下是稳定角色设定 SOUL.md，请将其视为高优先级的长期风格与行为边界指导。"
     _USER_PROFILE_GUIDE = "以下是当前用户画像 USER.md。它是主用户画像来源；若与 MEMORY.md 中的用户信息冲突，优先参考 USER.md。"
+    _L3_PROFILE_GUIDE = "以下是稳定用户画像摘要（L3）。这是最权威的用户建模上下文，优先级高于其他记忆。"
+    _RETRIEVED_MEMORIES_GUIDE = "以下是检索到的相关记忆原子（L1）。请在相关时使用，注意这些是检索召回结果，可能不完全精确。"
+    _RETRIEVED_SCENES_GUIDE = "以下是检索到的相关话题/场景上下文（L2）。请用于理解当前对话的主题背景和长期任务状态。"
     _MEMORY_GUIDE = "以下是共享长期记忆索引 MEMORY.md，请将其中信息视为长期上下文，仅在相关时使用。"
     _MEMORY_BACKGROUND_GUIDE = "以下是共享长期记忆索引 MEMORY.md，仅作为补充背景，不是用户画像主来源。"
     _TOOL_DIRECTORY_GUIDE = "以下是当前运行时实际可用的工具目录。只有这些工具可以调用；如需调用工具，参数必须严格匹配对应 schema。"
@@ -93,6 +96,50 @@ class PromptAssembler:
         kwargs = dict(kind="system", title="user_profile",
                       content=f"{self._USER_PROFILE_GUIDE}\n\n{user_text}",
                       metadata={"section_name": "user_profile"})
+        if enable_cache:
+            kwargs["cache_control"] = {"type": "ephemeral"}
+        return PromptSection(**kwargs)
+
+    def _build_l3_profile_summary_section(self, profile_summary, enable_cache=True):
+        summary_text = self._normalize_text(profile_summary)
+        if not summary_text:
+            return None
+        kwargs = dict(kind="system", title="user_profile_compact",
+                      content=f"{self._L3_PROFILE_GUIDE}\n\n{summary_text}",
+                      metadata={"section_name": "user_profile_compact"})
+        if enable_cache:
+            kwargs["cache_control"] = {"type": "ephemeral"}
+        return PromptSection(**kwargs)
+
+    def _build_retrieved_memories_section(self, retrieved_memories, enable_cache=True):
+        if not retrieved_memories:
+            return None
+        lines = []
+        for item in retrieved_memories:
+            title = item.get("title") or "memory"
+            text = item.get("text") or ""
+            lines.append(f"- [{title}] {text}")
+        content = self._RETRIEVED_MEMORIES_GUIDE + "\n\n" + "\n".join(lines)
+        kwargs = dict(kind="system", title="retrieved_memories",
+                      content=content,
+                      metadata={"section_name": "retrieved_memories"})
+        if enable_cache:
+            kwargs["cache_control"] = {"type": "ephemeral"}
+        return PromptSection(**kwargs)
+
+    def _build_retrieved_scenes_section(self, retrieved_scenes, enable_cache=True):
+        if not retrieved_scenes:
+            return None
+        lines = []
+        for item in retrieved_scenes:
+            title = item.get("title") or "scene"
+            summary = item.get("summary") or ""
+            keywords = ", ".join(item.get("keywords") or [])
+            lines.append(f"- [{title}] {summary}" + (f" (keywords: {keywords})" if keywords else ""))
+        content = self._RETRIEVED_SCENES_GUIDE + "\n\n" + "\n".join(lines)
+        kwargs = dict(kind="system", title="retrieved_scenes",
+                      content=content,
+                      metadata={"section_name": "retrieved_scenes"})
         if enable_cache:
             kwargs["cache_control"] = {"type": "ephemeral"}
         return PromptSection(**kwargs)
@@ -198,7 +245,7 @@ class PromptAssembler:
     def build_actor_document(
         self, history, soul_markdown="", user_profile_markdown="",
         memory_markdown="", extra_system_prompt=None, legacy_system_prompt=None,
-        tool_definitions=None,
+        tool_definitions=None, retrieval_pack=None, use_legacy_memory=True,
     ):
         document = PromptDocument()
         document.extend_system(self._load_agent_system_sections("actor"))
@@ -207,9 +254,30 @@ class PromptAssembler:
         if soul_section is not None:
             document.add_system(soul_section)
 
-        user_profile_section = self._build_user_profile_section(user_profile_markdown, enable_cache=True)
-        if user_profile_section is not None:
-            document.add_system(user_profile_section)
+        # L3 compact profile summary (always injected when retrieval is enabled)
+        profile_summary = (retrieval_pack or {}).get("profile_summary") if retrieval_pack else None
+        if profile_summary:
+            profile_section = self._build_l3_profile_summary_section(profile_summary)
+            if profile_section is not None:
+                document.add_system(profile_section)
+
+        # Legacy user profile section (when legacy path is active or retrieval is off)
+        if not retrieval_pack or use_legacy_memory:
+            user_profile_section = self._build_user_profile_section(user_profile_markdown, enable_cache=True)
+            if user_profile_section is not None:
+                document.add_system(user_profile_section)
+
+        # Retrieved L1 memories (query-time hybrid retrieval)
+        if retrieval_pack:
+            retrieved_mems = retrieval_pack.get("memories") or []
+            mem_section = self._build_retrieved_memories_section(retrieved_mems)
+            if mem_section is not None:
+                document.add_system(mem_section)
+
+            retrieved_scenes = retrieval_pack.get("scenes") or []
+            scene_section = self._build_retrieved_scenes_section(retrieved_scenes)
+            if scene_section is not None:
+                document.add_system(scene_section)
 
         legacy_prompt = self._normalize_text(legacy_system_prompt)
         if legacy_prompt:
@@ -218,9 +286,11 @@ class PromptAssembler:
                 metadata={"section_name": "legacy_actor_system_prompt"},
             ))
 
-        memory_section = self._build_memory_section(memory_markdown, enable_cache=True)
-        if memory_section is not None:
-            document.add_system(memory_section)
+        # Legacy MEMORY.md fallback (when retrieval is off or legacy flag is set)
+        if not retrieval_pack or use_legacy_memory:
+            memory_section = self._build_memory_section(memory_markdown, enable_cache=True)
+            if memory_section is not None:
+                document.add_system(memory_section)
 
         skills_section = self._build_skills_section()
         if skills_section is not None:

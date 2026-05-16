@@ -9,11 +9,9 @@ import json
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Any, Optional
 
-from Agent.BackgroundTaskManager import BackgroundTaskManager
-from Agent.SubAgent import SubAgent
 from configurationLoader import config
 from Tools.registry import registry
 
@@ -150,7 +148,7 @@ class AgentDelegateManager:
 _manager = AgentDelegateManager()
 
 
-def _execute_subagent_task(agent_type: str, task: str, agent_id: str, tools_registry, output_callback=None, shared_state=None) -> Dict[str, Any]:
+def _execute_subagent_task(agent_type: str, task: str, agent_id: str, tools_registry, output_callback=None) -> Dict[str, Any]:
     """
     在线程中执行子agent任务
 
@@ -160,7 +158,6 @@ def _execute_subagent_task(agent_type: str, task: str, agent_id: str, tools_regi
         agent_id: agent ID
         tools_registry: 工具注册表
         output_callback: 输出回调函数
-        shared_state: 跨线程共享状态 dict，用于超时后提取最后文本
 
     Returns:
         执行结果
@@ -171,6 +168,8 @@ def _execute_subagent_task(agent_type: str, task: str, agent_id: str, tools_regi
         import Tools.builtin.file_tools
         import Tools.builtin.glob_tool
 
+        from Agent.SubAgent import SubAgent  # 懒加载，避免循环依赖
+
         # 创建子agent
         subagent = SubAgent(
             agent_type=agent_type,
@@ -178,7 +177,6 @@ def _execute_subagent_task(agent_type: str, task: str, agent_id: str, tools_regi
             agent_id=agent_id,
             tools_registry=tools_registry,
             output_callback=output_callback,
-            shared_state=shared_state,
         )
 
         # 执行任务
@@ -202,15 +200,15 @@ def _execute_subagent_task(agent_type: str, task: str, agent_id: str, tools_regi
 async def AgentDelegate(
     agent_type: str,
     task: str,
-    run_background: bool = False,
 ) -> str:
     """
     创建并执行子agent
 
+    runtime 层统一处理 run_background 和超时后台化，本函数无需感知。
+
     Args:
         agent_type: agent类型（Explore、Plan、Verify等）
         task: 要执行的任务描述
-        run_background: 是否立即后台执行
 
     Returns:
         JSON格式的执行结果
@@ -256,88 +254,30 @@ async def AgentDelegate(
     # 通知开始执行
     _manager.notify_output(f"🚀 启动 {agent_type} agent [{agent_id}]", "info")
 
-    # 超时时间与 tools.background_timeout 保持一致，由 runtime 层统一管理
-    timeout = config.get("tools.background_timeout", 120)
+    # 在线程池中执行子agent（阻塞等待，runtime 层管理超时/后台化）
     loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        _manager.executor,
+        _execute_subagent_task,
+        agent_type,
+        task,
+        agent_id,
+        tools_registry_instance,
+        _manager.output_callback,
+    )
 
-    # 跨线程共享状态：子agent线程写入 last_text_answer，超时后主线程读取
-    shared_state = {}
+    # 清理
+    _manager.decrement_agent_count(agent_type)
+    _manager.unregister_task(agent_type, task)
 
-    if run_background:
-        task_mgr = BackgroundTaskManager()
-        task_id = task_mgr.submit_subagent(
-            agent_type, task, agent_id, tools_registry_instance, shared_state
-        )
-        _manager.notify_output(
-            f"⏳ {agent_type} agent [{agent_id}] 已显式转后台 (task #{task_id})", "info"
-        )
-        return json.dumps({
-            "backgrounded": True,
-            "task_id": task_id,
-            "agent_id": agent_id,
-            "agent_type": agent_type,
-            "message": f"SubAgent [{agent_id}] launched in background (task #{task_id})",
-        }, ensure_ascii=False)
-
-    result = None
-    try:
-        # 使用 run_in_executor 异步执行（不阻塞事件循环）
-        result = await asyncio.wait_for(
-            loop.run_in_executor(
-                _manager.executor,
-                _execute_subagent_task,
-                agent_type,
-                task,
-                agent_id,
-                tools_registry_instance,
-                _manager.output_callback,
-                shared_state,
-            ),
-            timeout=timeout
-        )
-    except asyncio.TimeoutError:
-        # 超时：移动到后台继续执行
-        task_mgr = BackgroundTaskManager()
-        task_id = task_mgr.submit_subagent(
-            agent_type, task, agent_id, tools_registry_instance, shared_state
-        )
-        _manager.notify_output(
-            f"⏳ {agent_type} agent [{agent_id}] 超时，已转后台 (task #{task_id})", "info"
-        )
-        return json.dumps({
-            "backgrounded": True,
-            "task_id": task_id,
-            "agent_id": agent_id,
-            "agent_type": agent_type,
-            "message": f"SubAgent [{agent_id}] moved to background (task #{task_id})",
-        }, ensure_ascii=False)
-    except Exception as e:
-        result = {
-            "agent_id": agent_id,
-            "agent_type": agent_type,
-            "status": "error",
-            "content": "",
-            "error": f"子agent执行异常: {str(e)}",
-            "token_count": 0,
-            "duration_ms": 0,
-            "tool_calls_count": 0
-        }
-    finally:
-        # 减少计数
-        _manager.decrement_agent_count(agent_type)
-
-        # 注销任务
-        _manager.unregister_task(agent_type, task)
-
-        # 通知完成（超时路径已在 except 块中通知，此处仅处理正常/异常路径）
-        if result is not None:
-            if result.get("status") == "success":
-                status_icon = "✅"
-            elif result.get("status") == "partial":
-                status_icon = "⚠️"
-            else:
-                status_icon = "❌"
-            _manager.notify_output(f"{status_icon} {agent_type} agent [{agent_id}] 完成", "info")
+    # 通知完成
+    if result.get("status") == "success":
+        status_icon = "✅"
+    elif result.get("status") == "partial":
+        status_icon = "⚠️"
+    else:
+        status_icon = "❌"
+    _manager.notify_output(f"{status_icon} {agent_type} agent [{agent_id}] 完成", "info")
 
     # 添加总体统计
     total_duration = int((time.time() - start_time) * 1000)

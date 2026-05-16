@@ -152,6 +152,42 @@ def _split_content_lines(content: str | None) -> list[str]:
     return content.splitlines()
 
 
+def _find_old_string(file_text: str, old_string: str) -> str | None:
+    """Cascade-match old_string against file_text.
+
+    Handles three common mismatches caused by Read's JSON output format:
+    1. Exact match (no mismatch)
+    2. JSON escape decoding (\\\\t → tab, \\\\\" → \", etc.) — model copied
+       escaped characters from Read's JSON output
+    3. Tab → spaces (model visually perceived tabs as spaces and copied spaces)
+    """
+    # Level 1: exact match
+    if old_string in file_text:
+        return old_string
+
+    # Level 2: decode common JSON escapes that the model may have
+    # copied literally from Read's JSON output
+    try:
+        unescaped = (
+            old_string.replace("\\t", "\t")
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace('\\"', '"')
+            .replace("\\\\", "\\")
+        )
+        if unescaped != old_string and unescaped in file_text:
+            return unescaped
+    except Exception:
+        pass
+
+    # Level 3: tabs → 4 spaces (model visually perceives tabs as spaces)
+    spaces_old = old_string.replace("\t", "    ")
+    if spaces_old != old_string and spaces_old in file_text:
+        return spaces_old
+
+    return None
+
+
 def _is_probably_text_file(path_obj: Path) -> bool:
     try:
         with path_obj.open("rb") as file_obj:
@@ -340,15 +376,19 @@ async def Edit(
         if has_trailing_newline and lines:
             original_text += newline
 
-        # 查找 old_string
-        if old_string not in original_text:
+        # 查找 old_string（级联匹配，处理 JSON 转义/空白差异）
+        matched = _find_old_string(original_text, old_string)
+        if matched is None:
             return _error(
                 "old_string 在文件中不存在",
                 hint="请先用 Read 工具查看文件内容，确保 old_string 完全匹配"
             )
 
+        # 使用匹配到的实际文本
+        actual_old = matched
+
         # 检查唯一性
-        occurrences = original_text.count(old_string)
+        occurrences = original_text.count(actual_old)
         if occurrences > 1:
             return _error(
                 f"old_string 在文件中出现 {occurrences} 次，不唯一",
@@ -356,7 +396,7 @@ async def Edit(
             )
 
         # 执行替换
-        new_text = original_text.replace(old_string, new_string, 1)
+        new_text = original_text.replace(actual_old, new_string, 1)
         new_lines = new_text.splitlines()
 
         # 检测新文本是否有尾随换行符

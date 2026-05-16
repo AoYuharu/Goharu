@@ -1,27 +1,38 @@
-from Agent.SummarizerAgent import SummarizeAgent
-from Agent.ReviewAgent import ReviewAgent
+from configurationLoader import config
 from Memory.LongTermMemory import LongTermMemory
 from Memory.UserProfileMemory import UserProfileMemory
 from Memory.WorkingMemory import WorkingMemory
-from configurationLoader import config
+from Memory.retrieval.HybridRetriever import HybridRetriever
+from Memory.repositories.L3Repository import L3Repository
 
 
 class MemoryManager:
+    """记忆管理器 — 统一 facade。
+
+    编排逻辑（溢出检测、日总结、话题合并、用户画像复盘）已移至
+    Agent.MemoryOrchestrator，MemoryManager 不再 import Agent 包中的任何内容。
+    """
+
     def __init__(self):
         self.working = WorkingMemory()
         self.long_term = LongTermMemory()
         self.user_profile = UserProfileMemory()
-        self.summarizer = SummarizeAgent()
-        self.reviewer = ReviewAgent()
-        self.review_enabled = bool(config.get("memory.user.review_enabled", True))
-        self.merge_every_n_summaries = max(
-            1,
-            int(config.get("memory.topic.merge_every_n_summaries", 3)),
-        )
-        self.merge_min_count = max(
-            2,
-            int(config.get("memory.topic.merge_min_count", 4)),
-        )
+        self.retrieval_enabled = bool(config.get("memory.retrieval.enabled", False))
+        self.use_legacy_memory_markdown = bool(config.get("memory.prompt.use_legacy_memory_markdown", True))
+        self._hybrid_retriever = None
+        self._l3_repo = None
+
+    @property
+    def hybrid_retriever(self):
+        if self._hybrid_retriever is None:
+            self._hybrid_retriever = HybridRetriever()
+        return self._hybrid_retriever
+
+    @property
+    def l3_repo(self):
+        if self._l3_repo is None:
+            self._l3_repo = L3Repository()
+        return self._l3_repo
 
     def append(self, message):
         self.working.append(message)
@@ -29,71 +40,6 @@ class MemoryManager:
     def clear_context(self):
         """清空当前会话上下文"""
         self.working.clear_today()
-
-    def detectOverflow(self):
-        expired_days = self.working.list_expired_days()
-        if not expired_days:
-            return []
-
-        events = []
-        summary_events = self._summarize_and_store(expired_days[0])
-        events.extend(summary_events)
-        if summary_events:
-            events.extend(self._maybe_merge_topics())
-        return events
-
-    def _summarize_and_store(self, target_day=None):
-        if target_day is None:
-            expired_days = self.working.list_expired_days()
-            if not expired_days:
-                return []
-            target_day = expired_days[0]
-
-        day_payload = self.working.read_day(target_day)
-        if not day_payload:
-            return []
-
-        history = day_payload.get("messages", [])
-        if not history:
-            self.working.delete_day(target_day)
-            return [f"Deleted empty expired day: {target_day}"]
-
-        summary = self.summarizer.summarize_day(history, self.get_longterm_context())
-        self.long_term.update(summary, source_day=target_day)
-        self.working.delete_day(target_day)
-        return [
-            f"Summarized expired day: {target_day}",
-            f"Updated long-term memory from daily summary: {target_day}",
-        ]
-
-    def _maybe_merge_topics(self):
-        index = self.long_term.read_index()
-        topics = self.long_term.read_topics_metadata()
-        metadata = index.get("metadata", {})
-        summaries_since_merge = int(metadata.get("summaries_since_merge", 0) or 0)
-
-        if summaries_since_merge < self.merge_every_n_summaries:
-            return []
-        if len(topics) < self.merge_min_count:
-            return []
-
-        topic_docs = []
-        for topic in topics:
-            topic_doc = self.long_term.read_topic(topic["slug"])
-            if topic_doc is not None:
-                topic_docs.append(topic_doc)
-
-        merge_payload = self.summarizer.merge_topics(index, topic_docs)
-        if merge_payload.get("merge_groups"):
-            self.long_term.merge_topics(merge_payload)
-            merged_groups = len(merge_payload.get("merge_groups") or [])
-            return [f"Merged related topic groups: {merged_groups}"]
-
-        self.long_term.rebuild_memory_index(
-            last_topic_merge_at=self.long_term.current_timestamp(),
-            summaries_since_merge=0,
-        )
-        return ["Checked topic merge threshold and rebuilt memory index"]
 
     def get_context(self):
         return self.working.get_messages()
@@ -103,30 +49,6 @@ class MemoryManager:
 
     def get_turn_messages_since(self, start_index):
         return self.working.get_messages_since(start_index)
-
-    def post_turn_review(self, turn_context):
-        if not self.review_enabled:
-            return []
-        if not turn_context:
-            return []
-        if not self.user_profile.should_review():
-            return ["Skipped user profile review (not yet at review interval)"]
-
-        user_profile_markdown = self.get_user_profile_markdown()
-        review_payload = self.reviewer.review_turn(
-            turn_context=turn_context,
-            user_profile_context=user_profile_markdown,
-            memory_markdown=self.get_memory_markdown(),
-        )
-        source_turn = turn_context[0].get("timestamp") if isinstance(turn_context[0], dict) else ""
-        apply_result = self.user_profile.apply(review_payload, source_turn=source_turn)
-
-        events = [f"Reviewed turn and refreshed user profile: {apply_result['path']}"]
-        if apply_result.get("updated"):
-            events.append("Applied user profile updates from current turn")
-        else:
-            events.append("No user profile changes extracted from current turn")
-        return events
 
     def get_memory_markdown(self):
         return self.long_term.read_memory_markdown()
@@ -141,3 +63,20 @@ class MemoryManager:
         context = self.long_term.read()
         context["user_profile_markdown"] = self.get_user_profile_markdown()
         return context
+
+    def retrieve_prompt_memory(self):
+        """Query-time hybrid retrieval: L1 atoms + L2 scenes + L3 profile summary.
+
+        Returns:
+            dict with keys: profile_summary, memories, scenes, query_text
+        """
+        messages = self.get_context()
+        retriever = self.hybrid_retriever
+        query = retriever.build_query_from_messages(messages)
+        pack = retriever.retrieve(query)
+        pack["query_text"] = query
+        return pack
+
+    def get_profile_compact_summary(self):
+        """Compact L3 user profile summary for prompt injection."""
+        return self.l3_repo.build_compact_summary()

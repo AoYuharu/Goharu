@@ -82,12 +82,12 @@ class ToolPanel(Container):
         yield Static("🔧 Tool Activity", id="tool-header")
         yield Vertical(
             Static("▶ Tool Calling", id="calling-header"),
-            RichLog(id="calling-log", wrap=True, highlight=True, markup=True),
+            RichLog(id="calling-log", wrap=True, highlight=True, markup=True, max_lines=500),
             id="calling-section",
         )
         yield Vertical(
             Static("✓ Tool Result", id="result-header"),
-            RichLog(id="result-log", wrap=True, highlight=True, markup=True),
+            RichLog(id="result-log", wrap=True, highlight=True, markup=True, max_lines=2000),
             id="result-section",
         )
 
@@ -178,9 +178,16 @@ class ToolPanel(Container):
             "elapsed_str": elapsed_str,
         })
 
-        # Re-render both sections
+        # 限制 _completed_results 列表大小，防止内存无限增长
+        if len(self._completed_results) > 100:
+            self._completed_results = self._completed_results[-50:]
+
+        # 只更新 calling 区（通常只有 1-3 个活跃调用，不贵）
         self._refresh_calling()
-        self._refresh_results()
+
+        # 增量追加结果，不用 clear+rewrite 所有历史
+        # （之前的 _refresh_results 会 O(n) 重渲全部结果，几十步后主线程吃满）
+        self._write_single_result(self._completed_results[-1])
 
     def _format_elapsed(self, start_time: float) -> str:
         """Format elapsed time as MM:SS"""

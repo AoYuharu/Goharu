@@ -16,7 +16,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+from Core.LogManager import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -140,31 +142,78 @@ class BackgroundTaskManager:
         )
         return task_id
 
-    def submit_subagent(self, agent_type: str, task_desc: str,
-                        agent_id: str, tools_registry, shared_state) -> int:
-        """Submit a sub-agent as a background task.
+    def track_task(self, tool_name: str, task: "asyncio.Task", description: str = "") -> int:
+        """Track a live asyncio.Task that continues running in the background.
 
-        Same as submit() but wraps the sub-agent execution in a coroutine.
+        Unlike submit() which starts a new coroutine in a ThreadPoolExecutor,
+        this wraps an already-running Task (protected by asyncio.shield) with
+        a done callback. The subprocess behind the task is NOT killed — it
+        keeps running and its result is collected when it finishes naturally.
+
+        Args:
+            tool_name: Name of the tool being executed.
+            task: The running asyncio.Task to track.
+            description: Human-readable description for logging / injection.
+
+        Returns:
+            int: Unique task ID.
         """
-        from Tools.builtin.agent_delegate import _execute_subagent_task
+        task_id = self._next_id()
 
-        async def _bg_subagent():
-            return await asyncio.get_event_loop().run_in_executor(
-                None,
-                _execute_subagent_task,
-                agent_type,
-                task_desc,
-                agent_id,
-                tools_registry,
-                None,  # output_callback — not available in background
-                shared_state,
+        def _on_done(t: "asyncio.Task"):
+            try:
+                result = t.result()
+                error = None
+            except asyncio.CancelledError:
+                result = json.dumps(
+                    {"error": f"Task #{task_id} was cancelled"},
+                    ensure_ascii=False,
+                )
+                error = result
+            except Exception as exc:
+                result = json.dumps(
+                    {"error": f"Task #{task_id} failed: {type(exc).__name__}: {exc}"},
+                    ensure_ascii=False,
+                )
+                error = result
+
+            bg_result = BackgroundResult(
+                task_id=task_id,
+                tool_name=tool_name,
+                result=result,
+                description=description,
+                error=error,
+                completed_at=time.time(),
             )
 
-        return self.submit(
-            f"AgentDelegate[{agent_type}]",
-            _bg_subagent(),
-            f"{agent_type} agent [{agent_id}]: {task_desc[:200]}",
+            with self._results_lock:
+                self._pending_results[task_id] = bg_result
+
+            logger.info(
+                "[bg-task] Tracked task #%d (%s) completed%s",
+                task_id,
+                tool_name,
+                " (error)" if bg_result.error else "",
+            )
+
+            with self._callbacks_lock:
+                callbacks = list(self._completion_callbacks)
+            for cb in callbacks:
+                try:
+                    cb(task_id, bg_result)
+                except Exception:
+                    logger.debug(
+                        "[bg-task] Callback error for tracked task #%d",
+                        task_id,
+                        exc_info=True,
+                    )
+
+        task.add_done_callback(_on_done)
+        logger.info(
+            "[bg-task] Task #%d tracked (shielded): %s - %s",
+            task_id, tool_name, description[:120],
         )
+        return task_id
 
     def is_completed(self, task_id: int) -> bool:
         with self._results_lock:
@@ -226,8 +275,34 @@ class BackgroundTaskManager:
 
         Uses the [task-background #N] prefix so the LLM naturally interprets
         these as system-initiated context updates.
+
+        Applies ToolResultBudget to non-error results — same token-budget
+        path as synchronous tool results in ActorAgent, so oversized outputs
+        are saved to cache files and replaced with Read-able placeholders.
         """
-        for r in results:
+        from Agent.ToolResultBudget import ToolResultBudget
+        from configurationLoader import config
+
+        # Collect non-error results for unified token budget processing
+        budget_inputs = []
+        budget_idx_by_original = {}
+        for i, r in enumerate(results):
+            if not r.error:
+                budget_idx_by_original[i] = len(budget_inputs)
+                budget_inputs.append({
+                    "tool_name": r.tool_name,
+                    "result_text": str(r.result),
+                })
+
+        if budget_inputs:
+            max_single = config.get("tools.result_budget.max_single_tokens", 8000)
+            max_batch = config.get("tools.result_budget.max_batch_tokens", 24000)
+            cache_dir = config.get(
+                "tools.result_budget.cache_dir", "./runtime_memory/tool_cache"
+            )
+            ToolResultBudget.apply(budget_inputs, cache_dir, max_single, max_batch)
+
+        for i, r in enumerate(results):
             if r.error:
                 content = (
                     f"[task-background #{r.task_id} completed with error]\n"
@@ -237,9 +312,7 @@ class BackgroundTaskManager:
                     f"Do NOT retry it unless the user explicitly asks."
                 )
             else:
-                result_str = str(r.result)
-                if len(result_str) > 5000:
-                    result_str = result_str[:5000] + "\n... [truncated]"
+                result_str = budget_inputs[budget_idx_by_original[i]]["result_text"]
                 content = (
                     f"[task-background #{r.task_id} completed]\n"
                     f"Tool: {r.tool_name}\n"

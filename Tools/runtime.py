@@ -3,7 +3,6 @@ import json
 import logging
 from dataclasses import dataclass
 
-from Agent.BackgroundTaskManager import BackgroundTaskManager
 from configurationLoader import config
 from Tools.loader import load_builtin_tools
 from Tools.registry import registry
@@ -70,29 +69,49 @@ class InProcessToolRuntime:
         if not self._initialized:
             await self.initialize()
         args = arguments or {}
+
+        # 统一后台化入口：任何工具都可以传 run_background=True
+        # runtime 层剥离该参数并立即 track_task，工具 handler 不感知
+        run_background = args.pop("run_background", False)
+
+        from Agent.BackgroundTaskManager import BackgroundTaskManager  # 懒加载，避免循环依赖
+        task_mgr = BackgroundTaskManager()
+        desc = f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
+
+        dispatch_task = asyncio.create_task(registry.dispatch(name, args))
+
+        if run_background:
+            task_id = task_mgr.track_task(name, dispatch_task, desc)
+            logger.info(
+                "Tool '%s' launched in background (task #%d)",
+                name, task_id,
+            )
+            return ToolResult(
+                content=json.dumps(
+                    {
+                        "backgrounded": True,
+                        "task_id": task_id,
+                        "tool": name,
+                        "message": f"Tool launched in background (task #{task_id}). Results will be injected when ready.",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
         background_timeout = config.get("tools.background_timeout", 120)
         if not isinstance(background_timeout, (int, float)) or background_timeout <= 0:
-            background_timeout = None
+            result = await dispatch_task
+            return ToolResult(content=result)
 
         try:
-            if background_timeout:
-                result = await asyncio.wait_for(
-                    registry.dispatch(name, args), timeout=background_timeout
-                )
-            else:
-                result = await registry.dispatch(name, args)
+            result = await asyncio.wait_for(
+                asyncio.shield(dispatch_task), timeout=background_timeout
+            )
             return ToolResult(content=result)
         except asyncio.TimeoutError:
-            # Move to background instead of failing
-            task_mgr = BackgroundTaskManager()
-            desc = f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
-
-            async def _bg_work():
-                return await registry.dispatch(name, args)
-
-            task_id = task_mgr.submit(name, _bg_work(), desc)
+            task_id = task_mgr.track_task(name, dispatch_task, desc)
             logger.info(
-                "Tool '%s' exceeded background_timeout (%ss), moved to background (task #%d)",
+                "Tool '%s' exceeded background_timeout (%ss), tracked as background (task #%d)",
                 name, background_timeout, task_id,
             )
             return ToolResult(
@@ -101,7 +120,7 @@ class InProcessToolRuntime:
                         "backgrounded": True,
                         "task_id": task_id,
                         "tool": name,
-                        "message": f"Task moved to background (task #{task_id})",
+                        "message": f"Tool is still running in background (task #{task_id}). Results will be injected when ready.",
                     },
                     ensure_ascii=False,
                 )

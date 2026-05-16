@@ -76,6 +76,11 @@ class CommandSuggestions(Container):
             "usage": "/prompt"
         },
         {
+            "name": "/prompt-cache",
+            "description": "Browse & reuse recent long prompts",
+            "usage": "/prompt-cache"
+        },
+        {
             "name": "/exit",
             "description": "Exit the application",
             "usage": "/exit"

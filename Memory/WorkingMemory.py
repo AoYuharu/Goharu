@@ -5,12 +5,17 @@ from pathlib import Path
 
 from configurationLoader import config
 from Core.ToolCall import ToolCall
+from Memory.repositories.L0Repository import L0Repository
 
 
 class WorkingMemory:
     def __init__(self):
         self.daily_dir = Path(config.get("memory.daily.dir", "./runtime_memory/daily"))
         self.retention_days = max(1, int(config.get("memory.daily.retention_days", 7)))
+        self.sqlite_enabled = bool(config.get("memory.sqlite.enabled", True))
+        self.daily_json_enabled = bool(config.get("memory.export.daily_json_enabled", True))
+        self.session_id = str(config.get("memory.session_id", "default"))
+        self.l0_repo = L0Repository() if self.sqlite_enabled else None
         self.daily_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
@@ -134,22 +139,29 @@ class WorkingMemory:
         temp_path.replace(path)
 
     def append(self, content):
-        today = date.today().isoformat()
-        day_payload = self.read_day(today) or self._empty_day(today)
-
         message = self._normalize_message(content)
-        if not day_payload["messages"]:
-            day_payload["created_at"] = message["timestamp"]
 
-        day_payload["messages"].append(message)
-        day_payload["updated_at"] = message["timestamp"]
-        day_payload["message_count"] = len(day_payload["messages"])
-        self._write_day(day_payload)
+        # Dual-write: SQLite (new primary store) + daily JSON (legacy export)
+        if self.sqlite_enabled and self.l0_repo:
+            self.l0_repo.append_message(message, session_id=self.session_id)
+
+        if self.daily_json_enabled:
+            today = date.today().isoformat()
+            day_payload = self.read_day(today) or self._empty_day(today)
+            if not day_payload["messages"]:
+                day_payload["created_at"] = message["timestamp"]
+            day_payload["messages"].append(message)
+            day_payload["updated_at"] = message["timestamp"]
+            day_payload["message_count"] = len(day_payload["messages"])
+            self._write_day(day_payload)
 
     def list_daily_files(self):
         return sorted(self.daily_dir.glob("*.json"), key=lambda path: path.stem)
 
     def list_expired_days(self):
+        if self.sqlite_enabled and self.l0_repo:
+            return self.l0_repo.list_expired_days(self.retention_days, session_id=self.session_id)
+
         cutoff = date.today() - timedelta(days=self.retention_days - 1)
         expired_days = []
         for path in self.list_daily_files():
@@ -162,15 +174,22 @@ class WorkingMemory:
         return expired_days
 
     def read_day(self, date_str: str):
+        if self.sqlite_enabled and self.l0_repo:
+            messages = self.l0_repo.list_day_messages(date_str, session_id=self.session_id)
+            return {"date": date_str, "messages": messages, "message_count": len(messages)}
+
         path = self._day_path(date_str)
         if not path.exists():
             return None
         return self._read_day_file(path)
 
     def delete_day(self, date_str: str):
-        path = self._day_path(date_str)
-        if path.exists():
-            path.unlink()
+        if self.sqlite_enabled and self.l0_repo:
+            self.l0_repo.delete_day(date_str, session_id=self.session_id)
+        if self.daily_json_enabled:
+            path = self._day_path(date_str)
+            if path.exists():
+                path.unlink()
 
     def clear_today(self):
         """清空今天的消息（当前会话）"""
@@ -178,6 +197,10 @@ class WorkingMemory:
         self.delete_day(today)
 
     def get_recent_messages(self):
+        if self.sqlite_enabled and self.l0_repo:
+            cutoff = (date.today() - timedelta(days=self.retention_days - 1)).isoformat()
+            return self.l0_repo.list_messages(session_id=self.session_id, start_day=cutoff)
+
         cutoff = date.today() - timedelta(days=self.retention_days - 1)
         messages = []
         for path in self.list_daily_files():

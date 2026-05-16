@@ -103,7 +103,7 @@ DO NOT retry with run_cmd. Use the dedicated tools."""}, ensure_ascii=False)
         )
         tool_process_tracker.register(p.pid)
         try:
-            stdout, stderr = await asyncio.to_thread(p.communicate, timeout=30)
+            stdout, stderr = await asyncio.to_thread(p.communicate, timeout=480)
             return json.dumps({
                 "exit_code": p.returncode,
                 "stdout": (stdout or "").strip(),
@@ -153,7 +153,7 @@ registry.register(
     name="run_cmd",
     description=(
         "Execute a shell command. STRICTLY for system-level operations that CANNOT be done with dedicated tools. "
-        "Commands time out after 30s. Returns JSON with exit_code/stdout/stderr/timed_out/interrupted.\n\n"
+        "Commands time out after 8m. Returns JSON with exit_code/stdout/stderr/timed_out/interrupted.\n\n"
         "ALLOWED (examples): 'python script.py' / 'pytest test_xxx.py' / 'pip install pkg' / "
         "'git add file && git commit -m msg' / 'gh pr create ...' / 'mkdir new_dir' / 'ls' / 'dir'.\n\n"
         "BLOCKED — file reading/writing: echo >, echo >>, cat, head, tail, sed, awk, type | . "
@@ -184,6 +184,16 @@ registry.register(
                     "dd, mkfs, and any command that could damage the system. Do NOT attempt these."
                 ),
             },
+            "run_background": {
+                "type": "boolean",
+                "description": (
+                    "If true, run the command in the background and return immediately. "
+                    "Use this for servers, daemons, or any command that runs indefinitely "
+                    "(e.g., 'python server.py', 'npm run dev', 'uvicorn'). "
+                    "Results will be injected when the command completes."
+                ),
+                "default": False
+            },
         },
         "required": ["cmd"],
     },
@@ -191,6 +201,37 @@ registry.register(
     group="core",
 )
 
+
+def background_status() -> str:
+    """Query the status of all background tasks currently pending completion.
+
+    Returns a JSON summary including pending result count, task IDs, and
+    reactivation count. The agent can use this to check whether previously
+    dispatched background work has finished, and then drain/inject the results.
+    """
+    from Agent.BackgroundTaskManager import BackgroundTaskManager
+    summary = BackgroundTaskManager().get_status_summary()
+    return json.dumps(summary, ensure_ascii=False)
+
+
+registry.register(
+    name="background_status",
+    description=(
+        "Query the status of all pending background tasks. "
+        "Returns JSON with: pending_results (count of completed but not yet "
+        "injected background tasks), task_ids (their IDs), and reactivation_count "
+        "(how many times background results have been injected into context). "
+        "Use this to check whether a previously dispatched background task "
+        "(e.g. long run_cmd, subagent) has finished. The results will be "
+        "automatically injected into your context at the next step boundary."
+    ),
+    arguments_schema={
+        "type": "object",
+        "properties": {},
+    },
+    handler=background_status,
+    group="core",
+)
 
 
 # 导入 system_info_tool 以注册 get_system_info 工具

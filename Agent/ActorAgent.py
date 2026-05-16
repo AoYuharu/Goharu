@@ -1,6 +1,10 @@
 from Agent.LargeLanguageModel import LargeLanguageModel
 import asyncio
+import atexit
 import json
+import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from Core.ToolCall import ToolCall
 from Prompting.PromptAssembler import PromptAssembler
@@ -8,6 +12,33 @@ from Prompting.PromptRenderer import PromptRenderer
 from Tools.guard import ToolCallGuard
 from Tools.task_guide import TaskGuide
 from configurationLoader import config
+
+logger = logging.getLogger(__name__)
+
+# 专用 executor，不受事件循环生命周期影响
+# Python 3.9+ 的 ThreadPoolExecutor 会在 __init__ 注册 atexit handler，
+# 导致进程关闭时 executor 被自动 shutdown。这里主动 unregister 该 handler，
+# 只在手动调用 shutdown_llm_executor() 时才关闭。
+_LLM_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm-query-")
+_LLM_EXECUTOR_LOCK = threading.Lock()
+_LLM_EXECUTOR_SHUTDOWN = False
+
+# Unregister the atexit handler that ThreadPoolExecutor registers in __init__
+# (Python 3.9+). Without this, the executor gets shut down while daemon threads
+# are still trying to submit LLM queries during process exit.
+try:
+    atexit.unregister(_LLM_EXECUTOR._python_exit)
+except (AttributeError, Exception):
+    pass  # _python_exit may not exist in all Python versions
+
+
+def shutdown_llm_executor(wait=True):
+    """手动关闭 LLM executor（在 main() finally 中调用）。"""
+    global _LLM_EXECUTOR, _LLM_EXECUTOR_SHUTDOWN
+    with _LLM_EXECUTOR_LOCK:
+        _LLM_EXECUTOR_SHUTDOWN = True
+        _LLM_EXECUTOR.shutdown(wait=wait, cancel_futures=True)
+    logger.info("LLM executor shut down")
 
 
 class ActorAgent(LargeLanguageModel):
@@ -62,7 +93,9 @@ class ActorAgent(LargeLanguageModel):
         """Check if a tool result indicates the task was moved to background."""
         try:
             parsed = json.loads(result_text)
-            return parsed.get("backgrounded", False)
+            if isinstance(parsed, dict):
+                return parsed.get("backgrounded", False)
+            return False
         except (json.JSONDecodeError, TypeError):
             return False
 
@@ -84,6 +117,17 @@ class ActorAgent(LargeLanguageModel):
         if self.guard is None and tool_definitions:
             self.guard = ToolCallGuard(tool_definitions)
 
+        import configurationLoader
+        retrieval_enabled = bool(configurationLoader.config.get("memory.retrieval.enabled", False))
+        use_legacy_memory = bool(configurationLoader.config.get("memory.prompt.use_legacy_memory_markdown", True))
+
+        retrieval_pack = None
+        if retrieval_enabled and hasattr(self.working, "retrieve_prompt_memory"):
+            try:
+                retrieval_pack = self.working.retrieve_prompt_memory()
+            except Exception:
+                retrieval_pack = None
+
         document = self.prompt_assembler.build_actor_document(
             history=self.working.get_context(),
             soul_markdown=self.working.get_soul_markdown(),
@@ -91,6 +135,8 @@ class ActorAgent(LargeLanguageModel):
             memory_markdown=self.working.get_memory_markdown(),
             extra_system_prompt=extra_system_prompt,
             tool_definitions=tool_definitions,
+            retrieval_pack=retrieval_pack,
+            use_legacy_memory=use_legacy_memory,
         )
         messages = self.prompt_renderer.render_document(document)
         return {
@@ -158,13 +204,34 @@ class ActorAgent(LargeLanguageModel):
     async def _run_llm_with_interrupt(query_fn, interrupt_check, poll_interval=0.3):
         """在后台线程运行阻塞的 LLM 查询，定期检查中断标志。
 
-        如果 interrupt_check 返回 True，立即放弃等待（后台线程仍会完成但结果被丢弃），返回 None。
-        否则等待查询完成并返回结果。
+        使用专用的 _LLM_EXECUTOR。如果 executor 已被 shutdown（进程关闭），
+        返回 None 让调用方当作中断处理，而非抛出异常导致 crash。
         """
+        global _LLM_EXECUTOR, _LLM_EXECUTOR_SHUTDOWN
+
         if not interrupt_check:
-            return query_fn()
-        loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(None, query_fn)
+            try:
+                return query_fn()
+            except RuntimeError as e:
+                if "shutdown" in str(e).lower():
+                    logger.warning("LLM query skipped (executor shut down)")
+                    return None
+                raise
+
+        with _LLM_EXECUTOR_LOCK:
+            if _LLM_EXECUTOR_SHUTDOWN:
+                logger.warning("LLM query skipped (executor marked shut down)")
+                return None
+            try:
+                future = asyncio.get_running_loop().run_in_executor(
+                    _LLM_EXECUTOR, query_fn
+                )
+            except RuntimeError as e:
+                if "shutdown" in str(e).lower():
+                    logger.warning("LLM query skipped: executor shut down")
+                    return None
+                raise
+
         while True:
             if interrupt_check():
                 return None  # 用户中断，放弃等待
@@ -232,6 +299,14 @@ class ActorAgent(LargeLanguageModel):
 
         # 判断是否使用 Anthropic 原生工具调用
         use_native = self._should_use_native_tools()
+
+        logger.debug(
+            "act: use_native=%s tools=%d messages=%d interrupt=%s",
+            use_native,
+            len(tool_definitions) if tool_definitions else 0,
+            len(messages),
+            bool(_interrupt_check),
+        )
 
         if use_native:
             anthropic_tools = self._convert_tools_to_anthropic_format(tool_definitions)
