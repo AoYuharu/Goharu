@@ -8,30 +8,19 @@
     tool_cfg = config.make_tool_config()
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
 class ModelConfig:
-    provider: str = "local_hf"
+    provider: str = "anthropic_compatible"
     model_name: str = ""
     api_key_env: str = ""
     base_url: str = ""
     max_tokens: int = 1024
     temperature: float = 0.7
     top_p: float = 0.9
-    use_native_tools: bool = True
     api_timeout: int = 120
-    # local_hf
-    hf_model_path: str = ""
-    hf_device_map: str = "cuda"
-    hf_trust_remote_code: bool = True
-    hf_load_in_4bit: bool = True
-    hf_bnb_4bit_quant_type: str = "nf4"
-    hf_bnb_4bit_compute_dtype: str = "float16"
-    hf_bnb_4bit_use_double_quant: bool = True
-    hf_max_new_tokens: int = 1024
-    hf_repetition_penalty: float = 1.1
 
 
 @dataclass
@@ -72,18 +61,10 @@ class MemoryConfig:
     retrieval_embedding_timeout: int = 30
     retrieval_reranker_model_path: str = "./models/rerank_model/bge-reranker-v2-m3"
     pipeline_db_enabled: bool = True
-    prompt_use_legacy_memory_markdown: bool = True
     export_daily_json_enabled: bool = True
     session_id: str = "default"
     daily_dir: str = "./runtime_memory/daily"
     retention_days: int = 7
-    index_path: str = "./runtime_memory/MEMORY.md"
-    user_path: str = "./runtime_memory/USER.md"
-    user_review_enabled: bool = True
-    user_review_interval: int = 10
-    topic_dir: str = "./runtime_memory/topic"
-    topic_merge_every_n: int = 3
-    topic_merge_min_count: int = 4
 
 
 @dataclass

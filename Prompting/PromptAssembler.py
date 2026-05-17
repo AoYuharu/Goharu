@@ -13,7 +13,6 @@ _SKILLS_DIR = Path(__file__).parent.parent / "Skills"
 
 
 def _scan_skills():
-    """启动时扫描 Skills/ 目录，读取每个 skill.md 的标题和描述，构建注入文本。"""
     skills_text = ""
     if not _SKILLS_DIR.is_dir():
         return skills_text
@@ -36,7 +35,7 @@ def _scan_skills():
 
 
 class PromptAssembler:
-    """提示词组装器 - 从外部文件加载系统提示词，静态引导语直接写死在代码中"""
+    """提示词组装器 — 金字塔记忆体系（SOUL + L1/L2检索 + L3 persona 摘要）。"""
 
     def __init__(self, prompt_loader=None):
         self.prompt_loader = prompt_loader or PromptLoader()
@@ -55,18 +54,14 @@ class PromptAssembler:
         sections.extend(self.prompt_loader.load_system_sections(agent_key))
         return sections
 
-    # ── 静态引导语（直接写死，不读文件） ──────────────────────────────
+    # ── 静态引导语 ─────────────────────────────────────────────────
 
     _SOUL_GUIDE = "以下是稳定角色设定 SOUL.md，请将其视为高优先级的长期风格与行为边界指导。"
-    _USER_PROFILE_GUIDE = "以下是当前用户画像 USER.md。它是主用户画像来源；若与 MEMORY.md 中的用户信息冲突，优先参考 USER.md。"
-    _L3_PROFILE_GUIDE = "以下是稳定用户画像摘要（L3）。这是最权威的用户建模上下文，优先级高于其他记忆。"
+    _L3_PROFILE_GUIDE = "以下是用户画像摘要（L3/persona.md）。这是最权威的用户建模上下文，优先级高于其他记忆。"
     _RETRIEVED_MEMORIES_GUIDE = "以下是检索到的相关记忆原子（L1）。请在相关时使用，注意这些是检索召回结果，可能不完全精确。"
-    _RETRIEVED_SCENES_GUIDE = "以下是检索到的相关话题/场景上下文（L2）。请用于理解当前对话的主题背景和长期任务状态。"
-    _MEMORY_GUIDE = "以下是共享长期记忆索引 MEMORY.md，请将其中信息视为长期上下文，仅在相关时使用。"
-    _MEMORY_BACKGROUND_GUIDE = "以下是共享长期记忆索引 MEMORY.md，仅作为补充背景，不是用户画像主来源。"
+    _RETRIEVED_SCENES_GUIDE = "以下是检索到的相关场景上下文（L2）。请用于理解当前对话的主题背景和长期任务状态。"
     _TOOL_DIRECTORY_GUIDE = "以下是当前运行时实际可用的工具目录。只有这些工具可以调用；如需调用工具，参数必须严格匹配对应 schema。"
 
-    # Skills 用法指导 + 启动时扫描的预置技能列表
     _SKILLS_GUIDE = (
         "## Skills 预置技能\n"
         "Skills 是针对特殊需求的预置任务范式（SOP）。"
@@ -89,29 +84,18 @@ class PromptAssembler:
             cache_control={"type": "ephemeral"},
         )
 
-    def _build_user_profile_section(self, user_profile_markdown, enable_cache=True):
-        user_text = self._normalize_text(user_profile_markdown)
-        if not user_text:
-            return None
-        kwargs = dict(kind="system", title="user_profile",
-                      content=f"{self._USER_PROFILE_GUIDE}\n\n{user_text}",
-                      metadata={"section_name": "user_profile"})
-        if enable_cache:
-            kwargs["cache_control"] = {"type": "ephemeral"}
-        return PromptSection(**kwargs)
-
-    def _build_l3_profile_summary_section(self, profile_summary, enable_cache=True):
+    def _build_l3_profile_summary_section(self, profile_summary):
         summary_text = self._normalize_text(profile_summary)
         if not summary_text:
             return None
-        kwargs = dict(kind="system", title="user_profile_compact",
-                      content=f"{self._L3_PROFILE_GUIDE}\n\n{summary_text}",
-                      metadata={"section_name": "user_profile_compact"})
-        if enable_cache:
-            kwargs["cache_control"] = {"type": "ephemeral"}
-        return PromptSection(**kwargs)
+        return PromptSection(
+            kind="system", title="user_profile_compact",
+            content=f"{self._L3_PROFILE_GUIDE}\n\n{summary_text}",
+            metadata={"section_name": "user_profile_compact"},
+            cache_control={"type": "ephemeral"},
+        )
 
-    def _build_retrieved_memories_section(self, retrieved_memories, enable_cache=True):
+    def _build_retrieved_memories_section(self, retrieved_memories):
         if not retrieved_memories:
             return None
         lines = []
@@ -120,14 +104,13 @@ class PromptAssembler:
             text = item.get("text") or ""
             lines.append(f"- [{title}] {text}")
         content = self._RETRIEVED_MEMORIES_GUIDE + "\n\n" + "\n".join(lines)
-        kwargs = dict(kind="system", title="retrieved_memories",
-                      content=content,
-                      metadata={"section_name": "retrieved_memories"})
-        if enable_cache:
-            kwargs["cache_control"] = {"type": "ephemeral"}
-        return PromptSection(**kwargs)
+        return PromptSection(
+            kind="system", title="retrieved_memories",
+            content=content, metadata={"section_name": "retrieved_memories"},
+            cache_control={"type": "ephemeral"},
+        )
 
-    def _build_retrieved_scenes_section(self, retrieved_scenes, enable_cache=True):
+    def _build_retrieved_scenes_section(self, retrieved_scenes):
         if not retrieved_scenes:
             return None
         lines = []
@@ -137,32 +120,9 @@ class PromptAssembler:
             keywords = ", ".join(item.get("keywords") or [])
             lines.append(f"- [{title}] {summary}" + (f" (keywords: {keywords})" if keywords else ""))
         content = self._RETRIEVED_SCENES_GUIDE + "\n\n" + "\n".join(lines)
-        kwargs = dict(kind="system", title="retrieved_scenes",
-                      content=content,
-                      metadata={"section_name": "retrieved_scenes"})
-        if enable_cache:
-            kwargs["cache_control"] = {"type": "ephemeral"}
-        return PromptSection(**kwargs)
-
-    def _build_memory_section(self, memory_markdown, background_only=False, enable_cache=True):
-        memory_text = self._normalize_text(memory_markdown)
-        if not memory_text:
-            return None
-        guide = self._MEMORY_BACKGROUND_GUIDE if background_only else self._MEMORY_GUIDE
-        kwargs = dict(kind="system", title="long_term_memory",
-                      content=f"{guide}\n\n{memory_text}",
-                      metadata={"section_name": "long_term_memory"})
-        if enable_cache:
-            kwargs["cache_control"] = {"type": "ephemeral"}
-        return PromptSection(**kwargs)
-
-    def _build_tool_directory_section(self, tool_definitions):
-        if not tool_definitions:
-            return None
         return PromptSection(
-            kind="system", title="tool_directory",
-            content=f"{self._TOOL_DIRECTORY_GUIDE}\n\n{self._json_text(tool_definitions)}",
-            metadata={"section_name": "tool_directory"},
+            kind="system", title="retrieved_scenes",
+            content=content, metadata={"section_name": "retrieved_scenes"},
             cache_control={"type": "ephemeral"},
         )
 
@@ -172,8 +132,7 @@ class PromptAssembler:
             return None
         return PromptSection(
             kind="system", title="skills",
-            content=skills_text,
-            metadata={"section_name": "skills"},
+            content=skills_text, metadata={"section_name": "skills"},
             cache_control={"type": "ephemeral"},
         )
 
@@ -193,16 +152,22 @@ class PromptAssembler:
         if not isinstance(record, dict):
             raise TypeError("Prompt history record must be dict or ToolCall")
 
-        tool_call = ToolCall.from_record(record)
-        if tool_call is not None:
-            section = tool_call.to_section()
-            metadata = dict(section.metadata)
+        if record.get("message_type") == "tool_call":
+            tool_call = ToolCall.from_record(record)
+            if tool_call is None:
+                raise ValueError("Structured tool_call record is invalid")
+            content = record.get("content")
+            if not isinstance(content, list):
+                content = [tool_call.to_anthropic_tool_use()]
+            metadata = {
+                "tool_name": tool_call.tool_name,
+                "arguments": dict(tool_call.arguments),
+            }
             if record.get("timestamp"):
                 metadata["timestamp"] = record.get("timestamp")
             if record.get("id"):
                 metadata["id"] = record.get("id")
-            kwargs = dict(kind=section.kind, title=section.title,
-                          content=section.content, metadata=metadata)
+            kwargs = dict(kind="tool_call", title=tool_call.tool_name, content=content, metadata=metadata)
             if enable_cache:
                 kwargs["cache_control"] = {"type": "ephemeral"}
             return PromptSection(**kwargs)
@@ -212,20 +177,7 @@ class PromptAssembler:
         timestamp = record.get("timestamp")
 
         if role == "tool":
-            metadata = {
-                "tool_name": record.get("tool_name") or record.get("name"),
-                "name": record.get("name"),
-            }
-            if timestamp:
-                metadata["timestamp"] = timestamp
-            if record.get("id"):
-                metadata["id"] = record.get("id")
-            kwargs = dict(kind="tool_result",
-                          title=str(record.get("name") or record.get("tool_name") or "tool_result"),
-                          content=content, metadata=metadata)
-            if enable_cache:
-                kwargs["cache_control"] = {"type": "ephemeral"}
-            return PromptSection(**kwargs)
+            raise ValueError("Legacy role='tool' messages are no longer supported")
 
         if role in {"user", "assistant", "system"}:
             metadata = {}
@@ -243,10 +195,14 @@ class PromptAssembler:
     # ── Document builders ───────────────────────────────────────────
 
     def build_actor_document(
-        self, history, soul_markdown="", user_profile_markdown="",
-        memory_markdown="", extra_system_prompt=None, legacy_system_prompt=None,
-        tool_definitions=None, retrieval_pack=None, use_legacy_memory=True,
+        self, history, soul_markdown="",
+        extra_system_prompt=None, tool_definitions=None, retrieval_pack=None,
     ):
+        """构建 actor prompt 文档。
+
+        金字塔体系注入顺序：actor system → SOUL → L3 persona →
+        L1 检索记忆 → L2 检索场景 → skills → 对话历史。
+        """
         document = PromptDocument()
         document.extend_system(self._load_agent_system_sections("actor"))
 
@@ -254,50 +210,42 @@ class PromptAssembler:
         if soul_section is not None:
             document.add_system(soul_section)
 
-        # L3 compact profile summary (always injected when retrieval is enabled)
-        profile_summary = (retrieval_pack or {}).get("profile_summary") if retrieval_pack else None
-        if profile_summary:
-            profile_section = self._build_l3_profile_summary_section(profile_summary)
-            if profile_section is not None:
-                document.add_system(profile_section)
-
-        # Legacy user profile section (when legacy path is active or retrieval is off)
-        if not retrieval_pack or use_legacy_memory:
-            user_profile_section = self._build_user_profile_section(user_profile_markdown, enable_cache=True)
-            if user_profile_section is not None:
-                document.add_system(user_profile_section)
-
-        # Retrieved L1 memories (query-time hybrid retrieval)
+        # L3 persona summary (from persona.md)
         if retrieval_pack:
+            profile_summary = retrieval_pack.get("profile_summary")
+            if profile_summary:
+                profile_section = self._build_l3_profile_summary_section(profile_summary)
+                if profile_section is not None:
+                    document.add_system(profile_section)
+
+            # L1 memories
             retrieved_mems = retrieval_pack.get("memories") or []
             mem_section = self._build_retrieved_memories_section(retrieved_mems)
             if mem_section is not None:
                 document.add_system(mem_section)
 
+            # L2 scenes
             retrieved_scenes = retrieval_pack.get("scenes") or []
             scene_section = self._build_retrieved_scenes_section(retrieved_scenes)
             if scene_section is not None:
                 document.add_system(scene_section)
 
-        legacy_prompt = self._normalize_text(legacy_system_prompt)
-        if legacy_prompt:
-            document.add_system(PromptSection(
-                kind="system", title="legacy_actor_system_prompt", content=legacy_prompt,
-                metadata={"section_name": "legacy_actor_system_prompt"},
-            ))
-
-        # Legacy MEMORY.md fallback (when retrieval is off or legacy flag is set)
-        if not retrieval_pack or use_legacy_memory:
-            memory_section = self._build_memory_section(memory_markdown, enable_cache=True)
-            if memory_section is not None:
-                document.add_system(memory_section)
-
         skills_section = self._build_skills_section()
         if skills_section is not None:
             document.add_system(skills_section)
 
-        for record in history or []:
-            section = self.record_to_section(record)
+        # Find the last user message — everything before it gets cached
+        last_user_idx = -1
+        if history:
+            for i in range(len(history) - 1, -1, -1):
+                role = (history[i].get("role") or "").strip() if isinstance(history[i], dict) else ""
+                if role == "user":
+                    last_user_idx = i
+                    break
+
+        for i, record in enumerate(history or []):
+            enable_cache = (last_user_idx >= 0 and i < last_user_idx)
+            section = self.record_to_section(record, enable_cache=enable_cache)
             if section is not None:
                 document.add_conversation(section)
 
@@ -310,36 +258,23 @@ class PromptAssembler:
 
         return document
 
-    def build_day_summary_document(self, history, old_memory):
+    def build_day_summary_document(self, history, old_memory=None, existing_atoms=None):
         document = PromptDocument()
         document.extend_system(self._load_agent_system_sections("summarizer"))
-        document.extend_conversation([
+
+        sections = [
             PromptSection(kind="user", title="day_history",
                           content="以下是某一天的历史对话：\n\n" + self._json_text(history or []),
                           metadata={"section_name": "day_history"}),
-            PromptSection(kind="user", title="long_term_memory_index",
-                          content="以下是当前长期记忆索引与 topic 元数据：\n\n" + self._json_text(old_memory or {}),
-                          metadata={"section_name": "long_term_memory_index"}),
-            PromptSection(kind="user", title="summary_task",
+        ]
+        if existing_atoms:
+            sections.append(PromptSection(kind="user", title="existing_atoms",
+                          content="以下是已存在的记忆原子（避免输出重复内容）：\n\n" + self._json_text(existing_atoms),
+                          metadata={"section_name": "existing_atoms"}))
+        sections.append(PromptSection(kind="user", title="summary_task",
                           content="请根据任务A（日总结）的格式，生成该日的长期记忆摘要 JSON。",
-                          metadata={"section_name": "summary_task"}),
-        ])
-        return document
-
-    def build_topic_merge_document(self, memory_index, topic_docs):
-        document = PromptDocument()
-        document.extend_system(self._load_agent_system_sections("summarizer"))
-        document.extend_conversation([
-            PromptSection(kind="user", title="memory_index",
-                          content="以下是当前 MEMORY.md 索引：\n\n" + self._json_text(memory_index or {}),
-                          metadata={"section_name": "memory_index"}),
-            PromptSection(kind="user", title="topic_documents",
-                          content="以下是当前所有 topic 文档的结构化内容：\n\n" + self._json_text(topic_docs or []),
-                          metadata={"section_name": "topic_documents"}),
-            PromptSection(kind="user", title="merge_task",
-                          content="请根据任务B（话题合并）的格式，输出 topic 合并建议 JSON。",
-                          metadata={"section_name": "merge_task"}),
-        ])
+                          metadata={"section_name": "summary_task"}))
+        document.extend_conversation(sections)
         return document
 
     def build_context_compact_document(self, conversation, system_prompt=None):
@@ -365,32 +300,3 @@ class PromptAssembler:
         document.extend_conversation(sections)
         return document
 
-    def build_review_document(self, turn_context, user_profile_markdown="", memory_markdown=""):
-        document = PromptDocument()
-        document.extend_system(self._load_agent_system_sections("reviewer"))
-
-        user_text = self._normalize_text(user_profile_markdown)
-        memory_text = self._normalize_text(memory_markdown)
-
-        document.extend_conversation([
-            PromptSection(kind="user", title="turn_transcript",
-                          content="以下是本轮 turn transcript 的结构化 JSON：\n\n" + self._json_text(turn_context or []),
-                          metadata={"section_name": "turn_transcript"}),
-            PromptSection(kind="user", title="current_user_profile",
-                          content="以下是当前 USER.md 内容：\n\n" + (user_text or "(empty)"),
-                          metadata={"section_name": "current_user_profile"}),
-        ])
-
-        if memory_text:
-            document.add_conversation(PromptSection(
-                kind="user", title="long_term_memory_background",
-                content="以下是当前 MEMORY.md 内容，仅作补充背景：\n\n" + memory_text,
-                metadata={"section_name": "long_term_memory_background"},
-            ))
-
-        document.add_conversation(PromptSection(
-            kind="user", title="review_task",
-            content="请根据以上内容，输出本轮用户画像复盘 JSON。",
-            metadata={"section_name": "review_task"},
-        ))
-        return document

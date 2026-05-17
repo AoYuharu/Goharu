@@ -7,7 +7,6 @@ Shows available slash commands when user types /
 from textual.widgets import Static
 from textual.containers import Container, Vertical
 from rich.text import Text
-from rich.table import Table
 
 
 class CommandSuggestions(Container):

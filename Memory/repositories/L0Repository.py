@@ -152,6 +152,13 @@ class L0Repository:
             (str(day_key), str(session_id)),
         )
 
+    def delete_all_for_session(self, session_id="default"):
+        """Delete ALL turns (and cascade messages) for a session."""
+        self.db.execute(
+            "DELETE FROM l0_turns WHERE session_id = ?",
+            (str(session_id),),
+        )
+
     def mark_turn_pipeline_state(self, turn_id, pipeline_state, status=None):
         if status is None:
             self.db.execute(

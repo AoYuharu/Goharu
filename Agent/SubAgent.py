@@ -10,7 +10,6 @@ import json
 import re
 import shlex
 import time
-import uuid
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
@@ -208,10 +207,9 @@ class SubAgent:
         # 初始化LLM
         self.llm = LargeLanguageModel()
 
-        # 判断是否使用 Anthropic 原生工具调用
+        # 仅支持 Anthropic 原生工具调用
         llm_config = config.get("model.large-language-model", {}) or {}
-        self.provider = llm_config.get("provider", "local_hf")
-        self.use_native_tools = llm_config.get("use_native_tools", True)
+        self.provider = llm_config.get("provider", "anthropic_compatible")
 
         # 执行统计
         self.start_time = None
@@ -323,29 +321,10 @@ class SubAgent:
                 tools.append(tool_def)
         return tools
 
-    def _build_tools_schema(self) -> str:
-        """构建工具schema描述（文本格式，用于 local_hf 回退）"""
-        tools_desc = []
-
-        for tool_name in self.allowed_tools:
-            tool_entry = self.tools_registry.get_entry(tool_name)
-            if tool_entry:
-                tools_desc.append(f"## {tool_name}")
-                tools_desc.append(f"描述: {tool_entry.description}")
-
-                schema = tool_entry.arguments_schema
-                if schema:
-                    tools_desc.append(f"参数: {json.dumps(schema, ensure_ascii=False, indent=2)}")
-
-                tools_desc.append("")
-
-        return "\n".join(tools_desc)
-
     def _build_prompt_messages(self) -> List[Dict[str, Any]]:
         """构建提示消息，支持PromptCaching"""
         messages = []
 
-        # 系统提示词（Level 1缓存 - 总是缓存）
         system_message = {
             "role": "system",
             "content": self.system_prompt,
@@ -353,17 +332,6 @@ class SubAgent:
         }
         messages.append(system_message)
 
-        # 工具schema（Level 1缓存 - 总是缓存）
-        # 对于 Anthropic 原生工具，这仅作为文本回退；工具定义通过 API tools 参数传递
-        tools_schema = self._build_tools_schema()
-        tools_message = {
-            "role": "system",
-            "content": f"# 可用工具\n\n{tools_schema}",
-            "cache_control": {"type": "ephemeral"}
-        }
-        messages.append(tools_message)
-
-        # 用户任务（不缓存 - 每次都不同）
         task_message = {
             "role": "user",
             "content": self._build_initial_task_text()
@@ -491,10 +459,9 @@ class SubAgent:
         return truncated
 
     def _should_use_native_tools(self) -> bool:
-        """判断是否应该使用 Anthropic 原生工具调用"""
+        """判断是否满足 Anthropic 原生工具调用前提"""
         return (
             self.provider == "anthropic_compatible"
-            and self.use_native_tools
             and bool(self.allowed_tools)
         )
 
@@ -686,70 +653,13 @@ class SubAgent:
 
         return result
 
-    def _parse_tool_calls(self, response: str) -> List[Dict[str, Any]]:
-        """
-        从LLM响应中解析工具调用（文本格式，仅用于 local_hf 回退）
-
-        支持多种格式：
-        1. {"tool": "tool_name", "args": {...}}
-        2. {"tool": "tool_name", "arguments": {...}}
-        3. {tool => "tool_name", args => {...}}
-        """
-        tool_calls = []
-
-        try:
-            import re
-
-            # 格式1和2: 标准JSON格式
-            json_pattern = r'\{[^{}]*"tool"[^{}]*\}'
-            matches = re.findall(json_pattern, response, re.DOTALL)
-
-            for match in matches:
-                try:
-                    tool_call = json.loads(match)
-                    if "tool" in tool_call:
-                        args = tool_call.get("args") or tool_call.get("arguments") or {}
-                        tool_calls.append({
-                            "tool": tool_call["tool"],
-                            "args": args
-                        })
-                except json.JSONDecodeError:
-                    continue
-
-            # 格式3: {tool => "name", args => {...}} 格式
-            arrow_pattern = r'\{tool\s*=>\s*"([^"]+)"[^}]*args\s*=>\s*(\{[^}]+\})\}'
-            arrow_matches = re.findall(arrow_pattern, response, re.DOTALL)
-
-            for tool_name, args_str in arrow_matches:
-                try:
-                    args = {}
-                    arg_pattern = r'--(\w+)\s+"([^"]+)"'
-                    arg_matches = re.findall(arg_pattern, args_str)
-                    for key, value in arg_matches:
-                        args[key] = value
-
-                    if not args:
-                        args = json.loads(args_str)
-
-                    tool_calls.append({
-                        "tool": tool_name,
-                        "args": args
-                    })
-                except Exception:
-                    continue
-
-        except Exception:
-            pass
-
-        return tool_calls
-
-    def _scan_messages_for_last_text(self, messages: List[Dict], use_native: bool) -> Optional[str]:
+    def _scan_messages_for_last_text(self, messages: List[Dict]) -> Optional[str]:
         """扫描消息列表，返回最后一条 assistant 的 text/thinking 内容（排除纯 tool_use 消息）"""
         for msg in reversed(messages):
             if msg.get("role") != "assistant":
                 continue
             content = msg.get("content")
-            if use_native and isinstance(content, list):
+            if isinstance(content, list):
                 text_parts = []
                 for block in content:
                     if isinstance(block, dict):
@@ -784,8 +694,11 @@ class SubAgent:
         try:
             messages = self._build_prompt_messages()
             max_iterations = self._get_max_iterations()
-            use_native = self._should_use_native_tools()
-            anthropic_tools = self._build_anthropic_tools() if use_native else None
+            if not self._should_use_native_tools():
+                raise ValueError(
+                    "SubAgent requires anthropic_compatible provider and at least one allowed tool"
+                )
+            anthropic_tools = self._build_anthropic_tools()
 
             final_answer = None
             iteration = 0
@@ -794,19 +707,15 @@ class SubAgent:
                 self._notify(f"  🔄 [{self.agent_id}] 迭代 {iteration + 1}/{max_iterations}", "info")
                 remaining = max_iterations - (iteration + 1)
 
-                # ══════ Phase 1: LLM 调用（含重试） ══════
                 try:
-                    if use_native:
-                        response = self._call_llm_with_retry(messages, anthropic_tools, MAX_LLM_RETRIES)
-                    else:
-                        response = self._call_llm_with_retry(messages, None, MAX_LLM_RETRIES)
+                    response = self._call_llm_with_retry(messages, anthropic_tools, MAX_LLM_RETRIES)
                 except Exception as e:
                     self._notify(f"  ❌ [{self.agent_id}] LLM 调用完全失败: {e}", "error")
-                    fallback = self._scan_messages_for_last_text(messages, use_native) or ""
+                    fallback = self._scan_messages_for_last_text(messages) or ""
                     return self._build_result("error", fallback, iteration, error=f"LLM call failed: {e}")
 
                 # ══════ Phase 2: max_tokens 截断续写 ══════
-                if use_native and self._is_native_response(response):
+                if self._is_native_response(response):
                     continued = self._handle_truncation(
                         response, messages, anthropic_tools, 0, MAX_AUTO_CONTINUE
                     )
@@ -814,145 +723,91 @@ class SubAgent:
                         response = continued
 
                 # ══════ Phase 3: 解析响应 ══════
-                if use_native and self._is_native_response(response):
-                    native_text = self._extract_native_text(response)
-                    native_thinking = self._extract_native_thinking(response)
-                    tool_use_blocks = self._parse_native_tool_calls(response)
+                if not self._is_native_response(response):
+                    raise ValueError("Native subagent mode requires Anthropic response objects with content blocks")
 
-                    self._notify(
-                        f"  💭 [{self.agent_id}] 思考: "
-                        + ((native_text or native_thinking or "(no text)")[:200]),
-                        "debug",
-                    )
+                native_text = self._extract_native_text(response)
+                native_thinking = self._extract_native_thinking(response)
+                tool_use_blocks = self._parse_native_tool_calls(response)
 
-                    if native_text or native_thinking:
-                        self.last_text_answer = native_text or native_thinking
-                        self.shared_state["last_text_answer"] = self.last_text_answer
+                self._notify(
+                    f"  💭 [{self.agent_id}] 思考: "
+                    + ((native_text or native_thinking or "(no text)")[:200]),
+                    "debug",
+                )
 
-                    _write_agent_jsonl(self._log_dir, self.agent_id, {
-                        "event": "iteration", "iteration": iteration + 1, "native": True,
-                        "text_preview": (native_text[:200] if native_text else None),
-                        "thinking_preview": (native_thinking[:200] if native_thinking else None),
-                        "tool_use_count": len(tool_use_blocks),
-                        "tool_names": [tb["tool"] for tb in tool_use_blocks],
-                        "timestamp": time.time(),
+                if native_text or native_thinking:
+                    self.last_text_answer = native_text or native_thinking
+                    self.shared_state["last_text_answer"] = self.last_text_answer
+
+                _write_agent_jsonl(self._log_dir, self.agent_id, {
+                    "event": "iteration", "iteration": iteration + 1, "native": True,
+                    "text_preview": (native_text[:200] if native_text else None),
+                    "thinking_preview": (native_thinking[:200] if native_thinking else None),
+                    "tool_use_count": len(tool_use_blocks),
+                    "tool_names": [tb["tool"] for tb in tool_use_blocks],
+                    "timestamp": time.time(),
+                })
+
+                if native_thinking and not native_text and not tool_use_blocks:
+                    messages.append({
+                        "role": "assistant",
+                        "content": [{"type": "thinking", "thinking": native_thinking}],
                     })
+                    continue
 
-                    # 仅 thinking，无 text 无工具 → 模型还在思考
-                    if native_thinking and not native_text and not tool_use_blocks:
-                        messages.append({
-                            "role": "assistant",
-                            "content": [{"type": "thinking", "thinking": native_thinking}],
-                        })
-                        continue
+                if not tool_use_blocks:
+                    self._notify(f"  ✅ [{self.agent_id}] 得出最终结论", "info")
+                    final_answer = native_text or ""
+                    break
 
-                    # 无工具调用 → 最终答案
-                    if not tool_use_blocks:
-                        self._notify(f"  ✅ [{self.agent_id}] 得出最终结论", "info")
-                        final_answer = native_text or ""
-                        break
-
-                    # ══════ Phase 4: 执行工具 ══════
-                    # 构建 assistant 消息（text + tool_use 块）
-                    assistant_content = []
-                    if native_text:
-                        assistant_content.append({"type": "text", "text": native_text})
-                    for tb in tool_use_blocks:
-                        assistant_content.append({
-                            "type": "tool_use",
-                            "id": tb["id"],
-                            "name": tb["tool"],
-                            "input": tb.get("args", tb.get("input", {})),
-                        })
-                    messages.append({"role": "assistant", "content": assistant_content})
-
-                    # 通过 registry 安全执行
-                    tool_results = self._execute_tools_safely(tool_use_blocks)
-
-                    # 构建 user 消息（剩余次数提示 + tool_result 块）
-                    user_content = [{"type": "text", "text": (
-                        f"⚠️ 剩余可执行次数: {remaining}/{max_iterations}。"
-                        f"用完将强制结束。请高效利用剩余机会。" if remaining > 0 else
-                        f"⚠️ 最后机会！本次执行后将被强制结束，必须输出文本答案，不能再调用工具。"
-                    )}]
-                    for tr in tool_results:
-                        args_str = json.dumps(tr.get("args", {}), ensure_ascii=False)[:100]
-                        self._notify(
-                            f"  🔧 [{self.agent_id}] 调用工具: {tr['tool']}({args_str}...)", "info"
-                        )
-                        result_preview = tr["result"][:150] + "..." if len(tr["result"]) > 150 else tr["result"]
-                        self._notify(
-                            f"  {'⚠' if tr['is_error'] else '✓'} [{self.agent_id}] 工具结果: {result_preview}", "debug"
-                        )
-                        user_content.append(
-                            ToolCall.create_anthropic_tool_result(
-                                tr["tool_use_id"], tr["result"], is_error=tr["is_error"]
-                            )
-                        )
-                        self.tool_calls.append({
-                            "tool": tr["tool"], "args": tr.get("args", {}),
-                            "is_error": tr["is_error"], "timestamp": time.time(),
-                        })
-                    messages.append({"role": "user", "content": user_content})
-
-                    # Token 感知上下文管理
-                    messages = self._manage_context(messages)
-
-                else:
-                    # ── 文本格式回退（local_hf） ──
-                    response_text = response if isinstance(response, str) else str(response)
-
-                    self._notify(
-                        f"  💭 [{self.agent_id}] 思考: {response_text[:200]}", "debug"
-                    )
-
-                    if response_text.strip():
-                        self.last_text_answer = response_text.strip()
-                        self.shared_state["last_text_answer"] = self.last_text_answer
-
-                    tool_calls = self._parse_tool_calls(response_text)
-
-                    _write_agent_jsonl(self._log_dir, self.agent_id, {
-                        "event": "iteration", "iteration": iteration + 1, "native": False,
-                        "text_preview": response_text[:200],
-                        "tool_use_count": len(tool_calls),
-                        "tool_names": [tc.get("tool") for tc in tool_calls],
-                        "timestamp": time.time(),
+                assistant_content = []
+                if native_text:
+                    assistant_content.append({"type": "text", "text": native_text})
+                for tb in tool_use_blocks:
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": tb["id"],
+                        "name": tb["tool"],
+                        "input": tb.get("args", tb.get("input", {})),
                     })
+                messages.append({"role": "assistant", "content": assistant_content})
 
-                    if not tool_calls:
-                        self._notify(f"  ✅ [{self.agent_id}] 得出最终结论", "info")
-                        final_answer = response_text
-                        break
+                tool_results = self._execute_tools_safely(tool_use_blocks)
 
-                    # 文本路径工具执行：转成统一格式，走 _execute_tools_safely
-                    messages.append({"role": "assistant", "content": response_text})
-                    unified_blocks = [
-                        {"id": f"text_{uuid.uuid4().hex[:8]}", "tool": tc["tool"], "args": tc.get("args", {})}
-                        for tc in tool_calls
-                    ]
-                    tr_list = self._execute_tools_safely(unified_blocks)
+                user_content = [{"type": "text", "text": (
+                    f"⚠️ 剩余可执行次数: {remaining}/{max_iterations}。"
+                    f"用完将强制结束。请高效利用剩余机会。" if remaining > 0 else
+                    f"⚠️ 最后机会！本次执行后将被强制结束，必须输出文本答案，不能再调用工具。"
+                )}]
+                for tr in tool_results:
+                    args_str = json.dumps(tr.get("args", {}), ensure_ascii=False)[:100]
+                    self._notify(
+                        f"  🔧 [{self.agent_id}] 调用工具: {tr['tool']}({args_str}...)", "info"
+                    )
+                    result_preview = tr["result"][:150] + "..." if len(tr["result"]) > 150 else tr["result"]
+                    self._notify(
+                        f"  {'⚠' if tr['is_error'] else '✓'} [{self.agent_id}] 工具结果: {result_preview}", "debug"
+                    )
+                    user_content.append(
+                        ToolCall.create_anthropic_tool_result(
+                            tr["tool_use_id"], tr["result"], is_error=tr["is_error"]
+                        )
+                    )
+                    self.tool_calls.append({
+                        "tool": tr["tool"], "args": tr.get("args", {}),
+                        "is_error": tr["is_error"], "timestamp": time.time(),
+                    })
+                messages.append({"role": "user", "content": user_content})
 
-                    tool_results_text = [
-                        f"⚠️ 剩余可执行次数: {remaining}/{max_iterations}。"
-                        f"用完将强制结束。请高效利用剩余机会。" if remaining > 0 else
-                        f"⚠️ 最后机会！必须输出文本答案，不能再调用工具。"
-                    ]
-                    for tr in tr_list:
-                        tool_results_text.append(f"### {tr['tool']}\n{tr['result']}")
-                        self.tool_calls.append({
-                            "tool": tr["tool"], "args": tr.get("args", {}),
-                            "is_error": tr["is_error"], "timestamp": time.time(),
-                        })
-                    messages.append({"role": "user", "content": "\n\n".join(tool_results_text)})
-                    messages = self._manage_context(messages)
+                messages = self._manage_context(messages)
 
             # ══════ 循环结束：构建结果 ══════
             if final_answer is None:
                 self._notify(f"  ⚠️ [{self.agent_id}] 达到最大迭代次数", "warning")
                 final_answer = (
                     self.last_text_answer
-                    or self._scan_messages_for_last_text(messages, use_native)
+                    or self._scan_messages_for_last_text(messages)
                     or ""
                 )
                 if not final_answer:

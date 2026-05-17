@@ -3,6 +3,7 @@
 """
 
 import re
+import sys
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional
 from pathlib import Path
@@ -121,7 +122,7 @@ class TextExtractor(BaseExtractor):
                         text_parts.append(page_text)
                 return "\n\n".join(text_parts)
         except Exception as e:
-            print(f"pdfplumber extraction failed: {e}")
+            print(f"pdfplumber extraction failed: {e}", file=sys.stderr)
             return ""
 
     def _extract_with_pymupdf(self, pdf_path: str) -> str:
@@ -134,7 +135,7 @@ class TextExtractor(BaseExtractor):
             doc.close()
             return "\n\n".join(text_parts)
         except Exception as e:
-            print(f"PyMuPDF extraction failed: {e}")
+            print(f"PyMuPDF extraction failed: {e}", file=sys.stderr)
             return ""
 
     def _extract_with_ocr(self, pdf_path: str) -> str:
@@ -153,7 +154,7 @@ class TextExtractor(BaseExtractor):
             doc.close()
             return "\n\n".join(text_parts)
         except Exception as e:
-            print(f"OCR extraction failed: {e}")
+            print(f"OCR extraction failed: {e}", file=sys.stderr)
             return ""
 
     def extract_sections(self, pdf_path: str, full_text: str) -> Dict[str, PDFSection]:
@@ -250,7 +251,7 @@ class TableExtractor(BaseExtractor):
                                 data=table_data
                             ))
         except Exception as e:
-            print(f"Table extraction failed: {e}")
+            print(f"Table extraction failed: {e}", file=sys.stderr)
 
         return tables
 
@@ -316,7 +317,7 @@ class FigureExtractor(BaseExtractor):
                         image_path=image_path
                     ))
         except Exception as e:
-            print(f"Figure extraction failed: {e}")
+            print(f"Figure extraction failed: {e}", file=sys.stderr)
         finally:
             doc.close()
 

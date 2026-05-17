@@ -3,7 +3,7 @@
 
 提供交互式界面，展示和编辑三层上下文：
 1. System Prompt（系统提示词）
-2. Memory Context（记忆上下文）
+2. Persona (L3)（记忆上下文）
 3. Conversation History（对话历史）
 """
 import json
@@ -108,10 +108,10 @@ class ContextDebugEditor:
             "[1] 编辑"
         )
 
-        # 第二层：Memory Context
-        memory_md = self.memory_manager.get_memory_markdown()
+        # 第二层：Persona (L3)
+        memory_md = (self.memory_manager.get_persona_markdown() or "")
         table.add_row(
-            "2️⃣  Memory Context",
+            "2️⃣  Persona (L3)",
             "1",
             f"{len(memory_md):,}",
             "[2] 编辑"
@@ -175,9 +175,9 @@ class ContextDebugEditor:
     def _edit_memory_context(self):
         """编辑记忆上下文"""
         self.console.clear()
-        self.console.print(Panel("编辑 Memory Context", style="cyan"))
+        self.console.print(Panel("编辑 Persona (L3)", style="cyan"))
 
-        memory_md = self.memory_manager.get_memory_markdown()
+        memory_md = (self.memory_manager.get_persona_markdown() or "")
         preview = memory_md[:500] + "..." if len(memory_md) > 500 else memory_md
 
         self.console.print(Panel(preview, title="当前内容", border_style="dim"))

@@ -116,18 +116,14 @@ class MicroCompactor:
     def _is_tool_result(msg: Dict[str, Any]) -> bool:
         """判断一条消息是否为工具执行结果。
 
-        支持三种格式：
-          1. role == "tool"                     — 文本格式工具结果
-          2. role == "user" + content 列表中有  — Anthropic 原生 tool_result 块
+        支持两种格式：
+          1. role == "user" + content 列表中有  — Anthropic 原生 tool_result 块
              type=="tool_result" 的项
-          3. role == "user" + content 字符串以   — 后台任务完成通知
+          2. role == "user" + content 字符串以   — 后台任务完成通知
              "[task-background" 开头
         """
         role = msg.get("role", "")
         content = msg.get("content")
-
-        if role == "tool":
-            return True
 
         if role == "user":
             if isinstance(content, list):
@@ -160,11 +156,6 @@ class MicroCompactor:
         """
         role = msg.get("role", "")
         content = msg.get("content")
-
-        if role == "tool":
-            name = msg.get("name", "unknown_tool")
-            preview = cls._truncate(str(content))
-            return {"name": name, "preview": preview}
 
         if role == "user":
             if isinstance(content, list):
@@ -229,12 +220,8 @@ class MicroCompactor:
             f"user explicitly requests it. Rely on preserved recent results instead."
         )
 
-        return {
-            "role": "user",
-            "content": content,
-            "id": f"micro_compact_{uuid.uuid4().hex[:8]}",
-            "timestamp": datetime.now().isoformat(),
-        }
+        from Core.Message import CoreMessage, MessageSource
+        return CoreMessage.context_only(MessageSource.MICRO_COMPACT, content).to_dict()
 
     # ── Token 估算 ─────────────────────────────────────
 

@@ -68,13 +68,16 @@ class WorkingMemory:
         if not isinstance(message, dict):
             raise TypeError("WorkingMemory messages must be dict or ToolCall")
 
-        tool_call = ToolCall.from_record(message)
-        if tool_call is not None:
-            record = tool_call.to_record(timestamp=message.get("timestamp"))
-            # 保留原始消息的 id（to_record 不包含 id 字段）
-            if "id" in message:
-                record["id"] = message["id"]
-            return record
+        if message.get("message_type") == "tool_call":
+            tool_call = ToolCall.from_record(message)
+            if tool_call is not None:
+                record = tool_call.to_record(timestamp=message.get("timestamp"))
+                if "id" in message:
+                    record["id"] = message["id"]
+                content = message.get("content")
+                if isinstance(content, list):
+                    record["content"] = self._serialize_value(content)
+                return record
 
         return dict(message)
 
@@ -196,6 +199,17 @@ class WorkingMemory:
         today = date.today().isoformat()
         self.delete_day(today)
 
+    def clear_all(self):
+        """清空当前会话的全部消息（所有日期）。"""
+        if self.sqlite_enabled and self.l0_repo:
+            self.l0_repo.delete_all_for_session(self.session_id)
+        if self.daily_json_enabled:
+            for path in self.list_daily_files():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
     def get_recent_messages(self):
         if self.sqlite_enabled and self.l0_repo:
             cutoff = (date.today() - timedelta(days=self.retention_days - 1)).isoformat()
@@ -217,10 +231,3 @@ class WorkingMemory:
     def get_messages(self):
         return self.get_recent_messages()
 
-    def get_messages_since(self, start_index):
-        messages = self.get_recent_messages()
-        start = max(0, int(start_index or 0))
-        return messages[start:]
-
-    def size(self):
-        return len(self.get_recent_messages())

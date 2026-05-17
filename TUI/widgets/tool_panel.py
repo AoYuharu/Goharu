@@ -10,7 +10,8 @@ from textual.app import ComposeResult
 from textual.containers import Container, Vertical
 from textual.widgets import RichLog, Static
 from rich.text import Text
-from rich.syntax import Syntax
+from rich.panel import Panel
+from rich import box
 from datetime import datetime
 import json
 import queue
@@ -79,14 +80,14 @@ class ToolPanel(Container):
 
     def compose(self) -> ComposeResult:
         """Create child widgets"""
-        yield Static("🔧 Tool Activity", id="tool-header")
+        yield Static("Tool Activity", id="tool-header")
         yield Vertical(
-            Static("▶ Tool Calling", id="calling-header"),
+            Static("> Calling", id="calling-header"),
             RichLog(id="calling-log", wrap=True, highlight=True, markup=True, max_lines=500),
             id="calling-section",
         )
         yield Vertical(
-            Static("✓ Tool Result", id="result-header"),
+            Static("> Results", id="result-header"),
             RichLog(id="result-log", wrap=True, highlight=True, markup=True, max_lines=2000),
             id="result-section",
         )
@@ -231,7 +232,7 @@ class ToolPanel(Container):
         arg_str = self._build_arg_string(arguments)
 
         line = Text()
-        line.append("🔧 ", style="bold yellow")
+        line.append("> ", style="bold yellow")
         line.append(tool_name, style="bold cyan")
 
         if arg_str:
@@ -267,42 +268,117 @@ class ToolPanel(Container):
         result = entry.get("result", "")
         elapsed_str = entry.get("elapsed_str", "")
 
-        # One-line header: ✓ ToolName    MM:SS
+        # One-line header
         header = Text()
-        header.append("✓ ", style="bold green")
+        header.append("[OK] ", style="bold green")
         header.append(tool_name, style="bold cyan")
         if elapsed_str:
             header.append(f"    {elapsed_str}", style="dim")
         self.result_log.write(header)
 
-        # Result content
+        # Format result body with a clean Panel
         if not result:
             self.result_log.write(Text("  (empty result)", style="dim"))
             return
 
+        body = self._format_result_content(result)
+        panel = Panel(body, box=box.ROUNDED, border_style="dim green",
+                      padding=(0, 1))
+        self.result_log.write(panel)
+
+    def _format_result_content(self, result: str):
+        """Format result content — use clean readable text, not raw JSON."""
         try:
-            result_obj = json.loads(result)
-            formatted = json.dumps(result_obj, indent=2, ensure_ascii=False)
+            obj = json.loads(result)
 
-            lines = formatted.split('\n')
-            if len(lines) > 10:
-                display_lines = lines[:8]
-                remaining = len(lines) - 8
-                display_lines.append(f"  ... ({remaining} more lines)")
-                formatted = '\n'.join(display_lines)
-            elif len(formatted) > 500:
-                formatted = formatted[:500] + "\n  ... (truncated)"
+            # ── Unwrap {"content": "..."} ──
+            if isinstance(obj, dict) and list(obj.keys()) == ["content"]:
+                inner = obj["content"]
+                if isinstance(inner, str):
+                    return self._truncate_text(inner, 600)
 
-            syntax = Syntax(formatted, "json", theme="monokai", line_numbers=False)
-            self.result_log.write(syntax)
+            # ── List of dicts → compact table ──
+            if isinstance(obj, list) and obj and all(isinstance(i, dict) for i in obj):
+                return self._build_compact_table(obj)
+
+            # ── Plain dict → key: value lines ──
+            if isinstance(obj, dict):
+                return self._build_dict_lines(obj)
+
+            # ── Other JSON (list, scalar) → pretty text ──
+            formatted = json.dumps(obj, indent=2, ensure_ascii=False)
+            return self._truncate_text(formatted, 600)
+
         except (json.JSONDecodeError, ValueError):
-            if len(result) > 300:
-                result = result[:300] + "..."
-            self.result_log.write(Text(f"  {result}", style="green"))
+            return self._truncate_text(result.strip(), 500)
 
-    def add_thinking(self, step: int, thinking: str):
-        """Add agent thinking/reasoning (unused currently, kept for compatibility)"""
-        pass
+    @staticmethod
+    def _build_dict_lines(obj: dict, indent: int = 0) -> Text:
+        """Render a dict as clean key: value lines."""
+        text = Text()
+        prefix = "  " * indent
+        for i, (k, v) in enumerate(obj.items()):
+            if i > 0:
+                text.append("\n")
+            text.append(f"{prefix}", style="")
+            text.append(f"{k}", style="bold yellow")
+            text.append(": ", style="dim")
+            if isinstance(v, dict):
+                text.append("\n")
+                text.append(ToolPanel._build_dict_lines(v, indent + 1))
+            elif isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                text.append(f"[{len(v)} items]", style="dim")
+            elif isinstance(v, list):
+                items = ", ".join(str(x) for x in v[:6])
+                text.append(items, style="green")
+                if len(v) > 6:
+                    text.append(f" ... +{len(v) - 6}", style="dim")
+            else:
+                s = str(v)
+                if len(s) > 80:
+                    s = s[:80] + "..."
+                text.append(s, style="green")
+        return text
+
+    @staticmethod
+    def _build_compact_table(items: list) -> Text:
+        """Compact table for list-of-dict results."""
+        if not items:
+            return Text("(empty list)", style="dim")
+
+        total = len(items)
+        keys = [k for k in items[0].keys() if not k.startswith("_")][:4]
+
+        text = Text()
+        text.append(f"{total} items", style="bold dim")
+        text.append("\n")
+
+        # Header
+        col_width = 24
+        header_text = "  " + "  ".join(k.ljust(col_width)[:col_width] for k in keys)
+        text.append(header_text, style="bold cyan underline")
+        text.append("\n")
+
+        for item in items[:8]:
+            row = "  " + "  ".join(
+                str(item.get(k, ""))[:col_width].ljust(col_width)[:col_width]
+                for k in keys
+            )
+            text.append(row, style="green")
+            text.append("\n")
+
+        if total > 8:
+            text.append(f"  ... {total - 8} more items", style="dim")
+        return text
+
+    @staticmethod
+    def _truncate_text(s: str, limit: int) -> Text:
+        """Truncate long text with a note."""
+        if len(s) <= limit:
+            return Text(s, style="green")
+        text = Text(s[:limit], style="green")
+        text.append(f"\n  ... ({len(s) - limit} more chars)", style="dim")
+        return text
 
     def clear(self):
         """Clear both sections"""

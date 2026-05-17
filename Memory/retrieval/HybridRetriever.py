@@ -23,12 +23,28 @@ class HybridRetriever:
         self.bm25_enabled = config.get("memory.retrieval.bm25_enabled", True)
         self.final_k = int(config.get("memory.retrieval.final_top_k", 6))
         self.default_query_window = int(config.get("memory.retrieval.query_window_messages", 6))
+        self._scene_file_manager = None
+        self._persona_generator = None
+
+    @property
+    def scene_file_manager(self):
+        if self._scene_file_manager is None:
+            from Memory.scene_blocks.SceneFileManager import SceneFileManager
+            self._scene_file_manager = SceneFileManager()
+        return self._scene_file_manager
+
+    @property
+    def persona_generator(self):
+        if self._persona_generator is None:
+            from Memory.pipeline.PersonaGenerator import PersonaGenerator
+            self._persona_generator = PersonaGenerator()
+        return self._persona_generator
 
     def retrieve(self, query, top_k=None):
         query = str(query or "").strip()
         final_k = int(top_k or self.final_k)
         if not query:
-            return {"profile_summary": self.l3_repo.build_compact_summary(), "memories": [], "scenes": []}
+            return {"profile_summary": self._read_persona_compact_summary(), "memories": [], "scenes": []}
 
         candidate_lists = []
 
@@ -48,10 +64,20 @@ class HybridRetriever:
         memories = [item for item in reranked if item.get("record_type") == "l1"]
         scenes = [item for item in reranked if item.get("record_type") == "l2"]
         return {
-            "profile_summary": self.l3_repo.build_compact_summary(),
+            "profile_summary": self._read_persona_compact_summary(),
             "memories": memories[:final_k],
             "scenes": scenes[:final_k],
         }
+
+    def _read_persona_compact_summary(self):
+        """从 persona.md 读取精简摘要，fallback 到 SQLite L3。"""
+        try:
+            summary = self.persona_generator.get_persona_summary()
+            if summary and summary != "(empty persona)":
+                return summary
+        except Exception:
+            pass
+        return self.l3_repo.build_compact_summary()
 
     def build_query_from_messages(self, messages):
         relevant = list(messages or [])[-self.default_query_window :]
@@ -190,9 +216,15 @@ class HybridRetriever:
                 "score": float(atom.get("salience") or 0.0),
             }
         if normalized == "l2":
+            # 优先从 scene_blocks/*.md 读取完整内容作为 source of truth
             scene = self.l2_repo.get_scene(source_id)
             if scene is None:
                 return None
+            slug = scene.get("slug") or ""
+            hydrated = self._hydrate_l2_from_scene_file(slug)
+            if hydrated is not None:
+                return hydrated
+            # Fallback to SQLite content
             return {
                 "record_type": "l2",
                 "source_id": scene["id"],
@@ -203,6 +235,31 @@ class HybridRetriever:
                 "metadata": scene,
                 "score": float(scene.get("importance") or 0.0),
             }
+
+    def _hydrate_l2_from_scene_file(self, slug):
+        """从 scene_blocks/{slug}.md 读取场景内容。
+
+        Returns:
+            dict or None: hydrated candidate dict, or None if file doesn't exist.
+        """
+        if not slug:
+            return None
+        try:
+            meta, body = self.scene_file_manager.read_scene(slug)
+            if meta is None:
+                return None
+            return {
+                "record_type": "l2",
+                "source_id": slug,  # use slug as source_id
+                "title": meta.get("title") or slug,
+                "text": body or "",
+                "summary": meta.get("summary") or (body or "").split("\n\n")[0][:500],
+                "keywords": meta.get("keywords") or [],
+                "metadata": dict(meta),
+                "score": float(meta.get("importance") or 0.0),
+            }
+        except Exception:
+            return None
         return None
 
     @staticmethod

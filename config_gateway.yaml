@@ -6,17 +6,6 @@ memory:
   daily:
     dir: ./runtime_memory/daily
     retention_days: 7
-  index:
-    path: ./runtime_memory/MEMORY.md
-  user:
-    path: ./runtime_memory/USER.md
-    review_enabled: true
-    review_interval: 10
-  topic:
-    dir: ./runtime_memory/topic
-    merge_every_n_summaries: 3
-    merge_min_count: 4
-
 prompt:
   system:
     shared: []
@@ -24,9 +13,6 @@ prompt:
       - ./prompts/actor/base.md
     summarizer:
       - ./prompts/summarizer/base.md
-    reviewer:
-      - ./prompts/reviewer/base.md
-
 model:
   large-language-model:
     provider: anthropic_compatible
@@ -36,7 +22,6 @@ model:
     max_tokens: 1024
     temperature: 0.7
     top_p: 0.9
-    use_native_tools: false
 
 tools:
   runtime: in_process

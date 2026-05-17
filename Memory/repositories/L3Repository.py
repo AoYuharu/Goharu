@@ -17,7 +17,6 @@ class L3Repository:
         field,
         value,
         profile_type="user",
-        confidence=1.0,
         source_atom_id=None,
         source_scene_id=None,
         status="active",
@@ -39,15 +38,14 @@ class L3Repository:
             """
             INSERT INTO l3_profiles(
                 profile_type, section, field, value,
-                confidence, source_atom_id, source_scene_id, status, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                source_atom_id, source_scene_id, status, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(profile_type),
                 section,
                 field,
                 value,
-                float(confidence or 0.0),
                 source_atom_id,
                 source_scene_id,
                 str(status or "active"),
@@ -65,7 +63,6 @@ class L3Repository:
         section,
         value,
         profile_type="user",
-        confidence=1.0,
         source_atom_id=None,
         source_scene_id=None,
         status="active",
@@ -87,15 +84,14 @@ class L3Repository:
             """
             INSERT INTO l3_profiles(
                 profile_type, section, field, value,
-                confidence, source_atom_id, source_scene_id, status, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                source_atom_id, source_scene_id, status, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(profile_type),
                 str(section),
                 "item",
                 value,
-                float(confidence or 0.0),
                 source_atom_id,
                 source_scene_id,
                 str(status or "active"),

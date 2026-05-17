@@ -4,9 +4,12 @@ LLM响应日志记录器
 按调用分文件记录所有LLM API请求和响应，用于调试和复查。
 """
 import json
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
+
+_logger = logging.getLogger(__name__)
 
 
 class LLMResponseLogger:
@@ -67,7 +70,7 @@ class LLMResponseLogger:
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(request_data, f, ensure_ascii=False, indent=2, default=str)
         except Exception as e:
-            print(f"[LLMResponseLogger] 写入请求日志失败: {e}")
+            _logger.warning("写入请求日志失败: %s", e)
 
         return call_id
 
@@ -102,7 +105,7 @@ class LLMResponseLogger:
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(log_entry, f, ensure_ascii=False, indent=2, default=str)
         except Exception as e:
-            print(f"[LLMResponseLogger] 写入响应日志失败: {e}")
+            _logger.warning("写入响应日志失败: %s", e)
 
     def get_session_dir(self) -> Path:
         """获取当前会话日志目录"""

@@ -3,6 +3,23 @@ memory:
   sqlite:
     enabled: true
     path: ./runtime_memory/memory.db
+  pipeline_manager:
+    enabled: true
+    l1:
+      turn_interval: 5
+      warmup_enabled: true
+      idle_timeout_seconds: 600
+    l2:
+      delay_after_l1_seconds: 90
+      poll_max_seconds: 3600
+    l3:
+      new_atom_threshold: 50
+  scene_blocks:
+    dir: ./runtime_memory/scene_blocks
+  persona:
+    path: ./runtime_memory/persona.md
+  migration:
+    marker_path: ./runtime_memory/.migration_v2_done
   retrieval:
     enabled: true
     fts_top_k: 8
@@ -22,24 +39,12 @@ memory:
     reranker_model_path: ./models/rerank_model/bge-reranker-v2-m3
   pipeline:
     db_enabled: true
-  prompt:
-    use_legacy_memory_markdown: false
   export:
     daily_json_enabled: true
   session_id: default
   daily:
     dir: ./runtime_memory/daily
     retention_days: 7
-  index:
-    path: ./runtime_memory/MEMORY.md
-  user:
-    path: ./runtime_memory/USER.md
-    review_enabled: true
-    review_interval: 10
-  topic:
-    dir: ./runtime_memory/topic
-    merge_every_n_summaries: 3
-    merge_min_count: 4
 prompt:
   system:
     shared: []
@@ -47,8 +52,10 @@ prompt:
     - ./prompts/actor/base.md
     summarizer:
     - ./prompts/summarizer/base.md
-    reviewer:
-    - ./prompts/reviewer/base.md
+    scene_extractor:
+    - ./prompts/scene_extractor/base.md
+    persona_generator:
+    - ./prompts/persona_generator/base.md
 model:
   large-language-model:
     provider: anthropic_compatible
@@ -58,18 +65,7 @@ model:
     max_tokens: 8192
     temperature: 0.7
     top_p: 0.9
-    use_native_tools: true
-    local_hf:
-      name: Qwen2.5-7B-Instruct
-      path: E:\TableHelper\Qwen2.5-7B-Instruct
-      device_map: cuda
-      trust_remote_code: true
-      load_in_4bit: true
-      bnb_4bit_quant_type: nf4
-      bnb_4bit_compute_dtype: float16
-      bnb_4bit_use_double_quant: true
-      max_new_tokens: 1024
-      repetition_penalty: 1.1
+    api_timeout: 120
 tools:
   runtime: in_process
   background_timeout: 120  # seconds before moving to background (0 to disable)

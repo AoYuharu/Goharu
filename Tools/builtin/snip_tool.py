@@ -38,8 +38,6 @@ def _is_tool_call(msg):
 
 def _is_tool_result(msg):
     """检测消息是否为工具执行结果（需配对删除）"""
-    if msg.get("role") == "tool":
-        return True
     if msg.get("role") == "user":
         content = msg.get("content")
         if isinstance(content, list):

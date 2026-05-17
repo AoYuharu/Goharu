@@ -28,17 +28,21 @@ The agent uses a simple ReAct loop: the actor calls tools step by step, then gen
 
 - `Agent/LargeLanguageModel.py` is a thin wrapper over the singleton `Agent/LLMCore.py`.
   - `LargeLanguageModel.query()` delegates to `LLMCore.generate()`.
-  - `LLMCore` supports two providers: `anthropic_compatible` (Anthropic-compatible API) and `local_hf` (local HuggingFace model, optionally 4-bit quantized).
+  - `LLMCore` exclusively supports the `anthropic_compatible` provider (Anthropic-compatible API).
 
 - Prompt locations are split by role.
   - Tool-use prompt: `Agent/ActorAgent.py`
   - Summarization prompt: `Agent/SummarizerAgent.py`
 
-- Memory is coordinated by `Memory/MemoryManager.py`.
-  - Short-term context is persisted by `Memory/WorkingMemory.py` as daily JSON files under `memory.daily.dir`.
-  - Long-term memory is persisted by `Memory/LongTermMemory.py` as `MEMORY.md` plus per-topic markdown files under `memory.topic.dir`.
-  - `MemoryManager.detectOverflow()` checks for expired daily files based on `memory.daily.retention_days`, summarizes one expired day through `SummarizeAgent`, updates long-term memory, and deletes that daily file.
-  - Main answer generation builds prompts through `MemoryManager.get_prompt_context()`, which injects the actor system prompt, then `MEMORY.md`, then recent working-memory messages, and finally any extra system prompt.
+- Memory is coordinated by `Memory/MemoryManager.py` and `Agent/PipelineManager.py`.
+  - Short-term context is persisted by `Memory/WorkingMemory.py` as daily JSON files under `memory.daily.dir`, with dual-write to SQLite (`memory.db`).
+  - Long-term memory uses the L0→L1→L2→L3 pyramid pipeline managed by `PipelineManager`:
+    - L0: Raw messages in SQLite (`L0Repository`)
+    - L1: Memory atoms extracted per-turn (`SummarizeAgent`, stored in SQLite + embedding)
+    - L2: Scene context aggregated from L1 atoms → `scene_blocks/*.md` (`SceneExtractor`)
+    - L3: Persona profile generated from L2 scenes → `persona.md` (`PersonaGenerator`)
+  - PipelineManager triggers: L1 on turn interval (configurable via `pipeline_manager.l1.turn_interval`), L2 with delay after L1, L3 when new atom threshold reached.
+  - Main answer generation builds prompts through `PromptAssembler`, injecting: actor system prompt → SOUL.md → L3 persona → L1 retrieved memories → L2 retrieved scenes → conversation history.
 
 - All tools run in-process through `Tools.runtime.InProcessToolRuntime`.
   - `Tools/builtin/` contains all built-in tools loaded via `config.yaml` → `tools.builtin_modules`.
@@ -109,35 +113,3 @@ The agent uses a simple ReAct loop: the actor calls tools step by step, then gen
 - 创建独立的测试文件（如 `test_xxx.py`）测试核心函数
 - 或说明代码已完成，建议用户手动测试
 - 示例：对于包含 `input()` 的计算器，创建测试文件测试 `add()`, `subtract()` 等核心函数，而不测试交互式的 `calculator()` 函数
-
-## Gateway 管理
-
-Gateway 是连接 QQ 机器人的网关服务，支持 QQ 私聊和群聊消息处理。
-
-**重启 Gateway**：
-```bash
-./restart_gateway.sh
-```
-
-该脚本执行以下操作：
-1. 杀死旧 Gateway 进程
-2. 记录重启日志
-3. 启动新的 Gateway 进程
-4. 检查启动状态
-
-**手动重启 Gateway**：
-```bash
-cd /root/TableHelper
-pkill -f "Gateway/run_gateway" 2>/dev/null
-sleep 2
-source venv/bin/activate
-export CONFIG_FILE=config_gateway.yaml
-export ANTHROPIC_API_KEY=你的API_KEY
-nohup python3 -u Gateway/run_gateway.py >> logs/gateway.log 2>&1 &
-sleep 8 && tail -20 logs/gateway.log
-```
-
-**查看 Gateway 日志**：
-```bash
-tail -100 logs/gateway.log
-```

@@ -12,7 +12,6 @@ from textual.screen import ModalScreen
 from textual.message import Message
 from textual.binding import Binding
 from rich.text import Text
-from rich.table import Table
 from rich.panel import Panel
 from pathlib import Path
 from datetime import datetime
@@ -25,12 +24,6 @@ PROMPT_CATALOG = [
         "name": "Actor Agent",
         "file": "prompts/actor/base.md",
         "description": "主智能体提示词 — 工具调用、答案生成、子智能体调度",
-        "group": "🧠 Core Agents"
-    },
-    {
-        "name": "Review Agent",
-        "file": "prompts/reviewer/base.md",
-        "description": "用户画像复盘模块 — 提取用户画像增量写入 USER.md",
         "group": "🧠 Core Agents"
     },
     {

@@ -81,55 +81,15 @@ CONFIG_CATALOG = [
         "tips": "较短的保留期可以减少内存占用，但可能丢失近期上下文",
         "group": "💾 内存管理"
     },
-    {
-        "key": "memory.user.review_enabled",
-        "name": "用户画像审核",
-        "type": "bool",
-        "description": "是否启用用户画像审核功能",
-        "default": True,
-        "tips": "启用后会定期审核和更新用户画像，提供更个性化的服务",
-        "group": "💾 内存管理"
-    },
-    {
-        "key": "memory.user.review_interval",
-        "name": "用户画像审核间隔",
-        "type": "int",
-        "description": "用户画像审核间隔（对话轮数）",
-        "default": 10,
-        "range": (1, 100),
-        "tips": "每隔 N 轮对话会触发一次用户画像更新",
-        "group": "💾 内存管理"
-    },
-    {
-        "key": "memory.topic.merge_every_n_summaries",
-        "name": "主题合并间隔",
-        "type": "int",
-        "description": "每 N 个摘要合并一次主题记忆",
-        "default": 3,
-        "range": (1, 20),
-        "tips": "定期合并可以保持主题记忆的简洁性",
-        "group": "💾 内存管理"
-    },
-    {
-        "key": "memory.topic.merge_min_count",
-        "name": "主题合并最小数量",
-        "type": "int",
-        "description": "触发合并的最小摘要数量",
-        "default": 4,
-        "range": (2, 50),
-        "tips": "摘要数量达到此阈值时才会触发合并",
-        "group": "💾 内存管理"
-    },
-
     # 模型配置
     {
         "key": "model.large-language-model.provider",
         "name": "LLM 提供商",
         "type": "choice",
-        "description": "LLM 提供商：anthropic_compatible(Anthropic 兼容 API) 或 local_hf(本地 HuggingFace 模型)",
+        "description": "LLM 提供商：仅支持 anthropic_compatible(Anthropic 兼容 API)",
         "default": "anthropic_compatible",
-        "choices": ["anthropic_compatible", "local_hf"],
-        "tips": "选择与你运行环境匹配的提供商。anthropic_compatible 需要 API key，local_hf 需要本地模型路径",
+        "choices": ["anthropic_compatible"],
+        "tips": "当前仅支持 anthropic_compatible 提供商。需配置 api_key_env 和 base_url",
         "group": "🧠 模型配置"
     },
     {
@@ -171,16 +131,6 @@ CONFIG_CATALOG = [
         "tips": "与 temperature 配合使用，控制生成质量",
         "group": "🧠 模型配置"
     },
-    {
-        "key": "model.large-language-model.use_native_tools",
-        "name": "原生工具调用",
-        "type": "bool",
-        "description": "是否使用原生工具调用（Anthropic Tool Use）",
-        "default": True,
-        "tips": "启用后可以使用更高效的工具调用方式",
-        "group": "🧠 模型配置"
-    },
-
     # 工具安全
     {
         "key": "tools.security.enabled",

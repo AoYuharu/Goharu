@@ -1,6 +1,5 @@
 import json
 
-from Core.ToolCall import ToolCall
 from Core.PromptDocument import PromptDocument
 
 
@@ -16,6 +15,22 @@ class PromptRenderer:
         except TypeError:
             return str(content)
 
+    @staticmethod
+    def _normalize_native_blocks(content):
+        if not isinstance(content, list):
+            return None
+        normalized = []
+        for block in content:
+            if isinstance(block, dict):
+                normalized.append(dict(block))
+            elif isinstance(block, str) and block.strip():
+                normalized.append({"type": "text", "text": block})
+            elif hasattr(block, "model_dump"):
+                normalized.append(block.model_dump())
+            else:
+                raise ValueError(f"Unsupported native content block: {block!r}")
+        return normalized
+
     def render_document(self, document: PromptDocument):
         return self.render_sections(document.all_sections())
 
@@ -29,21 +44,18 @@ class PromptRenderer:
 
     def render_section(self, section):
         raw_content = section.content
-        # 保留原生 Anthropic 列表块（避免 JSON 序列化后流失 tool_use_id）
         if isinstance(raw_content, list):
-            content = raw_content
+            content = self._normalize_native_blocks(raw_content)
         else:
             content = self._stringify_content(raw_content).strip()
         if not content and section.kind != "tool_result":
             return None
 
-        # 注入消息 ID 前缀（仅 LLM 可见，TUI 不经过此路径）
         msg_id = section.metadata.get("id")
         if msg_id:
             if isinstance(content, str):
                 content = f"[ID:{msg_id}] {content}"
             elif isinstance(content, list):
-                # Anthropic 原生内容块列表：在最前面插入 text block
                 content = [{"type": "text", "text": f"[ID:{msg_id}] "}] + list(content)
 
         if section.kind in {"system", "user", "assistant"}:
@@ -51,34 +63,36 @@ class PromptRenderer:
                 "role": section.kind,
                 "content": content,
             }
-            # 传递 cache_control（用于 Anthropic Prompt Caching）
             if section.cache_control:
                 message["cache_control"] = section.cache_control
             return message
 
         if section.kind == "tool_call":
-            tool_name = section.metadata.get("tool_name")
-            arguments = section.metadata.get("arguments")
-            if isinstance(tool_name, str) and isinstance(arguments, dict):
-                return ToolCall(tool_name=tool_name, arguments=arguments).to_prompt_message()
-
-            tool_call = ToolCall.try_from_text(content)
-            if tool_call is not None:
-                return tool_call.to_prompt_message()
-
+            if not isinstance(content, list):
+                raise ValueError("tool_call sections must use native content blocks")
             return {
                 "role": "assistant",
                 "content": content,
             }
 
         if section.kind == "tool_result":
-            tool_name = section.metadata.get("tool_name") or section.metadata.get("name")
-            message = {
-                "role": "tool",
-                "content": content,
+            if isinstance(content, list):
+                blocks = content
+            else:
+                blocks = []
+                tool_use_id = section.metadata.get("tool_use_id")
+                if tool_use_id:
+                    blocks.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": content,
+                        "is_error": bool(section.metadata.get("is_error", False)),
+                    })
+                elif content:
+                    blocks.append({"type": "text", "text": content})
+            return {
+                "role": "user",
+                "content": blocks,
             }
-            if tool_name:
-                message["name"] = str(tool_name)
-            return message
 
         raise ValueError(f"Unsupported prompt section kind: {section.kind}")

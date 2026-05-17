@@ -4,11 +4,14 @@
 参考 hermes-agent 的 BasePlatformAdapter 设计
 """
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Optional, List, Callable, Awaitable, Dict, Any
+
+_logger = logging.getLogger(__name__)
 
 
 class Platform(Enum):
@@ -233,25 +236,22 @@ class BasePlatformAdapter(ABC):
         Args:
             event: 消息事件
         """
-        print(f"[BasePlatformAdapter] Handling message from {event.source.user_id}")
+        _logger.info("Handling message from %s", event.source.user_id)
         if self._message_handler:
             try:
-                print(f"[BasePlatformAdapter] Calling message handler...")
+                _logger.debug("Calling message handler...")
                 response = await self._message_handler(event)
-                print(f"[BasePlatformAdapter] Handler returned: {response[:100] if response else 'None'}...")
+                _logger.debug("Handler returned: %s", str(response)[:100] if response else "None")
                 if response:
-                    # 发送响应
-                    print(f"[BasePlatformAdapter] Sending response to {event.source.chat_id}")
+                    _logger.info("Sending response to %s", event.source.chat_id)
                     await self.send(event.source.chat_id, response)
-                    print(f"[BasePlatformAdapter] Response sent")
+                    _logger.debug("Response sent")
                 else:
-                    print(f"[BasePlatformAdapter] No response to send")
+                    _logger.debug("No response to send")
             except Exception as e:
-                print(f"[BasePlatformAdapter] Error handling message: {e}")
-                import traceback
-                traceback.print_exc()
+                _logger.error("Error handling message: %s", e, exc_info=True)
         else:
-            print(f"[BasePlatformAdapter] No message handler set!")
+            _logger.warning("No message handler set!")
 
     # ==================== 连接状态管理 ====================
 

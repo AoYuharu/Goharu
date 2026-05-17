@@ -203,27 +203,25 @@ registry.register(
 
 
 def background_status() -> str:
-    """Query the status of all background tasks currently pending completion.
+    """Query the status of all background tasks (both running and completed).
 
-    Returns a JSON summary including pending result count, task IDs, and
-    reactivation count. The agent can use this to check whether previously
-    dispatched background work has finished, and then drain/inject the results.
+    Returns a human-readable report showing:
+    - Running tasks: tool name, input parameters, task ID, start time
+    - Pending tasks: completed tasks awaiting result injection
+    - Reactivation count
     """
     from Agent.BackgroundTaskManager import BackgroundTaskManager
-    summary = BackgroundTaskManager().get_status_summary()
-    return json.dumps(summary, ensure_ascii=False)
+    return BackgroundTaskManager().get_detailed_status()
 
 
 registry.register(
     name="background_status",
     description=(
-        "Query the status of all pending background tasks. "
-        "Returns JSON with: pending_results (count of completed but not yet "
-        "injected background tasks), task_ids (their IDs), and reactivation_count "
-        "(how many times background results have been injected into context). "
-        "Use this to check whether a previously dispatched background task "
-        "(e.g. long run_cmd, subagent) has finished. The results will be "
-        "automatically injected into your context at the next step boundary."
+        "Query the status of all background tasks — both actively running and "
+        "completed-but-pending-injection. Returns a human-readable report with "
+        "tool name, arguments, task ID, and start/elapsed time for each task. "
+        "Use this to check what background work is in progress or awaiting "
+        "result injection at the next step boundary."
     ),
     arguments_schema={
         "type": "object",

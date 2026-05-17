@@ -21,7 +21,6 @@ class L1Repository:
         slot="",
         source_turn_id=None,
         source_message_id=None,
-        confidence=1.0,
         salience=0.5,
         status="active",
         scene_id=None,
@@ -33,7 +32,7 @@ class L1Repository:
                 """
                 UPDATE l1_memory_atoms
                 SET atom_type = ?, subject = ?, slot = ?, canonical_text = ?,
-                    source_turn_id = ?, source_message_id = ?, confidence = ?, salience = ?,
+                    source_turn_id = ?, source_message_id = ?, salience = ?,
                     status = ?, scene_id = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -44,7 +43,6 @@ class L1Repository:
                     str(canonical_text or ""),
                     source_turn_id,
                     source_message_id,
-                    float(confidence or 0.0),
                     float(salience or 0.0),
                     str(status or "active"),
                     scene_id,
@@ -59,9 +57,9 @@ class L1Repository:
                 INSERT INTO l1_memory_atoms(
                     atom_type, subject, slot, canonical_text,
                     source_turn_id, source_message_id,
-                    confidence, salience, status, scene_id, created_at, updated_at
+                    salience, status, scene_id, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(atom_type),
@@ -70,7 +68,6 @@ class L1Repository:
                     str(canonical_text or ""),
                     source_turn_id,
                     source_message_id,
-                    float(confidence or 0.0),
                     float(salience or 0.0),
                     str(status or "active"),
                     scene_id,

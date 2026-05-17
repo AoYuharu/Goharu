@@ -35,7 +35,7 @@ class StatusBar(Horizontal):
 
     def compose(self) -> ComposeResult:
         """Create child widgets"""
-        yield Static("⏳ Starting...", id="status-text")
+        yield Static("Starting...", id="status-text")
         yield Static("", id="stats-text")
 
     def on_mount(self):
@@ -51,13 +51,13 @@ class StatusBar(Horizontal):
             message: Status message
             status_type: One of "success", "error", "warning", "thinking", "working", "info"
         """
-        icons = {
-            "success": "✓",
-            "error": "✗",
-            "warning": "⚠",
-            "thinking": "💭",
-            "working": "⚙",
-            "info": "ℹ"
+        labels = {
+            "success": "[OK]",
+            "error": "[ERR]",
+            "warning": "[WARN]",
+            "thinking": "...",
+            "working": "[BUSY]",
+            "info": "[*]"
         }
 
         styles = {
@@ -69,11 +69,11 @@ class StatusBar(Horizontal):
             "info": "bold blue"
         }
 
-        icon = icons.get(status_type, "ℹ")
+        prefix = labels.get(status_type, "[*]")
         style = styles.get(status_type, "bold")
 
         text = Text()
-        text.append(f"{icon} ", style=style)
+        text.append(f"{prefix} ", style=style)
         text.append(message, style=style)
 
         self.status_text.update(text)

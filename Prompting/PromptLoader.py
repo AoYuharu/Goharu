@@ -28,12 +28,12 @@ class PromptLoader:
     def load_system_sections(self, key):
         paths = self._coerce_paths(self.config.get(f"prompt.system.{key}", []))
         sections = []
-        for path_text in paths:
+        for i, path_text in enumerate(paths):
             path = self._resolve_path(path_text)
             content = path.read_text(encoding="utf-8").strip()
             if not content:
                 continue
-            sections.append(PromptSection(
+            kwargs = dict(
                 kind="system",
                 title=path.stem,
                 content=content,
@@ -41,5 +41,8 @@ class PromptLoader:
                     "source_path": str(path),
                     "config_key": f"prompt.system.{key}",
                 },
-            ))
+            )
+            if i == len(paths) - 1:
+                kwargs["cache_control"] = {"type": "ephemeral"}
+            sections.append(PromptSection(**kwargs))
         return sections

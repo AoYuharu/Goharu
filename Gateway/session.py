@@ -5,6 +5,7 @@
 """
 
 import json
+import logging
 import os
 import uuid
 from dataclasses import dataclass, asdict
@@ -12,6 +13,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Optional, Dict, List
+
+_logger = logging.getLogger(__name__)
 
 from .platforms.base import SessionSource, Platform
 
@@ -250,7 +253,7 @@ class SessionStore:
                 self._entries[key] = entry
 
         except Exception as e:
-            print(f"Error loading sessions: {e}")
+            _logger.error("Error loading sessions: %s", e)
 
     def _save(self) -> None:
         """保存到文件（需要持有锁）"""
@@ -287,7 +290,7 @@ class SessionStore:
                 json.dump(data, f, ensure_ascii=False, indent=2)
 
         except Exception as e:
-            print(f"Error saving sessions: {e}")
+            _logger.error("Error saving sessions: %s", e)
 
     def _is_session_expired(self, entry: SessionEntry) -> bool:
         """

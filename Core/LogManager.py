@@ -2,8 +2,8 @@
 LogManager — 集中式日志管理。
 
 按模块分文件夹输出日志：
-  logs/agent/    — ActorAgent, SummarizerAgent, ReviewerAgent, MemoryOrchestrator
-  logs/memory/   — MemoryManager, WorkingMemory, LongTermMemory
+  logs/agent/    — ActorAgent, SummarizerAgent
+  logs/memory/   — MemoryManager, WorkingMemory
   logs/api/      — LLMCore, API 请求/响应
   logs/tools/    — ToolRuntime, ToolCall, 安全层
   logs/gateway/  — GatewaySession, JSON-RPC, 后台任务
@@ -35,8 +35,6 @@ class LogManager:
         # Agent
         "Agent.ActorAgent": "agent",
         "Agent.SummarizerAgent": "agent",
-        "Agent.ReviewAgent": "agent",
-        "Agent.MemoryOrchestrator": "agent",
         "Agent.BackgroundTaskManager": "agent",
         "Agent.LargeLanguageModel": "agent",
         "Agent.LLMCore": "api",  # LLMCore 主要做 API 调用
@@ -47,13 +45,10 @@ class LogManager:
         # Memory
         "Memory.MemoryManager": "memory",
         "Memory.WorkingMemory": "memory",
-        "Memory.LongTermMemory": "memory",
-        "Memory.UserProfileMemory": "memory",
         "Memory.MemoryDB": "memory",
         "Memory.pipeline": "memory",
         "Memory.repositories": "memory",
         "Memory.retrieval": "memory",
-        "Memory.projection": "memory",
         # Tools
         "Tools.runtime": "tools",
         "Tools.builtin": "tools",

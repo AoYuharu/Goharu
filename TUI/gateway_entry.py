@@ -32,8 +32,8 @@ _stdout_lock = threading.Lock()
 
 from Agent.ActorAgent import ActorAgent
 from Agent.BackgroundTaskManager import BackgroundTaskManager
-from Agent.MemoryOrchestrator import MemoryOrchestrator
 from Agent.MicroCompactor import MicroCompactor
+from Core.Message import CoreMessage, MessageSource
 from Memory.MemoryManager import MemoryManager
 from Tools.runtime import create_tool_runtime
 from Tools.tool_process_tracker import tool_process_tracker
@@ -93,16 +93,17 @@ class GatewaySession:
 
     def __init__(self):
         self.memory_manager: Optional[MemoryManager] = None
-        self.memory_orchestrator: Optional[MemoryOrchestrator] = None
         self.actor: Optional[ActorAgent] = None
         self.runtime = None
         self.session_store: Optional[SessionStore] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._initialized = False
         self._prompt_loader = None  # Lazily initialized
-        # Message batching support
-        self.pending_messages: list = []  # Pending user messages
-        self.pending_requests: list = []  # Corresponding request IDs
+        # Unified queue: messages + commands processed in FIFO order
+        # Each item is a dict with "type" key: "message" or "command"
+        #   message: {"type": "message", "data": str, "req_id": str}
+        #   command: {"type": "command", "name": str, "params": dict, "req_id": str}
+        self.pending_items: list = []
         self._processing = False  # Whether currently processing
         self._batch_lock = threading.Lock()
         # Interrupt support
@@ -111,27 +112,60 @@ class GatewaySession:
         self._micro_compacted = False
         # Background task reactivation dedup flag
         self._bg_reactivation_queued: bool = False
+        # PipelineManager: TencentDB-aligned memory pipeline
+        self.pipeline_manager = None
 
     def queue_message(self, message: str, req_id):
         """Queue a user message for batching"""
         with self._batch_lock:
-            self.pending_messages.append(message)
-            self.pending_requests.append(req_id)
-            logger.info(f"Queued message (total pending: {len(self.pending_messages)})")
+            self.pending_items.append({"type": "message", "data": message, "req_id": req_id})
+            logger.info(f"Queued message (total pending: {len(self.pending_items)})")
+
+    def queue_command(self, command_name: str, params: dict, req_id):
+        """Queue a command to be executed between message batches"""
+        with self._batch_lock:
+            self.pending_items.append(
+                {"type": "command", "name": command_name, "params": params, "req_id": req_id}
+            )
+            logger.info(
+                "Queued command '%s' (total pending: %d)",
+                command_name, len(self.pending_items),
+            )
 
     def get_pending_messages(self):
-        """Get and clear all pending messages"""
+        """Get and clear only pending messages, leaving commands in queue.
+
+        Used by mid-step message merge inside process_message().
+        Commands must NOT be executed mid-step — they wait for the
+        next iteration of the outer processing loop.
+        """
         with self._batch_lock:
-            msgs = list(self.pending_messages)
-            reqs = list(self.pending_requests)
-            self.pending_messages.clear()
-            self.pending_requests.clear()
+            msgs = []
+            reqs = []
+            remaining = []
+            for item in self.pending_items:
+                if item["type"] == "message":
+                    msgs.append(item["data"])
+                    reqs.append(item["req_id"])
+                else:
+                    remaining.append(item)
+            self.pending_items = remaining
             return msgs, reqs
 
-    def has_pending(self) -> bool:
-        """Check if there are pending messages"""
+    def drain_pending_items(self):
+        """Get and clear ALL pending items (messages and commands).
+
+        Used by the main processing loop to get everything queued so far.
+        """
         with self._batch_lock:
-            return len(self.pending_messages) > 0
+            items = list(self.pending_items)
+            self.pending_items.clear()
+            return items
+
+    def has_pending(self) -> bool:
+        """Check if there are pending items (messages or commands)"""
+        with self._batch_lock:
+            return len(self.pending_items) > 0
 
     def _drain_background_results(self):
         """Thread-safe: drain background results → inject into memory → emit event.
@@ -159,15 +193,6 @@ class GatewaySession:
         )
         return bg_results
 
-    def _run_post_turn_review(self, turn_context):
-        """Fire-and-forget: run post-turn user profile review in background thread."""
-        try:
-            events = self.memory_orchestrator.post_turn_review(turn_context)
-            for evt in events:
-                logger.info(f"[MemoryOrch] {evt}")
-        except Exception as e:
-            logger.warning(f"post_turn_review failed: {e}")
-
     async def initialize(self):
         """Initialize all components"""
         if self._initialized:
@@ -187,9 +212,19 @@ class GatewaySession:
             self.memory_manager = MemoryManager()
             logger.info("MemoryManager initialized")
 
-            # Initialize memory orchestrator (overflow detection, daily summarization, etc.)
-            self.memory_orchestrator = MemoryOrchestrator(self.memory_manager)
-            logger.info("MemoryOrchestrator initialized")
+            # Initialize PipelineManager (TencentDB-aligned L1/L2/L3 pipeline)
+            from Agent.PipelineManager import PipelineManager
+            self.pipeline_manager = PipelineManager(memory_manager=self.memory_manager)
+            logger.info("PipelineManager initialized")
+
+            # 一次性迁移：SQLite L2 → scene_blocks/*.md, USER.md → persona.md
+            try:
+                migrated_l2 = self.pipeline_manager.migrate_legacy_l2_to_scene_blocks()
+                if migrated_l2 > 0:
+                    logger.info("Migration: %d L2 scenes migrated to scene_blocks", migrated_l2)
+                self.pipeline_manager.migrate_legacy_l3_to_persona()
+            except Exception as e:
+                logger.warning("Migration failed (non-critical): %s", e)
 
             # Initialize tool runtime
             self.runtime = create_tool_runtime(config.get("tools.runtime", "in_process"))
@@ -239,9 +274,15 @@ class GatewaySession:
                     f"[System: background results arrived after previous answer] "
                     f"Background task(s) completed. Please review and respond if needed."
                 )
+                self.memory_manager.append(CoreMessage.context_only(
+                    MessageSource.REACTIVATION, synthetic_msg,
+                ).to_dict())
                 with self._batch_lock:
-                    self.pending_messages.append(synthetic_msg)
-                    self.pending_requests.append("bg_reactivation")
+                    self.pending_items.append({
+                        "type": "message",
+                        "data": synthetic_msg,
+                        "req_id": "bg_reactivation",
+                    })
                 _start_processing("default")
 
             BackgroundTaskManager().register_callback(_on_bg_complete)
@@ -277,14 +318,19 @@ class GatewaySession:
             session_id, len(message),
         )
 
-        # Periodic memory maintenance: check for expired daily files to summarize
-        if self.memory_orchestrator:
+        # PipelineManager: notify activity & check triggers
+        if self.pipeline_manager:
             try:
-                events = self.memory_orchestrator.detectOverflow()
-                for evt in events:
-                    logger.info(f"[MemoryOrch] {evt}")
+                self.pipeline_manager.notify_activity()
             except Exception as e:
-                logger.warning(f"detectOverflow failed: {e}")
+                logger.warning(f"PipelineManager.notify_activity failed: {e}")
+
+        # Periodic memory maintenance: trigger pipeline turn start (L1 check)
+        if self.pipeline_manager:
+            try:
+                self.pipeline_manager.on_turn_start()
+            except Exception as e:
+                logger.warning(f"PipelineManager.on_turn_start failed: {e}")
 
         try:
             # 清除上一次可能残留的中断标记
@@ -359,10 +405,10 @@ class GatewaySession:
                 if self._interrupt_event.is_set():
                     self._interrupt_event.clear()
                     tool_process_tracker.kill_all()
-                    self.memory_manager.append({
-                        "role": "user",
-                        "content": "Request interrupted by user"
-                    })
+                    self.memory_manager.append(CoreMessage.context_only(
+                        MessageSource.INTERRUPT,
+                        "Request interrupted by user",
+                    ).to_dict())
                     write_json({
                         "jsonrpc": "2.0",
                         "method": "event",
@@ -381,7 +427,9 @@ class GatewaySession:
                 if pending_msgs:
                     pending_text = "\n".join(pending_msgs)
                     # Add to memory so actor sees them
-                    self.memory_manager.append({"role": "user", "content": f"[新消息] {pending_text}"})
+                    # bg_reactivation already injected directly as context_only above
+                    if "bg_reactivation" not in pending_reqs:
+                        self.memory_manager.append({"role": "user", "content": f"[新消息] {pending_text}"})
                     # Merge into the combined answer
                     combined += f"\n{pending_text}"
                     write_json({
@@ -546,15 +594,14 @@ class GatewaySession:
                         }
                     })
 
-                    # Fire post-turn user profile review in background (non-blocking)
-                    if self.memory_orchestrator:
+                    # PipelineManager: on_turn_end (L3 check)
+                    if self.pipeline_manager:
                         ctx = self.memory_manager.get_context()
                         turn_slice = ctx[-24:] if len(ctx) > 24 else ctx
-                        threading.Thread(
-                            target=self._run_post_turn_review,
-                            args=(turn_slice,),
-                            daemon=True
-                        ).start()
+                        try:
+                            self.pipeline_manager.on_turn_end(turn_slice)
+                        except Exception as e:
+                            logger.warning(f"PipelineManager.on_turn_end failed: {e}")
 
                     return answer
 
@@ -589,10 +636,10 @@ class GatewaySession:
                     # User pressed ESC during tool execution — actor skipped tools
                     self._interrupt_event.clear()
                     tool_process_tracker.kill_all()
-                    self.memory_manager.append({
-                        "role": "user",
-                        "content": "Request interrupted by user"
-                    })
+                    self.memory_manager.append(CoreMessage.context_only(
+                        MessageSource.INTERRUPT,
+                        "Request interrupted by user",
+                    ).to_dict())
                     write_json({
                         "jsonrpc": "2.0",
                         "method": "event",
@@ -641,6 +688,8 @@ class GatewaySession:
         """Clear a session's memory"""
         if self.memory_manager:
             self.memory_manager.clear_context()
+        if self.pipeline_manager:
+            self.pipeline_manager.reset_warmup()
 
     async def compact_session(self, session_id: str):
         """Summarize current conversation via LLM and replace with summary"""
@@ -770,15 +819,7 @@ class GatewaySession:
                 "cached_tokens": min(cached_tokens, current_tokens),
             }
 
-        prepared_messages = core._prepare_local_messages(messages) if core is not None else messages
-        parts = []
-        for message in prepared_messages or []:
-            role = message.get("role", "user") if isinstance(message, dict) else "user"
-            content = self._stringify_token_content(message.get("content", "") if isinstance(message, dict) else message).strip()
-            if content:
-                parts.append(f"{role}: {content}")
-
-        current_tokens = self._estimate_tokens("\n".join(parts)) if parts else 0
+        current_tokens = self._estimate_tokens(json.dumps(messages, ensure_ascii=False, default=str))
         return {"current_tokens": current_tokens, "cached_tokens": 0}
 
     def calculate_token_stats(self, extra_system_prompt=None):
@@ -801,6 +842,8 @@ class GatewaySession:
 
     async def shutdown(self):
         """Shutdown the gateway"""
+        if self.pipeline_manager:
+            self.pipeline_manager.shutdown()
         if self.runtime:
             await self.runtime.close()
 
@@ -837,6 +880,10 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             message = params.get("message", "")
             session_id = params.get("session_id", "default")
 
+            import sys as _sys2
+            _sys2.stderr.write(f"[TRACE] dispatch: agent.send_message msg_len={len(message)} session={session_id}\n")
+            _sys2.stderr.flush()
+
             # Always queue the message and return immediately (non-blocking)
             _session.queue_message(message, req_id)
 
@@ -852,76 +899,32 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         elif method == "agent.clear_session":
             session_id = params.get("session_id", "default")
 
-            # 等待后台消息处理完成（避免竞态条件）
-            # 如果后台正在处理消息，等待其完成
-            acquired = _processing_lock.acquire(blocking=True, timeout=5.0)
-            if not acquired:
-                return {
-                    "jsonrpc": "2.0",
-                    "error": {"code": -32603, "message": "无法获取处理锁，请稍后重试"},
-                    "id": req_id
-                }
+            # Queue command for execution in the processing loop.
+            # No lock contention — commands are processed sequentially
+            # between message batches by _process_queued_messages().
+            _session.queue_command("clear_session", {"session_id": session_id}, req_id)
+            _start_processing(session_id)
 
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(_session.clear_session(session_id))
-                    # Emit updated token stats after clear
-                    token_stats = _session.calculate_token_stats()
-                    write_json({
-                        "jsonrpc": "2.0",
-                        "method": "event",
-                        "params": {
-                            "type": "token.stats",
-                            "payload": token_stats
-                        }
-                    })
-                    return {
-                        "jsonrpc": "2.0",
-                        "result": {"success": True},
-                        "id": req_id
-                    }
-                finally:
-                    loop.close()
-            finally:
-                _processing_lock.release()
+            return {
+                "jsonrpc": "2.0",
+                "result": {"queued": True, "command": "clear_session"},
+                "id": req_id,
+            }
 
         elif method == "agent.compact":
             session_id = params.get("session_id", "default")
 
-            acquired = _processing_lock.acquire(blocking=True, timeout=5.0)
-            if not acquired:
-                return {
-                    "jsonrpc": "2.0",
-                    "error": {"code": -32603, "message": "无法获取处理锁，请稍后重试"},
-                    "id": req_id
-                }
+            # Queue command for execution in the processing loop.
+            # No lock contention — commands are processed sequentially
+            # between message batches by _process_queued_messages().
+            _session.queue_command("compact", {"session_id": session_id}, req_id)
+            _start_processing(session_id)
 
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(_session.compact_session(session_id))
-                    # Emit updated token stats after compact
-                    token_stats = _session.calculate_token_stats()
-                    write_json({
-                        "jsonrpc": "2.0",
-                        "method": "event",
-                        "params": {
-                            "type": "token.stats",
-                            "payload": token_stats
-                        }
-                    })
-                    return {
-                        "jsonrpc": "2.0",
-                        "result": {"success": True},
-                        "id": req_id
-                    }
-                finally:
-                    loop.close()
-            finally:
-                _processing_lock.release()
+            return {
+                "jsonrpc": "2.0",
+                "result": {"queued": True, "command": "compact"},
+                "id": req_id,
+            }
 
         elif method == "agent.get_history":
             """获取聊天历史记录"""
@@ -930,6 +933,9 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             serialized = []
             for msg in history:
                 if isinstance(msg, dict):
+                    # Skip context-only messages (internal system messages)
+                    if CoreMessage.is_context_only(msg):
+                        continue
                     role = msg.get("role", "unknown")
                     content = msg.get("content", "")
                     msg_type = "text"  # 标记消息类型，TUI 据此渲染
@@ -955,7 +961,7 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                                     f"{k}={str(v)[:80]}"
                                     for k, v in (tool_input.items() if isinstance(tool_input, dict) else {})
                                 )
-                                parts.append(f"🔧 调用工具: {tool_name}({args_brief})")
+                                parts.append(f"> tool: {tool_name}({args_brief})")
                                 has_tool_use = True
                             elif block_type == "tool_result":
                                 result_content = item.get("content", "")
@@ -975,6 +981,7 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                         "role": role,
                         "content": str(content)[:1000],
                         "type": msg_type,
+                        "timestamp": msg.get("timestamp", ""),
                     })
             return {
                 "jsonrpc": "2.0",
@@ -1093,64 +1100,138 @@ def _stdin_reader():
 
 def _process_queued_messages(session_id: str):
     """
-    Background processing: collects all pending messages, processes them,
-    and before each actor step checks for newly queued messages.
+    Background processing: drains the unified queue and processes items
+    in FIFO order.  Consecutive messages are batched; commands are executed
+    between message batches.
+
+    Queue item format:
+        {"type": "message", "data": str, "req_id": str}
+        {"type": "command", "name": str, "params": dict, "req_id": str}
     """
     global _session
     global _processing_lock
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        while _session.has_pending():
-            # Collect ALL pending messages
-            pending_msgs, pending_reqs = _session.get_pending_messages()
-            if not pending_msgs:
-                break
+    import sys as _sys
+    _sys.stderr.write("[DIAG] _process_queued_messages: START\n")
+    _sys.stderr.flush()
 
-            # Combine all messages into one context
-            combined = "\n".join(pending_msgs)
-
-            # Notify TUI of batching
-            if len(pending_msgs) > 1:
+    async def _execute_command(cmd_item: dict):
+        """Execute a queued command inside the processing event loop."""
+        name = cmd_item["name"]
+        params = cmd_item.get("params", {})
+        cid = cmd_item.get("req_id", "")
+        try:
+            if name == "compact":
+                await _session.compact_session(params.get("session_id", session_id))
+            elif name == "clear_session":
+                await _session.clear_session(params.get("session_id", session_id))
+            else:
+                logger.warning("Unknown command: %s", name)
                 write_json({
                     "jsonrpc": "2.0", "method": "event",
                     "params": {
-                        "type": "user.batch",
-                        "payload": {"count": len(pending_msgs), "combined": combined[:100]}
+                        "type": "command.complete",
+                        "payload": {"command": name, "success": False,
+                                     "error": f"Unknown command: {name}"}
                     }
                 })
+                return
 
-            # Process as one combined message
-            answer = loop.run_until_complete(
-                _session.process_message(combined, session_id)
-            )
-
-            # Emit token stats
+            # Emit updated token stats after command
             token_stats = _session.calculate_token_stats()
             write_json({
                 "jsonrpc": "2.0", "method": "event",
                 "params": {"type": "token.stats", "payload": token_stats}
             })
-
-            # Emit completion event (for all batched requests)
             write_json({
                 "jsonrpc": "2.0", "method": "event",
                 "params": {
-                    "type": "message.complete",
-                    "payload": {"answer": answer}
+                    "type": "command.complete",
+                    "payload": {"command": name, "success": True}
+                }
+            })
+            logger.info("Command '%s' executed successfully", name)
+        except Exception as exc:
+            logger.error("Command '%s' failed: %s", name, exc)
+            write_json({
+                "jsonrpc": "2.0", "method": "event",
+                "params": {
+                    "type": "command.complete",
+                    "payload": {"command": name, "success": False, "error": str(exc)}
                 }
             })
 
-            # ── Post-answer background watcher ─────────────────
-            # After answering, watch for late background task completions.
-            # If new results arrive, inject them as synthetic messages
-            # and re-trigger processing so the agent can respond.
-            #
-            # IMPORTANT: Uses asyncio.sleep (not time.sleep) so the event
-            # loop stays alive.  BackgroundTaskManager.track_task() relies on
-            # task.add_done_callback() to populate _pending_results, and those
-            # callbacks only fire while the event loop is running.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        while _session.has_pending():
+            # ── Drain ALL pending items (messages + commands) ──
+            items = _session.drain_pending_items()
+            if not items:
+                break
+
+            last_answer = None
+            i = 0
+            while i < len(items):
+                item = items[i]
+
+                if item["type"] == "command":
+                    # Execute command inline between message batches
+                    loop.run_until_complete(_execute_command(item))
+                    i += 1
+
+                else:
+                    # Collect consecutive message items into a batch
+                    msg_items = []
+                    while i < len(items) and items[i]["type"] == "message":
+                        msg_items.append(items[i])
+                        i += 1
+
+                    combined = "\n".join(m["data"] for m in msg_items)
+
+                    # Notify TUI of batching
+                    if len(msg_items) > 1:
+                        write_json({
+                            "jsonrpc": "2.0", "method": "event",
+                            "params": {
+                                "type": "user.batch",
+                                "payload": {"count": len(msg_items),
+                                            "combined": combined[:100]}
+                            }
+                        })
+
+                    # Process as one combined message
+                    last_answer = loop.run_until_complete(
+                        _session.process_message(combined, session_id)
+                    )
+
+                    # Emit token stats
+                    token_stats = _session.calculate_token_stats()
+                    write_json({
+                        "jsonrpc": "2.0", "method": "event",
+                        "params": {"type": "token.stats", "payload": token_stats}
+                    })
+
+                    # Emit completion event (for all batched requests)
+                    write_json({
+                        "jsonrpc": "2.0", "method": "event",
+                        "params": {
+                            "type": "message.complete",
+                            "payload": {"answer": last_answer}
+                        }
+                    })
+
+            # ── Post-batch background watcher ─────────────────
+            # Only runs when ALL items from this drain are processed
+            # AND no new items arrived during processing.
+            # If _session.has_pending() is True, the outer while loop
+            # catches it and processes new items instead.
+            if _session.has_pending():
+                continue  # New items arrived, skip watcher
+
+            if last_answer is None:
+                continue  # No message was processed, skip watcher
+
             from configurationLoader import config
             watch_window = int(config.get("agent.background_watch_window", 1800))
             max_reactivations = int(config.get("agent.background_max_reactivations", 3))
@@ -1161,7 +1242,7 @@ def _process_queued_messages(session_id: str):
 
                 async def _bg_watcher():
                     while (time.time() - start_watch) < watch_window:
-                        # 用户发了新消息，立即退出 watcher 处理消息
+                        # 用户发了新消息或命令，立即退出 watcher
                         if _session.has_pending():
                             return True
                         if task_mgr.has_pending():
@@ -1173,7 +1254,7 @@ def _process_queued_messages(session_id: str):
                             )
                             # Inject results into memory so agent sees them
                             if _session.memory_manager:
-                                BackgroundTaskManager().inject_into_memory(
+                                task_mgr.inject_into_memory(
                                     _session.memory_manager, bg_results
                                 )
                             # Only queue synthetic message if callback didn't already
@@ -1183,9 +1264,15 @@ def _process_queued_messages(session_id: str):
                                     f"{len(bg_results)} background task(s) completed. "
                                     f"Please review and respond if needed."
                                 )
+                                _session.memory_manager.append(CoreMessage.context_only(
+                                    MessageSource.REACTIVATION, synthetic_msg,
+                                ).to_dict())
                                 with _session._batch_lock:
-                                    _session.pending_messages.append(synthetic_msg)
-                                    _session.pending_requests.append("bg_reactivation")
+                                    _session.pending_items.append({
+                                        "type": "message",
+                                        "data": synthetic_msg,
+                                        "req_id": "bg_reactivation",
+                                    })
                             return True
                         await asyncio.sleep(1.0)
                     return False
@@ -1223,7 +1310,7 @@ def _process_queued_messages(session_id: str):
             _processing_lock.release()
         except RuntimeError:
             pass  # Lock may not have been acquired (shouldn't happen normally)
-        # Re-check: messages might have arrived during the lock release race window
+        # Re-check: items might have arrived during the lock release race window
         if _session.has_pending():
             _start_processing(session_id)
 
@@ -1308,6 +1395,9 @@ def main():
                 continue
 
             # Dispatch request
+            method = request.get("method", "?")
+            sys.stderr.write(f"[TRACE] main loop dispatching: method={method}\n")
+            sys.stderr.flush()
             response = dispatch(request)
             if response is not None:
                 if not write_json(response):

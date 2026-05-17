@@ -8,6 +8,7 @@ PDF Parser - 主解析器类
 """
 
 import json
+import sys
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -82,31 +83,31 @@ class PDFParser:
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
         # 1. 提取元数据
-        print(f"[1/6] Extracting metadata...")
+        print(f"[1/6] Extracting metadata...", file=sys.stderr)
         metadata = self.metadata_extractor.extract(pdf_path)
 
         # 2. 提取文本
-        print(f"[2/6] Extracting text...")
+        print(f"[2/6] Extracting text...", file=sys.stderr)
         full_text = self.text_extractor.extract(pdf_path)
 
         # 3. 提取章节
-        print(f"[3/6] Extracting sections...")
+        print(f"[3/6] Extracting sections...", file=sys.stderr)
         sections = self.text_extractor.extract_sections(pdf_path, full_text)
 
         # 4. 提取表格
-        print(f"[4/6] Extracting tables...")
+        print(f"[4/6] Extracting tables...", file=sys.stderr)
         tables = []
         if self.table_extractor:
             tables = self.table_extractor.extract(pdf_path)
 
         # 5. 提取图表
-        print(f"[5/6] Extracting figures...")
+        print(f"[5/6] Extracting figures...", file=sys.stderr)
         figures = []
         if self.figure_extractor:
             figures = self.figure_extractor.extract(pdf_path, output_dir=output_dir)
 
         # 6. 提取公式
-        print(f"[6/6] Extracting equations and references...")
+        print(f"[6/6] Extracting equations and references...", file=sys.stderr)
         equations = []
         if self.equation_extractor:
             equations = self.equation_extractor.extract(pdf_path, full_text=full_text)
@@ -153,7 +154,7 @@ class PDFParser:
 
         if save_to:
             Path(save_to).write_text(json_str, encoding='utf-8')
-            print(f"\nJSON saved to: {save_to}")
+            print(f"\nJSON saved to: {save_to}", file=sys.stderr)
 
         return json_str
 

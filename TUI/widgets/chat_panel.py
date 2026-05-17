@@ -7,7 +7,7 @@ Displays conversation history and input field with slash command support
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Vertical
-from textual.widgets import Input, RichLog, Static
+from textual.widgets import Input, RichLog
 from textual.message import Message
 from rich.text import Text
 from rich.panel import Panel
@@ -16,6 +16,7 @@ from datetime import datetime
 
 from .command_suggestions import CommandSuggestions
 from .prompt_cache import detect_and_cache
+from .tool_panel import ToolPanel
 
 
 class ChatPanel(Container):
@@ -93,7 +94,6 @@ class ChatPanel(Container):
         self.chat_input = self.query_one("#chat-input", Input)
         self.command_suggestions = self.query_one("#command-suggestions", CommandSuggestions)
         self.current_assistant_message = None  # Track streaming message
-        self.streaming_line_count = 0  # Track how many lines were written during streaming
         self.streaming_text = Text()  # Accumulate streaming chunks
         self.last_assistant_message = ""  # Store last assistant message for copying
         self.chat_history = []  # Store all messages for export
@@ -170,6 +170,9 @@ class ChatPanel(Container):
         try:
             # Use threading to avoid blocking
             import threading
+            import logging
+            _send_logger = logging.getLogger("TUI.SendMessage")
+
             def send_async():
                 try:
                     gateway.call("agent.send_message", {
@@ -177,8 +180,24 @@ class ChatPanel(Container):
                         "session_id": self.app.session_id
                     })
                 except Exception as e:
-                    # Error will be handled by gateway error event
-                    pass
+                    _send_logger.error(
+                        "Failed to send message to gateway: %s (gateway process=%s)",
+                        e,
+                        gateway.process and gateway.process.pid,
+                    )
+                    # Attempt to restart gateway
+                    try:
+                        _send_logger.info("Attempting gateway restart...")
+                        gateway.restart()
+                        _send_logger.info("Gateway restarted, retrying message send...")
+                        gateway.call("agent.send_message", {
+                            "message": message,
+                            "session_id": self.app.session_id
+                        })
+                    except Exception as retry_err:
+                        _send_logger.critical(
+                            "Gateway restart/retry also failed: %s", retry_err
+                        )
 
             thread = threading.Thread(target=send_async, daemon=True)
             thread.start()
@@ -193,17 +212,27 @@ class ChatPanel(Container):
             self.clear()
             self.add_system_message("Chat history cleared")
             self.chat_history = []
-            # Also clear on gateway
+            # Also clear tool panel (right side)
+            try:
+                self.app.query_one(ToolPanel).clear()
+            except Exception:
+                pass
+            # Also clear on gateway (queued, executes between message batches)
             try:
                 self.app.gateway.call("agent.clear_session", {"session_id": self.app.session_id})
             except:
                 pass
 
         elif cmd == "/compact":
-            # Summarize current conversation via LLM and replace with summary
+            # Summarize current conversation via LLM and replace with summary.
+            # Queued for sequential execution between message batches —
+            # result arrives asynchronously via command.complete event.
             try:
-                self.app.gateway.call("agent.compact", {"session_id": self.app.session_id})
-                self.add_system_message("Conversation compacted — history summarized via LLM")
+                result = self.app.gateway.call("agent.compact", {"session_id": self.app.session_id})
+                if isinstance(result, dict) and result.get("queued"):
+                    self.add_system_message("Compact queued — will execute after current tasks complete")
+                else:
+                    self.add_system_message("Conversation compacted — history summarized via LLM")
             except Exception as e:
                 self.add_error_message(f"Compact failed: {e}")
 
@@ -227,7 +256,6 @@ class ChatPanel(Container):
         elif cmd == "/export":
             # Export chat history to file
             try:
-                from datetime import datetime
                 filename = f"chat_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
                 with open(filename, "w", encoding="utf-8") as f:
                     for msg in self.chat_history:
@@ -311,79 +339,107 @@ class ChatPanel(Container):
             self.add_error_message(f"Unknown command: {cmd}")
             self.add_system_message("Type /help for available commands")
 
+    # ── History replay with incremental rendering ──
+
+    HISTORY_REPLAY_LIMIT = 5  # max recent messages to show on startup
+
     def replay_messages(self, messages: list):
-        """Restore chat history in the display — 像续上对话一样自然回放"""
+        """Restore chat history — only user questions and AI answers, no tool noise.
+        If more than HISTORY_REPLAY_LIMIT messages exist, only the most recent ones
+        are shown, with a placeholder for older history."""
         if self._history_loaded:
             return
         self._history_loaded = True
 
         if not messages:
+            self.add_system_message("--- No history to restore ---")
             return
 
-        tool_panel = None
-        try:
-            tool_panel = self.app.query_one("#tool-panel")
-        except Exception:
-            pass
+        # Only keep user/assistant text messages (skip tool_calls, tool_results, thinking, context_only)
+        chat_only = [
+            m for m in messages
+            if m.get("type") == "text"
+            and m.get("role") in ("user", "assistant")
+            and m.get("content", "")
+            and m.get("_visibility", "full") != "context_only"
+        ]
+        if not chat_only:
+            self.add_system_message("--- No history to restore ---")
+            return
 
-        restored_count = 0
-        for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            msg_type = msg.get("type", "text")
-            if not content:
-                continue
+        total = len(chat_only)
+        if total > self.HISTORY_REPLAY_LIMIT:
+            skipped = total - self.HISTORY_REPLAY_LIMIT
+            self.add_system_message(f"(更久远的对话... {skipped} messages)")
+            chat_only = chat_only[-self.HISTORY_REPLAY_LIMIT:]
 
-            if msg_type == "tool_call":
-                # 工具调用在正常交互时不显示，跳过
-                restored_count += 1
-                continue
+        self._replay_msgs = chat_only
+        self._replay_idx = 0
+        self._replay_count = 0
+        self.add_system_message("Loading conversation history...")
+        self._do_replay_step()
 
-            if msg_type == "tool_result":
-                # 工具结果路由到右侧 ToolPanel
-                if tool_panel:
-                    # 从内容中尝试提取工具名（取首行前30字符做标题）
-                    tool_label = content.split("\n")[0][:30] if content else "result"
-                    tool_panel.add_tool_result(tool_label, content)
-                else:
-                    self.add_system_message(f"📋 {content[:200]}")
-                restored_count += 1
-                continue
+    @staticmethod
+    def _parse_ts(msg: dict) -> str:
+        """Extract HH:MM:SS from a message's timestamp field, or use current time."""
+        raw = msg.get("timestamp", "")
+        if raw:
+            try:
+                # ISO format: "2026-05-18T14:30:00" or "2026-05-18T14:30:00+08:00"
+                ts = raw.replace("T", " ").split("+")[0].rstrip("Z")
+                return datetime.fromisoformat(ts).strftime("%H:%M:%S")
+            except (ValueError, TypeError):
+                pass
+        return datetime.now().strftime("%H:%M:%S")
 
-            if role == "user":
-                self.add_user_message(content)
-                self.chat_history.append(f"[history] You: {content}")
-                restored_count += 1
+    def _do_replay_step(self):
+        """Render one chat message from the replay queue, then schedule the next."""
+        if self._replay_idx >= len(self._replay_msgs):
+            total = self._replay_count
+            self.add_system_message(f"--- Restored {total} historical messages ---")
+            return
 
-            elif role == "assistant":
-                # 像正常对话一样渲染 assistant 回复（markdown 格式）
-                self.last_assistant_message = content
-                from datetime import datetime
-                ts = datetime.now().strftime("%H:%M:%S")
-                self.chat_history.append(f"[{ts}] Assistant:\n{content}")
+        msg = self._replay_msgs[self._replay_idx]
+        self._replay_idx += 1
 
-                separator = Text("─" * 80, style="bold cyan")
-                self.chat_log.write(separator)
+        role = msg["role"]
+        content = msg["content"]
+        ts = self._parse_ts(msg)
 
-                header = Text()
-                header.append(f"[{ts}] ", style="dim")
-                header.append("Assistant", style="bold green")
-                header.append(":")
-                self.chat_log.write(header)
+        if role == "user":
+            text = Text()
+            text.append(f"[{ts}] ", style="dim")
+            text.append("You", style="bold cyan")
+            text.append(": ")
+            text.append(content)
+            self.chat_log.write(text)
+            self.chat_history.append(f"[{ts}] You: {content}")
+            self._replay_count += 1
 
-                try:
-                    from rich.markdown import Markdown
-                    self.chat_log.write(Markdown(content))
-                except Exception:
-                    self.chat_log.write(Text(content))
+        elif role == "assistant":
+            self.last_assistant_message = content
+            self.chat_history.append(f"[{ts}] Assistant:\n{content}")
 
-                self.chat_log.write(separator)
-                restored_count += 1
+            separator = Text("─" * 80, style="bold cyan")
+            self.chat_log.write(separator)
 
-        if restored_count > 0:
-            self.add_system_message(f"--- 已恢复 {restored_count} 条历史对话 ---")
-        else:
-            self.add_system_message("--- 无历史消息 ---")
+            header = Text()
+            header.append(f"[{ts}] ", style="dim")
+            header.append("Assistant", style="bold green")
+            header.append(":")
+            self.chat_log.write(header)
+
+            try:
+                from rich.markdown import Markdown
+                self.chat_log.write(Markdown(content))
+            except Exception:
+                self.chat_log.write(Text(content))
+
+            self.chat_log.write(separator)
+            self._replay_count += 1
+
+        # Schedule next step — 60ms gap for a natural typing feel
+        self.set_timer(0.06, self._do_replay_step)
 
     def add_user_message(self, message: str):
         """Add a user message to the chat log"""
@@ -453,7 +509,6 @@ class ChatPanel(Container):
             self.chat_log.write(separator)
 
         self.current_assistant_message = None  # Reset streaming state
-        self.streaming_line_count = 0
         self.streaming_text = Text()
 
     def start_assistant_message(self):
@@ -465,7 +520,6 @@ class ChatPanel(Container):
         text.append(": ")
         self.chat_log.write(text)
         self.current_assistant_message = ""
-        self.streaming_line_count = 1  # Count the header line
         self.streaming_text = Text()  # Accumulate text for current line
 
     def append_to_assistant_message(self, chunk: str):
@@ -484,7 +538,6 @@ class ChatPanel(Container):
         if '\n' in chunk or len(accumulated_text) > 100:
             self.chat_log.write(self.streaming_text)
             self.streaming_text = Text()  # Reset for next batch
-            self.streaming_line_count += 1
 
     def add_system_message(self, message: str):
         """Add a system message to the chat log"""
@@ -495,6 +548,14 @@ class ChatPanel(Container):
         text.append(": ")
         text.append(message, style="italic")
         self.chat_log.write(text)
+
+    def add_splash_message(self, message: str, style: str = ""):
+        """Add a splash/branding message without role prefix or timestamp.
+        Not recorded in chat history. Used for startup branding only."""
+        if style:
+            self.chat_log.write(Text(message, style=style))
+        else:
+            self.chat_log.write(Text(message))
 
     def add_error_message(self, message: str):
         """Add an error message to the chat log"""

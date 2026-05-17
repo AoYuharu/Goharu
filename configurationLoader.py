@@ -56,26 +56,21 @@ class Configuration:
         """创建类型化的 ModelConfig"""
         from Core.Config import ModelConfig
         llm = self.get("model.large-language-model", {}) or {}
-        local = llm.get("local_hf", {}) or {}
+        provider = llm.get("provider", "anthropic_compatible")
+        if provider != "anthropic_compatible":
+            raise ValueError(
+                f"Unsupported model.large-language-model.provider: {provider}. "
+                "Only anthropic_compatible is supported."
+            )
         return ModelConfig(
-            provider=llm.get("provider", "local_hf"),
+            provider=provider,
             model_name=llm.get("model", ""),
             api_key_env=llm.get("api_key_env", ""),
             base_url=llm.get("base_url", ""),
             max_tokens=llm.get("max_tokens", 1024),
             temperature=float(llm.get("temperature", 0.7)),
             top_p=float(llm.get("top_p", 0.9)),
-            use_native_tools=llm.get("use_native_tools", True),
             api_timeout=int(llm.get("api_timeout", 120)),
-            hf_model_path=local.get("path", ""),
-            hf_device_map=local.get("device_map", "cuda"),
-            hf_trust_remote_code=local.get("trust_remote_code", True),
-            hf_load_in_4bit=local.get("load_in_4bit", True),
-            hf_bnb_4bit_quant_type=local.get("bnb_4bit_quant_type", "nf4"),
-            hf_bnb_4bit_compute_dtype=local.get("bnb_4bit_compute_dtype", "float16"),
-            hf_bnb_4bit_use_double_quant=local.get("bnb_4bit_use_double_quant", True),
-            hf_max_new_tokens=local.get("max_new_tokens", 1024),
-            hf_repetition_penalty=float(local.get("repetition_penalty", 1.1)),
         )
 
     def make_agent_config(self):
@@ -120,18 +115,10 @@ class Configuration:
             retrieval_embedding_timeout=int(self.get("memory.retrieval.embedding_timeout", 30)),
             retrieval_reranker_model_path=self.get("memory.retrieval.reranker_model_path", "./models/rerank_model/bge-reranker-v2-m3"),
             pipeline_db_enabled=self.get("memory.pipeline.db_enabled", True),
-            prompt_use_legacy_memory_markdown=self.get("memory.prompt.use_legacy_memory_markdown", True),
             export_daily_json_enabled=self.get("memory.export.daily_json_enabled", True),
             session_id=self.get("memory.session_id", "default"),
             daily_dir=self.get("memory.daily.dir", "./runtime_memory/daily"),
             retention_days=max(1, int(self.get("memory.daily.retention_days", 7))),
-            index_path=self.get("memory.index.path", "./runtime_memory/MEMORY.md"),
-            user_path=self.get("memory.user.path", "./runtime_memory/USER.md"),
-            user_review_enabled=self.get("memory.user.review_enabled", True),
-            user_review_interval=int(self.get("memory.user.review_interval", 10)),
-            topic_dir=self.get("memory.topic.dir", "./runtime_memory/topic"),
-            topic_merge_every_n=int(self.get("memory.topic.merge_every_n_summaries", 3)),
-            topic_merge_min_count=int(self.get("memory.topic.merge_min_count", 4)),
         )
 
     def make_tool_config(self):

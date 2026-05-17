@@ -1,5 +1,4 @@
 import json
-import re
 from dataclasses import dataclass
 
 from Core.PromptSection import PromptSection
@@ -27,196 +26,13 @@ class ToolCall:
         if arguments is None:
             arguments = payload.get("parameters")
         if arguments is None:
-            arguments = payload.get("input")  # 支持 Anthropic 格式
+            arguments = payload.get("input")
         if not isinstance(tool_name, str) or not tool_name.strip():
             return None
         if not isinstance(arguments, dict):
             return None
 
         return cls(tool_name=tool_name.strip(), arguments=dict(arguments))
-
-    @staticmethod
-    def _extract_balanced_object(text, start_index):
-        depth = 0
-        in_string = False
-        escape = False
-        for index in range(start_index, len(text)):
-            char = text[index]
-            if in_string:
-                if escape:
-                    escape = False
-                elif char == "\\":
-                    escape = True
-                elif char == '"':
-                    in_string = False
-                continue
-            if char == '"':
-                in_string = True
-            elif char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start_index:index + 1]
-        return None
-
-    @classmethod
-    def _convert_arrow_syntax(cls, text):
-        """
-        将箭头语法转换为标准 JSON
-        {tool => "Read", args => {--path "test.txt", --mode "r"}}
-        ->
-        {"tool": "Read", "arguments": {"path": "test.txt", "mode": "r"}}
-        """
-        try:
-            # 1. 替换 => 为 :
-            text = re.sub(r'\s*=>\s*', ': ', text)
-
-            # 2. 替换 args 为 arguments
-            text = re.sub(r'\bargs\b', 'arguments', text)
-
-            # 3. 给 tool 和 arguments 键加引号
-            text = re.sub(r'\btool\b(?=\s*:)', '"tool"', text)
-            text = re.sub(r'\barguments\b(?=\s*:)', '"arguments"', text)
-
-            # 4. 处理 --参数名 "值" 格式
-            # 找到所有 --param "value" 或 --param 'value' 模式
-            def replace_dash_param(match):
-                return f'"{match.group(1)}": {match.group(2)}'
-
-            # 匹配 --参数名 后跟引号开始的字符串
-            text = re.sub(r'--(\w+)\s+(["\'][^"\']*["\'])', replace_dash_param, text)
-
-            # 5. 在参数之间添加逗号（如果缺失）
-            # 匹配 "value" 后面直接跟 "key": 的情况
-            text = re.sub(r'(["\'])\s+("[\w_]+"\s*:)', r'\1, \2', text)
-
-            # 6. 处理换行和多余空格
-            text = re.sub(r'\s+', ' ', text)
-
-            # 7. 清理多余的逗号
-            text = re.sub(r',\s*}', ' }', text)
-            text = re.sub(r',\s*]', ' ]', text)
-
-            return text
-        except Exception as e:
-            return None
-
-    @classmethod
-    def try_from_text(cls, text):
-        """
-        从文本中提取工具调用
-
-        支持的格式：
-        1. 标准 JSON（推荐）: {"tool": "...", "arguments": {...}}
-        """
-        if not isinstance(text, str):
-            return None
-
-        stripped = text.strip()
-        if not stripped:
-            return None
-
-        # 标准 JSON 格式解析
-        candidates = [stripped]
-
-        # 提取 markdown 代码块中的 JSON（容错）
-        candidates.extend(match.group(1).strip() for match in re.finditer(
-            r"```(?:json|JSON)?\s*(\{.*?\})\s*```",
-            stripped,
-            re.DOTALL,
-        ))
-
-        # 提取所有可能的 JSON 对象
-        for match in re.finditer(r"\{", stripped):
-            candidate = cls._extract_balanced_object(stripped, match.start())
-            if candidate is not None and (
-                ('"tool"' in candidate and '"arguments"' in candidate)
-                or ('"name"' in candidate and '"parameters"' in candidate)
-                or ('"name"' in candidate and '"input"' in candidate)  # 支持 Anthropic 格式
-            ):
-                candidates.append(candidate)
-
-        # 尝试解析每个候选
-        seen = set()
-        for candidate in candidates:
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            try:
-                payload = json.loads(candidate)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-
-            tool_call = cls._from_payload(payload)
-            if tool_call is not None:
-                return tool_call
-
-        return None
-
-    @classmethod
-    def try_all_from_text(cls, text):
-        """
-        从文本中提取所有工具调用（支持多个工具调用）
-
-        返回: List[ToolCall] 或 None（如果没有找到任何工具调用）
-        """
-        if not isinstance(text, str):
-            return None
-
-        stripped = text.strip()
-        if not stripped:
-            return None
-
-        tool_calls = []
-
-        # 1. 尝试解析为JSON数组 [{"tool": "...", "arguments": {...}}, ...]
-        try:
-            # 查找JSON数组
-            array_match = re.search(r'\[\s*\{.*?\}\s*\]', stripped, re.DOTALL)
-            if array_match:
-                array_text = array_match.group(0)
-
-                # 修复 Windows 路径中的反斜杠问题
-                # 将单个反斜杠（不是有效的转义序列）替换为双反斜杠
-                array_text = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', array_text)
-
-                payloads = json.loads(array_text)
-                if isinstance(payloads, list):
-                    for payload in payloads:
-                        tool_call = cls._from_payload(payload)
-                        if tool_call is not None:
-                            tool_calls.append(tool_call)
-                    if tool_calls:
-                        return tool_calls
-        except (TypeError, ValueError, json.JSONDecodeError):
-            pass
-
-        # 2. 提取所有独立的JSON对象
-        seen = set()
-        for match in re.finditer(r"\{", stripped):
-            candidate = cls._extract_balanced_object(stripped, match.start())
-            if candidate is None:
-                continue
-            if candidate in seen:
-                continue
-            if not (('"tool"' in candidate and '"arguments"' in candidate)
-                    or ('"name"' in candidate and '"parameters"' in candidate)
-                    or ('"name"' in candidate and '"input"' in candidate)):  # 支持 Anthropic 格式
-                continue
-
-            seen.add(candidate)
-            try:
-                # 修复反斜杠问题
-                fixed_candidate = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', candidate)
-                payload = json.loads(fixed_candidate)
-                tool_call = cls._from_payload(payload)
-                if tool_call is not None:
-                    tool_calls.append(tool_call)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-
-        return tool_calls if tool_calls else None
 
     @classmethod
     def from_record(cls, record):
@@ -231,13 +47,12 @@ class ToolCall:
             if isinstance(tool_name, str) and tool_name.strip() and isinstance(arguments, dict):
                 return cls(tool_name=tool_name.strip(), arguments=dict(arguments))
 
-            content_call = cls.try_from_text(record.get("content", ""))
-            if content_call is not None:
-                return content_call
-            return None
-
-        if record.get("role") == "assistant":
-            return cls.try_from_text(record.get("content", ""))
+        content = record.get("content")
+        if record.get("role") == "assistant" and isinstance(content, list):
+            for block in content:
+                tool_call = cls.from_anthropic_tool_use(block)
+                if tool_call is not None:
+                    return tool_call
 
         return None
 
@@ -248,28 +63,21 @@ class ToolCall:
     def to_payload(self):
         return self._canonical_payload(self.tool_name, self.arguments)
 
-    def to_json_text(self):
-        return json.dumps(self.to_payload(), ensure_ascii=False)
-
-    def to_record(self, timestamp=None):
+    def to_record(self, timestamp=None, tool_use_id=None):
+        content = [self.to_anthropic_tool_use(tool_use_id=tool_use_id)]
         record = {
             "role": "assistant",
             "message_type": "tool_call",
             "tool_name": self.tool_name,
             "arguments": dict(self.arguments),
-            "content": self.to_json_text(),
+            "content": content,
         }
         if timestamp is not None:
             record["timestamp"] = timestamp
         return record
 
-    def to_prompt_message(self):
-        return {
-            "role": "assistant",
-            "content": self.to_json_text(),
-        }
-
-    def to_section(self, message_id=None):
+    def to_section(self, message_id=None, tool_use_id=None):
+        content = [self.to_anthropic_tool_use(tool_use_id=tool_use_id)]
         metadata = {
             "tool_name": self.tool_name,
             "arguments": dict(self.arguments),
@@ -279,7 +87,7 @@ class ToolCall:
         return PromptSection(
             kind="tool_call",
             title=self.tool_name,
-            content=self.to_json_text(),
+            content=content,
             metadata=metadata,
         )
 
@@ -384,7 +192,7 @@ class ToolCall:
                         return True
                     if parsed.get("interrupted", False):
                         return True
-                    return False  # exit_code=0, not timed_out/interrupted
+                    return False
                 if "error" in parsed and parsed["error"]:
                     return True
                 if parsed.get("backgrounded"):

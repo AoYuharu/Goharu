@@ -8,10 +8,14 @@ from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Header, Footer, Static, Input, RichLog
 from textual.binding import Binding
+from textual import events
 from rich.text import Text
 from rich.panel import Panel
+from rich.style import Style
 from datetime import datetime
 import logging
+
+logger = logging.getLogger(__name__)
 import os
 import queue
 import threading
@@ -56,6 +60,40 @@ def _trace(msg: str):
 
 
 _MEMORY_MONITOR_INTERVAL = 30  # 每30秒记录一次内存
+
+
+class _TypewriterHeader(Static):
+    """Header widget that displays text character by character with a typing animation."""
+
+    def __init__(self, text: str, interval: float = 0.04, **kwargs):
+        kwargs.setdefault("id", "header")
+        super().__init__("", **kwargs)
+        self._full_text = text
+        self._type_interval = interval
+        self._pos = 0
+        self._timer = None
+
+    def on_mount(self):
+        self._timer = self.set_interval(self._type_interval, self._type_next_char)
+
+    def _type_next_char(self):
+        if self._pos < len(self._full_text):
+            self._pos += 1
+            revealed = self._full_text[:self._pos]
+            self.update(Text(revealed, style=Style(bold=True)))
+        else:
+            if self._timer is not None:
+                self._timer.stop()
+                self._timer = None
+
+    def set_text(self, text: str):
+        """Update the header text and restart the typing animation."""
+        self._full_text = text
+        self._pos = 0
+        self.update("")
+        if self._timer is not None:
+            self._timer.stop()
+        self._timer = self.set_interval(self._type_interval, self._type_next_char)
 
 
 class TableHelperTUI(App):
@@ -142,7 +180,7 @@ class TableHelperTUI(App):
 
     def compose(self) -> ComposeResult:
         """Create child widgets"""
-        yield Static("🤖 TableHelper TUI", id="header")
+        yield _TypewriterHeader("Welcome back — Goharu is ready. What can I help you with?")
         yield Horizontal(
             ChatPanel(id="chat-panel"),
             ToolPanel(id="tool-panel"),
@@ -192,13 +230,21 @@ class TableHelperTUI(App):
         self.gateway.on_event("task.background.status", self._on_background_status)
         self.gateway.on_event("agent.interrupted", self._on_agent_interrupted)
         self.gateway.on_event("agent.error", self._on_agent_error)
+        self.gateway.on_event("command.complete", self._on_command_complete)
 
-        # Show welcome message
+        # ── Goharu splash ──
         chat_panel = self.query_one(ChatPanel)
-        chat_panel.add_system_message("Welcome to TableHelper TUI!")
-        chat_panel.add_system_message("Type your message in the input box below and press Enter.")
-        chat_panel.add_system_message("Press Tab to switch focus between panels.")
-        chat_panel.add_system_message("Waiting for Gateway to start...")
+        chat_panel.add_splash_message("")
+        chat_panel.add_splash_message("  ██████╗  ██████╗ ██╗  ██╗ █████╗ ██████╗ ██╗   ██╗", "bold cyan")
+        chat_panel.add_splash_message("  ██╔════╝ ██╔═══██╗██║  ██║██╔══██╗██╔══██╗██║   ██║", "bold cyan")
+        chat_panel.add_splash_message("  ██║  ███╗██║   ██║███████║███████║██████╔╝██║   ██║", "bold blue")
+        chat_panel.add_splash_message("  ██║   ██║██║   ██║██╔══██║██╔══██║██╔══██╗██║   ██║", "bold blue")
+        chat_panel.add_splash_message("  ╚██████╔╝╚██████╔╝██║  ██║██║  ██║██║  ██║╚██████╔╝", "bold magenta")
+        chat_panel.add_splash_message("   ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝", "bold magenta")
+        chat_panel.add_splash_message("")
+        chat_panel.add_splash_message("  Your Personal Coding Agent — Program, Debug, Automate.", "italic cyan")
+        chat_panel.add_splash_message("")
+        chat_panel.add_system_message("Type your message and press Enter to start. Waiting for Gateway...")
 
         # Focus input
         self.query_one(ChatPanel).focus_input()
@@ -257,6 +303,24 @@ class TableHelperTUI(App):
         except ImportError:
             pass
         _trace(f"HEARTBEAT #{self._heartbeat_count} steps={self._step_count}{mem_str}")
+
+        # ── Gateway health check & auto-restart ──
+        gw = self.gateway
+        if gw.process is not None:
+            exit_code = gw.process.poll()
+            if exit_code is not None:
+                _tui_log.warning(
+                    "Gateway process (pid=%s) died with exit_code=%s — restarting...",
+                    gw.process.pid, exit_code,
+                )
+                _trace(f"Gateway died (pid={gw.process.pid}, exit={exit_code}), restarting...")
+                try:
+                    gw.restart()
+                    _tui_log.info("Gateway restarted, new pid=%s", gw.process.pid if gw.process else "?")
+                    _trace(f"Gateway restarted, new pid={gw.process.pid if gw.process else '?'})")
+                except Exception as restart_err:
+                    _tui_log.critical("Gateway restart failed: %s", restart_err)
+                    _trace(f"Gateway restart FAILED: {restart_err}")
 
     def _install_textual_exception_hook(self):
         """安装 Textual 事件循环的全局异常处理器。
@@ -443,18 +507,40 @@ class TableHelperTUI(App):
     def _on_user_batch(self, payload):
         """User messages were batched at start (called from reader thread)"""
         count = payload.get("count", 0)
-        self.call_from_thread(self._do_chat_system_message, f"📦 Batched {count} messages into one context")
+        self.call_from_thread(self._do_chat_system_message, f"Batched {count} messages into one context")
 
     def _on_user_merge(self, payload):
         """User messages were merged during processing (called from reader thread)"""
         count = payload.get("count", 0)
-        self.call_from_thread(self._do_chat_system_message, f"🔄 Merged {count} new message(s) before next reasoning step")
+        self.call_from_thread(self._do_chat_system_message, f"Merged {count} new message(s) before next reasoning step")
 
     def _on_agent_error(self, payload):
         """Agent error occurred (called from reader thread)"""
         error_msg = payload.get("message", "Unknown error")
         _tui_log.error("Agent error event: %s", error_msg[:200])
         self.call_from_thread(self._do_agent_error, error_msg)
+
+    def _on_command_complete(self, payload):
+        """Command execution completed (called from reader thread)"""
+        command = payload.get("command", "")
+        success = payload.get("success", False)
+        error = payload.get("error", "")
+        self.call_from_thread(self._do_command_complete, command, success, error)
+
+    def _do_command_complete(self, command: str, success: bool, error: str):
+        """Display command result (runs on main thread)"""
+        chat_panel = self.query_one(ChatPanel)
+        if success:
+            if command == "compact":
+                chat_panel.add_system_message(
+                    "Conversation compacted \u2014 history summarized via LLM"
+                )
+            elif command == "clear_session":
+                chat_panel.add_system_message("Session cleared on gateway")
+            else:
+                chat_panel.add_system_message(f"Command '{command}' completed")
+        else:
+            chat_panel.add_error_message(f"Command '{command}' failed: {error}")
 
     def action_quit(self):
         """Quit the application"""
@@ -493,6 +579,8 @@ class TableHelperTUI(App):
         """Clear the chat"""
         chat_panel = self.query_one(ChatPanel)
         chat_panel.clear()
+        tool_panel = self.query_one(ToolPanel)
+        tool_panel.clear()
 
         # Clear session on gateway
         self.gateway.call("agent.clear_session", {"session_id": self.session_id})
@@ -505,8 +593,7 @@ class TableHelperTUI(App):
     def _on_micro_compact(self, payload):
         """Micro-compact: older tool results collapsed (called from reader thread)"""
         removed = payload.get("removed_results", 0)
-        self.call_from_thread(self._do_chat_system_message,
-                              f"📦 Micro-compact: {removed} older tool results compacted")
+        logger.info(f"Micro-compact: {removed} older tool results compacted")
 
     def _on_background_started(self, payload):
         """Background task started (called from reader thread)"""
@@ -601,16 +688,22 @@ class TableHelperTUI(App):
         chat_panel.add_error_message(error_msg)
         status_bar = self.query_one(StatusBar)
         status_bar.set_status(f"Error: {error_msg[:50]}", "error")
+        # Auto-restart gateway if it crashed
+        try:
+            _tui_log.info("Agent error — restarting gateway...")
+            _trace(f"Agent error, restarting gateway: {error_msg[:100]}")
+            self.gateway.restart()
+            _tui_log.info("Gateway restarted after error")
+            _trace("Gateway restarted after error")
+        except Exception as restart_err:
+            _tui_log.critical("Gateway restart after error failed: %s", restart_err)
+            _trace(f"Gateway restart after error FAILED: {restart_err}")
 
     def _do_background_started(self, bg_names: list):
-        chat_panel = self.query_one(ChatPanel)
-        chat_panel.add_system_message(f"BG task(s) started: {', '.join(bg_names)}")
         status_bar = self.query_one(StatusBar)
         status_bar.set_status(f"BG task: {', '.join(bg_names)}", "working")
 
     def _do_background_completed(self, count: int, task_ids: list):
-        chat_panel = self.query_one(ChatPanel)
-        chat_panel.add_system_message(f"{count} background task(s) completed (IDs: {task_ids})")
         status_bar = self.query_one(StatusBar)
         status_bar.set_status(f"BG tasks completed: {count}", "success")
 

@@ -14,9 +14,11 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from Core.LogManager import get_logger
+from Core.Message import CoreMessage, MessageSource
 
 logger = get_logger(__name__)
 
@@ -59,6 +61,8 @@ class BackgroundTaskManager:
         self._counter_lock = threading.Lock()
         self._pending_results: Dict[int, BackgroundResult] = {}
         self._results_lock = threading.Lock()
+        self._active_metadata: Dict[int, dict] = {}  # task_id -> {tool_name, args, submitted_at}
+        self._active_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(
             max_workers=5, thread_name_prefix="bg-task-"
         )
@@ -88,6 +92,19 @@ class BackgroundTaskManager:
         """
         task_id = self._next_id()
 
+        # Record active metadata
+        args_str = description
+        if description.startswith(tool_name) and len(description) > len(tool_name):
+            raw = description[len(tool_name):].strip()
+            if raw.startswith('(') and raw.endswith(')'):
+                args_str = raw[1:-1]
+        with self._active_lock:
+            self._active_metadata[task_id] = {
+                "tool_name": tool_name,
+                "args": args_str,
+                "submitted_at": time.time(),
+            }
+
         def _run():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -116,6 +133,8 @@ class BackgroundTaskManager:
 
             with self._results_lock:
                 self._pending_results[task_id] = bg_result
+            with self._active_lock:
+                self._active_metadata.pop(task_id, None)
 
             logger.info(
                 "[bg-task] Task #%d (%s) completed%s",
@@ -160,6 +179,19 @@ class BackgroundTaskManager:
         """
         task_id = self._next_id()
 
+        # Record active metadata
+        args_str = description
+        if description.startswith(tool_name) and len(description) > len(tool_name):
+            raw = description[len(tool_name):].strip()
+            if raw.startswith('(') and raw.endswith(')'):
+                args_str = raw[1:-1]
+        with self._active_lock:
+            self._active_metadata[task_id] = {
+                "tool_name": tool_name,
+                "args": args_str,
+                "submitted_at": time.time(),
+            }
+
         def _on_done(t: "asyncio.Task"):
             try:
                 result = t.result()
@@ -188,6 +220,8 @@ class BackgroundTaskManager:
 
             with self._results_lock:
                 self._pending_results[task_id] = bg_result
+            with self._active_lock:
+                self._active_metadata.pop(task_id, None)
 
             logger.info(
                 "[bg-task] Tracked task #%d (%s) completed%s",
@@ -265,6 +299,59 @@ class BackgroundTaskManager:
             "reactivation_count": self._reactivation_count,
         }
 
+    def get_detailed_status(self) -> str:
+        """Return a human-readable status report of all background tasks.
+
+        Includes running tasks (with tool name, args, task ID, start time)
+        and pending completed tasks awaiting drain. Formatted for easy reading
+        by both humans and agents.
+        """
+        now = time.time()
+        lines = ["=== Background Task Status ===", ""]
+
+        # Active (running) tasks
+        with self._active_lock:
+            active = list(self._active_metadata.items())
+        active.sort(key=lambda x: x[1]["submitted_at"])
+
+        if active:
+            lines.append(f"> RUNNING ({len(active)})")
+            lines.append("-" * 40)
+            for task_id, meta in active:
+                elapsed = int(now - meta["submitted_at"])
+                elapsed_str = f"{elapsed}s" if elapsed < 60 else f"{elapsed // 60}m{elapsed % 60}s"
+                start_time = datetime.fromtimestamp(meta["submitted_at"]).strftime("%Y-%m-%d %H:%M:%S")
+                lines.append(f"  #{task_id}  {meta['tool_name']}")
+                lines.append(f"       Args: {meta['args']}")
+                lines.append(f"       Started: {start_time} | elapsed: {elapsed_str}")
+                lines.append("")
+        else:
+            lines.append("> RUNNING: none")
+            lines.append("")
+
+        # Pending (completed, not yet drained) results
+        with self._results_lock:
+            pending = list(self._pending_results.values())
+        pending.sort(key=lambda r: r.completed_at)
+
+        if pending:
+            lines.append(f"> PENDING ({len(pending)}) -- completed, awaiting injection")
+            lines.append("-" * 40)
+            for r in pending:
+                comp_time = datetime.fromtimestamp(r.completed_at).strftime("%Y-%m-%d %H:%M:%S")
+                lines.append(f"  #{r.task_id}  {r.tool_name}  (completed {comp_time})")
+                lines.append(f"       Description: {r.description[:200]}")
+                if r.error:
+                    lines.append(f"       ERROR: {r.error[:120]}")
+                lines.append("")
+        else:
+            lines.append("> PENDING: none")
+            lines.append("")
+
+        # Reactivation count
+        lines.append(f"Reactivations: {self._reactivation_count}")
+        return "\n".join(lines)
+
     def increment_reactivation(self):
         self._reactivation_count += 1
 
@@ -321,7 +408,10 @@ class BackgroundTaskManager:
                     f"This result was from a background task. "
                     f"Please incorporate it into your response if relevant."
                 )
-            memory_manager.append({"role": "user", "content": content})
+            memory_manager.append(CoreMessage.context_only(
+                MessageSource.BG_TASK,
+                content,
+            ).to_dict())
             logger.info(
                 "[bg-task] Injected result for task #%d into working memory",
                 r.task_id,
