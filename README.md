@@ -38,7 +38,7 @@
 
 ### Goharu 是什么？
 
-**Goharu** 是一个基于大语言模型（兼容 Anthropic API）的终端编程 Agent。它运行在 ReAct 循环中——思考 → 行动 → 观察 → 回答——在真实的文件系统和 Shell 上操作真实工具。它不是聊天机器人，它是一个**会做事的 Agent**。
+**Goharu** 是一个基于大语言模型（兼容 Anthropic API）的终端编程 Agent。它运行在 ReAct 循环中——思考 → 行动 → 观察 → 回答——直接操作文件系统和 Shell。
 
 #### 核心能力
 
@@ -48,14 +48,13 @@
 | **Shell 执行** | 运行任意命令，带多层安全防火墙 |
 | **子 Agent 委托** | 派生子 Agent 进行探索、规划、验证 |
 | **PDF 解析** | 提取 PDF 中的文本和表格，支持 OCR 回退 |
-| **记忆金字塔** | L0→L1→L2→L3 长短期记忆体系，混合检索（BM25 + 向量 + 全文搜索） |
-| **多平台接入** | TUI 终端、QQ Bot、ACP/HTTP 协议——三种入口，共享同一大脑 |
+| **记忆系统** | L0→L1→L2→L3 长短期记忆体系，混合检索（BM25 + 向量 + 全文搜索） |
 | **技能系统** | 预制 SOP 范式：论文分析、引文、绘图、学术润色、审稿回复 |
 | **后台任务** | 长时间工具调用转入后台异步执行，完成后自动唤醒 Agent |
 
 #### 架构总览
 
-Goharu 采用分层架构。入口层支持三种接入方式：`run_tui.py`（终端 TUI）、QQ Bot、ACP/HTTP 协议。TUI 通过 JSON-RPC 与 Gateway 后端通信，Gateway 将请求转发给 Actor Agent。Agent 运行 ReAct 循环（思考 → 工具 → 观察 → 回答），内部由 PromptAssembler → LLMCore → ToolRuntime 串联。下层依赖三大系统：工具层（9 个内置模块）、记忆系统（L0→L3 金字塔 + 混合检索）、子 Agent（探索/规划/验证）。
+Goharu 采用分层架构。入口为 `run_tui.py`（终端 TUI），通过 JSON-RPC 与 Gateway 后端通信，Gateway 将请求转发给 Actor Agent。Agent 运行 ReAct 循环（思考 → 工具 → 观察 → 回答），内部由 PromptAssembler → LLMCore → ToolRuntime 串联。下层依赖三大系统：工具层（9 个内置模块）、记忆系统（L0→L3 金字塔 + 混合检索）、子 Agent（探索/规划/验证）。
 
 #### 记忆金字塔
 
@@ -112,10 +111,6 @@ Goharu/
 │       ├── chat_panel.py     #   流式消息展示
 │       ├── tool_panel.py     #   实时工具调用与结果视图
 │       └── status_bar.py     #   状态栏、Token 统计
-│
-├── Gateway/                  # 多平台消息网关
-│   ├── session.py            #   多用户会话管理
-│   └── platforms/            #   QQ、ACP 适配器
 │
 ├── Core/                     # 共享数据结构
 │   ├── Config.py             #   类型化数据类
@@ -220,7 +215,7 @@ Goharu 在本地运行所有工具，带**多层安全体系**：
 
 ### What is Goharu?
 
-**Goharu** is a terminal-based Coding Agent powered by large language models (Anthropic-compatible API). It operates in a ReAct loop — Think → Act → Observe → Answer — wielding real tools on your filesystem and shell. It is not a chatbot. It is an agent that *does things*.
+**Goharu** is a terminal-based Coding Agent powered by large language models (Anthropic-compatible API). It operates in a ReAct loop — Think → Act → Observe → Answer — working directly on your filesystem and shell.
 
 #### Core Capabilities
 
@@ -230,14 +225,13 @@ Goharu 在本地运行所有工具，带**多层安全体系**：
 | **Shell Execution** | Run arbitrary commands with a multi-layer security firewall |
 | **Sub-Agent Delegation** | Spawn sub-agents for exploration, planning, and verification |
 | **PDF Parsing** | Extract text and tables from PDFs, with OCR fallback |
-| **Memory Pyramid** | L0→L1→L2→L3 long-term memory with hybrid retrieval (BM25 + Embedding + FTS) |
-| **Multi-Platform** | TUI, QQ Bot, and ACP HTTP Protocol — three access modes, one brain |
+| **Memory System** | L0→L1→L2→L3 long-term memory with hybrid retrieval (BM25 + Embedding + FTS) |
 | **Skills System** | Pre-built SOPs: paper analysis, citation, figure generation, academic polishing |
 | **Background Tasks** | Long-running tool calls go async; agent reactivates when they complete |
 
 #### Architecture at a Glance
 
-Goharu uses a layered architecture. The entry layer supports three access modes: `run_tui.py` (terminal TUI), QQ Bot, and ACP/HTTP protocol. The TUI communicates with the Gateway backend via JSON-RPC, and the Gateway routes requests to the Actor Agent. The Agent runs a ReAct loop (Think → Tools → Observe → Answer), internally wired as PromptAssembler → LLMCore → ToolRuntime. Three downstream systems support it: the Tools layer (9 built-in modules), the Memory system (L0→L3 pyramid + hybrid retrieval), and Sub-Agents (explore/plan/verify).
+Goharu uses a layered architecture. The entry point is `run_tui.py` (terminal TUI), which communicates with the Gateway backend via JSON-RPC. The Gateway routes requests to the Actor Agent. The Agent runs a ReAct loop (Think → Tools → Observe → Answer), internally wired as PromptAssembler → LLMCore → ToolRuntime. Three downstream systems support it: the Tools layer (9 built-in modules), the Memory system (L0→L3 pyramid + hybrid retrieval), and Sub-Agents (explore/plan/verify).
 
 #### Memory Pyramid
 
@@ -294,10 +288,6 @@ Goharu/
 │       ├── chat_panel.py     #   Streaming message display
 │       ├── tool_panel.py     #   Real-time tool call & result view
 │       └── status_bar.py     #   Status, token counts, metrics
-│
-├── Gateway/                  # Multi-platform messaging
-│   ├── session.py            #   Multi-user session management
-│   └── platforms/            #   QQ, ACP adapters
 │
 ├── Core/                     # Shared data structures
 │   ├── Config.py             #   Typed dataclasses

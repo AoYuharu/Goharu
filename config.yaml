@@ -161,14 +161,6 @@ ui:
   show_memory_events: false
   show_actor_output: true
   show_thinking: true  # 显示模型的thinking过程
-gateway:
-  session:
-    storage_path: ./runtime_memory/gateway/sessions.json
-    group_sessions_per_user: true
-    thread_sessions_per_user: false
-    reset_mode: idle
-    reset_at_hour: 4
-    reset_idle_minutes: 1440
   acp:
     enabled: true
     host: 127.0.0.1

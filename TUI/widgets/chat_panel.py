@@ -304,7 +304,7 @@ class ChatPanel(Container):
                 if result:
                     if result.get("saved"):
                         self.add_system_message(f"✅ {result.get('message', '配置已保存')}")
-                        self.add_system_message("⚠️  部分配置需要重启 Gateway 才能生效")
+                        self.add_system_message("⚠️  部分配置需要重启应用才能生效")
                     elif "error" in result:
                         self.add_error_message(f"配置编辑失败: {result['error']}")
                     else:

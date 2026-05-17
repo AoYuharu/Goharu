@@ -38,7 +38,6 @@ from Memory.MemoryManager import MemoryManager
 from Tools.runtime import create_tool_runtime
 from Tools.tool_process_tracker import tool_process_tracker
 from configurationLoader import config
-from Gateway.session import SessionStore
 
 # Logging setup — centralized, per-module file output
 from Core.LogManager import init_logging, get_logger
@@ -95,7 +94,6 @@ class GatewaySession:
         self.memory_manager: Optional[MemoryManager] = None
         self.actor: Optional[ActorAgent] = None
         self.runtime = None
-        self.session_store: Optional[SessionStore] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._initialized = False
         self._prompt_loader = None  # Lazily initialized
@@ -240,18 +238,6 @@ class GatewaySession:
             self.actor = ActorAgent(self.runtime, self.memory_manager)
             logger.info("Agents initialized")
 
-            # Initialize session store
-            session_config = config.get("gateway.session", {})
-            self.session_store = SessionStore(
-                storage_path=session_config.get("storage_path", "./runtime_memory/gateway/sessions.json"),
-                group_sessions_per_user=session_config.get("group_sessions_per_user", True),
-                thread_sessions_per_user=session_config.get("thread_sessions_per_user", False),
-                reset_mode=session_config.get("reset_mode", "idle"),
-                reset_at_hour=session_config.get("reset_at_hour", 4),
-                reset_idle_minutes=session_config.get("reset_idle_minutes", 1440),
-            )
-            logger.info("SessionStore initialized")
-
             # Register background task completion callback for real-time TUI updates
             def _on_bg_complete(task_id, bg_result):
                 # 1. Immediately notify TUI of status change
@@ -335,18 +321,6 @@ class GatewaySession:
         try:
             # 清除上一次可能残留的中断标记
             self._interrupt_event.clear()
-
-            # Get or create session
-            from Gateway.platforms.base import SessionSource, Platform
-            source = SessionSource(
-                platform=Platform.LOCAL,
-                user_id="tui_user",
-                user_name="TUI User",
-                chat_id=session_id,
-                chat_type="private"
-            )
-
-            session = self.session_store.get_or_create_session(source)
 
             # Check for pending messages that should be merged BEFORE first step
             pending_msgs, pending_reqs = self.get_pending_messages()

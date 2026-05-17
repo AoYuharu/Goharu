@@ -1,8 +1,0 @@
-# Gateway 最小依赖（服务器端）
-pyyaml
-python-dotenv
-anthropic
-aiohttp
-httpx
-rich
-nest_asyncio
