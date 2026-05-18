@@ -304,6 +304,17 @@ class GatewaySession:
             session_id, len(message),
         )
 
+        # Emit thinking event IMMEDIATELY (before any blocking operations)
+        # so TUI shows spinner feedback right away
+        write_json({
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": "agent.thinking",
+                "payload": {}
+            }
+        })
+
         # PipelineManager: notify activity & check triggers
         if self.pipeline_manager:
             try:
@@ -312,9 +323,19 @@ class GatewaySession:
                 logger.warning(f"PipelineManager.notify_activity failed: {e}")
 
         # Periodic memory maintenance: trigger pipeline turn start (L1 check)
+        # Pass before_l1_callback to emit agent.l1_extracting event when L1 runs
         if self.pipeline_manager:
             try:
-                self.pipeline_manager.on_turn_start()
+                def _on_l1_start():
+                    write_json({
+                        "jsonrpc": "2.0",
+                        "method": "event",
+                        "params": {
+                            "type": "agent.l1_extracting",
+                            "payload": {}
+                        }
+                    })
+                self.pipeline_manager.on_turn_start(before_l1_callback=_on_l1_start)
             except Exception as e:
                 logger.warning(f"PipelineManager.on_turn_start failed: {e}")
 
@@ -346,16 +367,6 @@ class GatewaySession:
                         }
                     }
                 })
-
-            # Emit thinking event
-            write_json({
-                "jsonrpc": "2.0",
-                "method": "event",
-                "params": {
-                    "type": "agent.thinking",
-                    "payload": {}
-                }
-            })
 
             # Process with actor
             step = 0
@@ -471,6 +482,16 @@ class GatewaySession:
                 })
 
                 emit_token_stats()
+
+                # Emit LLM requesting event (before actor.act() LLM call)
+                write_json({
+                    "jsonrpc": "2.0",
+                    "method": "event",
+                    "params": {
+                        "type": "agent.llm_requesting",
+                        "payload": {}
+                    }
+                })
 
                 # Get actor response with on_tool_call_start callback
                 # This callback fires BEFORE each tool executes, allowing us

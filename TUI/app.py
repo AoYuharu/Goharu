@@ -216,6 +216,8 @@ class TableHelperTUI(App):
         self.gateway.on_event("agent.thinking", self._on_agent_thinking)
         self.gateway.on_event("agent.thinking_content", self._on_agent_thinking_content)
         self.gateway.on_event("agent.step", self._on_agent_step)
+        self.gateway.on_event("agent.l1_extracting", self._on_l1_extracting)
+        self.gateway.on_event("agent.llm_requesting", self._on_llm_requesting)
         self.gateway.on_event("agent.answer", self._on_agent_answer)
         self.gateway.on_event("agent.streaming", self._on_agent_streaming)
         self.gateway.on_event("tool.call", self._on_tool_call)
@@ -285,7 +287,12 @@ class TableHelperTUI(App):
                 if extra is not None:
                     # extra is for set_stats() call
                     status_bar.set_stats(extra)
-                elif style:
+                elif style in ("thinking", "working"):
+                    # Show spinner with label for ongoing operations
+                    status_bar.show_working(text)
+                elif style in ("success", "error", "warning", "info"):
+                    # Hide spinner and show static status
+                    status_bar.hide_working()
                     status_bar.set_status(text, style)
                 else:
                     status_bar.set_status(text)
@@ -404,6 +411,14 @@ class TableHelperTUI(App):
         # Start streaming message on main thread
         self.call_from_thread(self._do_start_assistant_message)
 
+    def _on_l1_extracting(self, payload):
+        """L1 memory extraction started (called from reader thread)"""
+        self._status_queue.put(("Querying...", "thinking", None))
+
+    def _on_llm_requesting(self, payload):
+        """LLM request being sent (called from reader thread)"""
+        self._status_queue.put(("Requesting...", "thinking", None))
+
     def _on_agent_thinking_content(self, payload):
         """Agent thinking content (called from gateway reader thread)"""
         step = payload.get("step", 0)
@@ -451,7 +466,7 @@ class TableHelperTUI(App):
         }))
 
         # Update status bar via thread-safe queue
-        self._status_queue.put((f"Calling {tool_name}...", "working", None))
+        self._status_queue.put((f"Processing: {tool_name}", "working", None))
 
     def _on_tool_result(self, payload):
         """Tool call completed (called from gateway reader thread)"""
@@ -466,8 +481,8 @@ class TableHelperTUI(App):
             "call_id": call_id,
         }))
 
-        # Update status bar via thread-safe queue
-        self._status_queue.put(("Tool finished", "success", None))
+        # Update status bar via thread-safe queue — keep spinner, next step updates it
+        self._status_queue.put(("Thinking...", "thinking", None))
 
     def _on_token_stats(self, payload):
         """Token statistics update (called from reader thread)"""
@@ -561,6 +576,7 @@ class TableHelperTUI(App):
         import threading
 
         status_bar = self.query_one(StatusBar)
+        status_bar.hide_working()
         status_bar.set_status("Interrupting...", "warning")
 
         def do_interrupt():
@@ -568,9 +584,15 @@ class TableHelperTUI(App):
                 result = self.gateway.call("agent.interrupt", {})
                 if result and not result.get("interrupted"):
                     # Agent is idle — nothing to interrupt
-                    self.call_from_thread(status_bar.set_status, "Ready", "success")
+                    def set_ready():
+                        status_bar.hide_working()
+                        status_bar.set_status("Ready", "success")
+                    self.call_from_thread(set_ready)
             except Exception:
-                self.call_from_thread(status_bar.set_status, "Ready", "success")
+                def set_ready():
+                    status_bar.hide_working()
+                    status_bar.set_status("Ready", "success")
+                self.call_from_thread(set_ready)
 
         thread = threading.Thread(target=do_interrupt, daemon=True)
         thread.start()
@@ -642,6 +664,7 @@ class TableHelperTUI(App):
 
     def _do_gateway_ready(self):
         status_bar = self.query_one(StatusBar)
+        status_bar.hide_working()
         status_bar.set_status("Gateway ready - You can start chatting!", "success")
         chat_panel = self.query_one(ChatPanel)
         chat_panel.add_system_message("Gateway is ready! You can now send messages.")
@@ -659,6 +682,7 @@ class TableHelperTUI(App):
 
     def _do_gateway_init_error(self, error_msg: str):
         status_bar = self.query_one(StatusBar)
+        status_bar.hide_working()
         status_bar.set_status(f"FATAL: {error_msg}", "error")
         chat_panel = self.query_one(ChatPanel)
         chat_panel.add_system_message("=" * 50)
@@ -668,6 +692,7 @@ class TableHelperTUI(App):
 
     def _do_agent_ready(self, tools_len: int):
         status_bar = self.query_one(StatusBar)
+        status_bar.hide_working()
         status_bar.set_status(f"Ready - {tools_len} tools", "success")
         chat_panel = self.query_one(ChatPanel)
         chat_panel.add_system_message(f"Agent ready with {tools_len} tools")
@@ -677,6 +702,7 @@ class TableHelperTUI(App):
             chat_panel = self.query_one(ChatPanel)
             chat_panel.add_assistant_message(answer)
         status_bar = self.query_one(StatusBar)
+        status_bar.hide_working()
         status_bar.set_status("Ready", "success")
 
     def _do_chat_system_message(self, msg: str):
@@ -687,6 +713,7 @@ class TableHelperTUI(App):
         chat_panel = self.query_one(ChatPanel)
         chat_panel.add_error_message(error_msg)
         status_bar = self.query_one(StatusBar)
+        status_bar.hide_working()
         status_bar.set_status(f"Error: {error_msg[:50]}", "error")
         # Auto-restart gateway if it crashed
         try:
@@ -701,10 +728,11 @@ class TableHelperTUI(App):
 
     def _do_background_started(self, bg_names: list):
         status_bar = self.query_one(StatusBar)
-        status_bar.set_status(f"BG task: {', '.join(bg_names)}", "working")
+        status_bar.show_working(f"BG task: {', '.join(bg_names)}")
 
     def _do_background_completed(self, count: int, task_ids: list):
         status_bar = self.query_one(StatusBar)
+        status_bar.hide_working()
         status_bar.set_status(f"BG tasks completed: {count}", "success")
 
     def _do_agent_interrupted(self, message: str):
@@ -713,7 +741,7 @@ class TableHelperTUI(App):
         tool_panel = self.query_one(ToolPanel)
         tool_panel.clear()
         status_bar = self.query_one(StatusBar)
-        status_bar.set_status("What should I do?", "thinking")
+        status_bar.show_working("What should I do?")
         self.query_one(ChatPanel).focus_input()
 
 

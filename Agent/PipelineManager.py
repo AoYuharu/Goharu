@@ -102,8 +102,13 @@ class PipelineManager:
             self._last_activity = time.time()
         self._restart_idle_timer()
 
-    def on_turn_start(self):
-        """每轮对话开始时的检查：触发 L1/L2 相关操作。"""
+    def on_turn_start(self, before_l1_callback=None):
+        """每轮对话开始时的检查：触发 L1/L2 相关操作。
+
+        Args:
+            before_l1_callback: Optional callback invoked before L1 extraction starts.
+                                Used by gateway_entry to emit agent.l1_extracting event.
+        """
         if not self.enabled:
             return
 
@@ -111,7 +116,7 @@ class PipelineManager:
         elapsed = time.time() - self._last_activity
         if elapsed >= self.l1_idle_timeout:
             logger.info("PipelineManager: idle timeout (%.0fs), triggering L1", elapsed)
-            self._run_l1()
+            self._trigger_l1_async(before_l1_callback=before_l1_callback)
 
         # 检查轮次计数 → 触发 L1
         self._turn_count += 1
@@ -121,7 +126,7 @@ class PipelineManager:
                 "PipelineManager: turn threshold reached (%d/%d), triggering L1",
                 self._turn_count, effective_threshold,
             )
-            self._run_l1()
+            self._trigger_l1_async(before_l1_callback=before_l1_callback)
             self._turn_count = 0
 
     def on_turn_end(self, turn_context=None):
@@ -177,11 +182,17 @@ class PipelineManager:
     # L1: Memory atom extraction
     # ------------------------------------------------------------------
 
-    def _run_l1(self):
-        """执行 L1：从工作记忆中提取记忆原子。"""
+    def _run_l1(self, before_l1_callback=None):
+        """执行 L1：从工作记忆中提取记忆原子。
+
+        Args:
+            before_l1_callback: Optional callback invoked before extraction starts.
+        """
         if self._l1_in_progress:
             logger.debug("PipelineManager: L1 already in progress, skipping")
             return
+        if before_l1_callback:
+            before_l1_callback()
         self._l1_in_progress = True
         try:
             logger.info("PipelineManager: L1 extraction started")
@@ -193,6 +204,19 @@ class PipelineManager:
             logger.warning("PipelineManager: L1 extraction failed: %s", e)
         finally:
             self._l1_in_progress = False
+
+    def _trigger_l1_async(self, before_l1_callback=None):
+        """后台触发 L1，避免阻塞主对话回路。"""
+        if self._l1_in_progress or self._shutting_down:
+            logger.debug("PipelineManager: L1 already in progress or shutting down, skip async trigger")
+            return
+        worker = threading.Thread(
+            target=self._run_l1,
+            kwargs={"before_l1_callback": before_l1_callback},
+            daemon=True,
+            name="PipelineManager-L1",
+        )
+        worker.start()
 
     def _get_existing_atoms_for_dedup(self, limit=80):
         """查询当前活跃的 L1 原子，供 summarizer 了解已有知识避免重复提取。"""
@@ -489,7 +513,7 @@ class PipelineManager:
 
     def _on_idle_timeout(self):
         logger.info("PipelineManager: idle timeout, triggering L1")
-        self._run_l1()
+        self._trigger_l1_async()
 
     def _cancel_timer(self, attr_name):
         with self._lock:
