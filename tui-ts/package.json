@@ -1,0 +1,33 @@
+{
+  "name": "goharu-tui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript TUI frontend for Goharu agent (replaces TUI/ Textual frontend)",
+  "scripts": {
+    "dev": "tsx watch src/main.tsx",
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "mock": "tsx src/main.tsx --mock",
+    "smoke": "tsx src/smoke.ts",
+    "smoke:mock": "tsx src/smoke.ts --mock",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "chalk": "^6.0.0",
+    "clipboardy": "^5.3.2",
+    "ink": "^7.1.1",
+    "ink-spinner": "^5.0.0",
+    "marked": "^15",
+    "marked-terminal": "^7.3.0",
+    "react": "^19",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.3.0",
+    "@types/react": "^19",
+    "ink-testing-library": "^4.0.0",
+    "tsx": "^4.23.12",
+    "typescript": "^5"
+  }
+}

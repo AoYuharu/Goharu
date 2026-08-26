@@ -11,3 +11,7 @@ Qwen2.5-7B-Instruct/
 *.zip
 *.log
 .pytest_cache/
+
+# TypeScript TUI
+tui-ts/node_modules/
+tui-ts/dist/

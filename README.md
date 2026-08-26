@@ -151,10 +151,15 @@ $env:ANTHROPIC_API_KEY="your-api-key-here"
 export ANTHROPIC_API_KEY="your-api-key-here"
 
 # 4. 启动
-python run_tui.py
+python run_tui.py          # Python/Textual TUI（默认）
+python run_tui_ts.py       # TypeScript/Ink TUI（新前端，需先 cd tui-ts && npm install && npm run build）
 ```
 
 base_url、模型等参数在 `config.yaml` → `model.large-language-model` 中配置。
+
+> **tui-ts**：TypeScript + Ink 实现的替代 TUI 前端（Ink 不捕获鼠标，终端原生框选复制可用）。
+> 与 Python TUI 共用同一 Gateway 后端和协议（见 `docs/tui-protocol.md`）。
+> 开发模式：`cd tui-ts && npm run dev`；离线 UI 开发：`npm run mock`。
 
 ---
 

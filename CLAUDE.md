@@ -7,6 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `pip install -r requirements.txt`
 - Run the TUI application (primary entrypoint):
   - `python run_tui.py`
+- Run the TypeScript/Ink TUI (alternative frontend, same Gateway backend):
+  - `python run_tui_ts.py` (requires `cd tui-ts && npm install && npm run build` once)
+  - Protocol contract between TUI and Gateway: `docs/tui-protocol.md`
 - TUI keyboard shortcuts:
   - `Ctrl+C` — Quit
   - `Ctrl+L` — Clear chat
