@@ -160,7 +160,9 @@ ui:
   verbose: true
   show_memory_events: false
   show_actor_output: true
-  show_thinking: true  # 显示模型的thinking过程
+  see:
+    thinking: true  # 实时展示模型 thinking 过程
+    text: true      # 实时展示模型在工具调用间的说明文字
   acp:
     enabled: true
     host: 127.0.0.1

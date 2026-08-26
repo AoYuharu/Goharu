@@ -164,8 +164,8 @@ class SceneExtractor:
         lines = []
         for atom in atoms:
             lines.append(
-                f"- [ID:{atom['id']}] ({atom.get('atom_type', 'fact')}) "
-                f"{atom.get('subject', '')}: {atom.get('canonical_text', '')}"
+                f'<atom id="{atom["id"]}" type="{atom.get("atom_type", "fact")}">'
+                f"{atom.get('subject', '')}: {atom.get('canonical_text', '')}</atom>"
             )
         return "\n".join(lines)
 

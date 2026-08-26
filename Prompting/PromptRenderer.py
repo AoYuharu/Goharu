@@ -54,7 +54,8 @@ class PromptRenderer:
         msg_id = section.metadata.get("id")
         if msg_id:
             if isinstance(content, str):
-                content = f"[ID:{msg_id}] {content}"
+                if section.kind not in {"user", "assistant"}:
+                    content = f"[ID:{msg_id}] {content}"
             elif isinstance(content, list):
                 content = [{"type": "text", "text": f"[ID:{msg_id}] "}] + list(content)
 

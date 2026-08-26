@@ -12,10 +12,16 @@ logger = logging.getLogger(__name__)
 _SKILLS_DIR = Path(__file__).parent.parent / "Skills"
 
 
+def _xml(tag, content, **attrs):
+    """Wrap content in an XML tag with optional attributes."""
+    attr_str = "".join(f' {k}="{v}"' for k, v in attrs.items() if v is not None)
+    return f"<{tag}{attr_str}>\n{content}\n</{tag}>"
+
+
 def _scan_skills():
-    skills_text = ""
+    items = []
     if not _SKILLS_DIR.is_dir():
-        return skills_text
+        return ""
     for subdir in sorted(_SKILLS_DIR.iterdir()):
         if not subdir.is_dir():
             continue
@@ -28,10 +34,10 @@ def _scan_skills():
                 continue
             name = lines[0].lstrip("#").strip()
             desc = lines[1] if len(lines) > 1 else ""
-            skills_text += f"- {name}：{desc}\n"
+            items.append(f'<skill name="{name}">\n{desc}\n</skill>')
         except Exception as exc:
             logger.warning(f"Failed to read skill {skill_file}: {exc}")
-    return skills_text
+    return "\n".join(items)
 
 
 class PromptAssembler:
@@ -54,32 +60,13 @@ class PromptAssembler:
         sections.extend(self.prompt_loader.load_system_sections(agent_key))
         return sections
 
-    # ── 静态引导语 ─────────────────────────────────────────────────
-
-    _SOUL_GUIDE = "以下是稳定角色设定 SOUL.md，请将其视为高优先级的长期风格与行为边界指导。"
-    _L3_PROFILE_GUIDE = "以下是用户画像摘要（L3/persona.md）。这是最权威的用户建模上下文，优先级高于其他记忆。"
-    _RETRIEVED_MEMORIES_GUIDE = "以下是检索到的相关记忆原子（L1）。请在相关时使用，注意这些是检索召回结果，可能不完全精确。"
-    _RETRIEVED_SCENES_GUIDE = "以下是检索到的相关场景上下文（L2）。请用于理解当前对话的主题背景和长期任务状态。"
-    _TOOL_DIRECTORY_GUIDE = "以下是当前运行时实际可用的工具目录。只有这些工具可以调用；如需调用工具，参数必须严格匹配对应 schema。"
-
-    _SKILLS_GUIDE = (
-        "## Skills 预置技能\n"
-        "Skills 是针对特殊需求的预置任务范式（SOP）。"
-        "当用户的需求无法由现有工具链直接完成（例如做一道菜、执行某个特定领域流程）时，"
-        "应调用 Skill 工具加载对应的技能说明获取完整指导。"
-        "面对包装后的大任务、工具无法一步到位时，先尝试用 Skill 检索是否有匹配的预置范式。\n"
-        "### 可用技能列表\n"
-    ) + _scan_skills()
-
-    # ── Section builders ────────────────────────────────────────────
-
     def _build_soul_section(self, soul_markdown):
         soul_text = self._normalize_text(soul_markdown)
         if not soul_text:
             return None
         return PromptSection(
             kind="system", title="soul",
-            content=f"{self._SOUL_GUIDE}\n\n{soul_text}",
+            content=_xml("soul_definition", soul_text, priority="high"),
             metadata={"section_name": "soul"},
             cache_control={"type": "ephemeral"},
         )
@@ -90,7 +77,7 @@ class PromptAssembler:
             return None
         return PromptSection(
             kind="system", title="user_profile_compact",
-            content=f"{self._L3_PROFILE_GUIDE}\n\n{summary_text}",
+            content=_xml("persona", summary_text, source="l3_pipeline", priority="highest"),
             metadata={"section_name": "user_profile_compact"},
             cache_control={"type": "ephemeral"},
         )
@@ -98,12 +85,18 @@ class PromptAssembler:
     def _build_retrieved_memories_section(self, retrieved_memories):
         if not retrieved_memories:
             return None
-        lines = []
+        items_xml = []
         for item in retrieved_memories:
             title = item.get("title") or "memory"
             text = item.get("text") or ""
-            lines.append(f"- [{title}] {text}")
-        content = self._RETRIEVED_MEMORIES_GUIDE + "\n\n" + "\n".join(lines)
+            sid = item.get("source_id", "")
+            score = item.get("score")
+            items_xml.append(_xml("memory", text,
+                id=str(sid),
+                score=f"{score:.4f}" if score is not None else None,
+                title=title))
+        content = _xml("retrieved_memories", "\n".join(items_xml),
+            type="l1", count=str(len(retrieved_memories)))
         return PromptSection(
             kind="system", title="retrieved_memories",
             content=content, metadata={"section_name": "retrieved_memories"},
@@ -113,13 +106,18 @@ class PromptAssembler:
     def _build_retrieved_scenes_section(self, retrieved_scenes):
         if not retrieved_scenes:
             return None
-        lines = []
+        items_xml = []
         for item in retrieved_scenes:
-            title = item.get("title") or "scene"
+            slug = item.get("source_id") or item.get("title") or "scene"
             summary = item.get("summary") or ""
             keywords = ", ".join(item.get("keywords") or [])
-            lines.append(f"- [{title}] {summary}" + (f" (keywords: {keywords})" if keywords else ""))
-        content = self._RETRIEVED_SCENES_GUIDE + "\n\n" + "\n".join(lines)
+            score = item.get("score")
+            items_xml.append(_xml("scene", summary,
+                slug=str(slug),
+                score=f"{score:.4f}" if score is not None else None,
+                keywords=keywords or None))
+        content = _xml("retrieved_scenes", "\n".join(items_xml),
+            type="l2", count=str(len(retrieved_scenes)))
         return PromptSection(
             kind="system", title="retrieved_scenes",
             content=content, metadata={"section_name": "retrieved_scenes"},
@@ -127,12 +125,13 @@ class PromptAssembler:
         )
 
     def _build_skills_section(self):
-        skills_text = self._SKILLS_GUIDE.strip()
-        if not skills_text:
+        skills_xml = _scan_skills()
+        if not skills_xml:
             return None
         return PromptSection(
             kind="system", title="skills",
-            content=skills_text, metadata={"section_name": "skills"},
+            content=_xml("available_skills", skills_xml),
+            metadata={"section_name": "skills"},
             cache_control={"type": "ephemeral"},
         )
 
@@ -183,8 +182,12 @@ class PromptAssembler:
             metadata = {}
             if timestamp:
                 metadata["timestamp"] = timestamp
-            if record.get("id"):
-                metadata["id"] = record.get("id")
+            msg_id = record.get("id")
+            if msg_id:
+                metadata["id"] = msg_id
+            if role in {"user", "assistant"} and isinstance(content, str):
+                tag = "user_message" if role == "user" else "assistant_message"
+                content = _xml(tag, content, id=msg_id or None)
             kwargs = dict(kind=role, title=role, content=content, metadata=metadata)
             if enable_cache:
                 kwargs["cache_control"] = {"type": "ephemeral"}
@@ -204,7 +207,13 @@ class PromptAssembler:
         L1 检索记忆 → L2 检索场景 → skills → 对话历史。
         """
         document = PromptDocument()
-        document.extend_system(self._load_agent_system_sections("actor"))
+        for section in self._load_agent_system_sections("actor"):
+            document.add_system(PromptSection(
+                kind=section.kind, title=section.title,
+                content=_xml("actor_role", section.content),
+                metadata=section.metadata,
+                cache_control=section.cache_control,
+            ))
 
         soul_section = self._build_soul_section(soul_markdown)
         if soul_section is not None:

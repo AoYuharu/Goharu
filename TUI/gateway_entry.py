@@ -3,6 +3,10 @@ TUI Gateway Entry Point
 
 JSON-RPC server over stdio for TUI communication.
 Supports message batching: pending user messages are merged before each actor step.
+
+Protocol contract (methods/events/payloads): docs/tui-protocol.md
+— consumed by both TUI/ (Python Textual) and tui-ts/ (TypeScript Ink) frontends.
+Keep all three in sync when changing the protocol.
 """
 
 import asyncio
@@ -498,6 +502,11 @@ class GatewaySession:
                 # to emit tool.call events in real-time (not after completion)
                 current_step = step  # capture for closure
 
+                # 读取 see 配置，控制哪些内容实时展示
+                see_config = config.get("ui.see", {})
+                show_thinking = see_config.get("thinking", True)
+                show_text = see_config.get("text", True)
+
                 def _on_tool_call(tool_name, tool_args, call_id="", *args):
                     write_json({
                         "jsonrpc": "2.0",
@@ -514,6 +523,8 @@ class GatewaySession:
                     })
 
                 def _on_thinking(thinking_text):
+                    if not show_thinking:
+                        return
                     write_json({
                         "jsonrpc": "2.0",
                         "method": "event",
@@ -522,6 +533,21 @@ class GatewaySession:
                             "payload": {
                                 "step": current_step,
                                 "thinking": str(thinking_text).strip()
+                            }
+                        }
+                    })
+
+                def _on_text(text_content):
+                    if not show_text:
+                        return
+                    write_json({
+                        "jsonrpc": "2.0",
+                        "method": "event",
+                        "params": {
+                            "type": "agent.text_content",
+                            "payload": {
+                                "step": current_step,
+                                "text": str(text_content).strip()
                             }
                         }
                     })
@@ -545,6 +571,7 @@ class GatewaySession:
                     on_tool_call_start=_on_tool_call,
                     on_thinking=_on_thinking,
                     on_tool_result=_on_tool_result,
+                    on_text=_on_text,
                     _interrupt_check=lambda: self._interrupt_event.is_set()
                 )
                 logger.debug(

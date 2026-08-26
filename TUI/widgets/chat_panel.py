@@ -587,6 +587,21 @@ class ChatPanel(Container):
         # Empty line for spacing
         self.chat_log.write("")
 
+    def add_text_content_message(self, text: str, step: int):
+        """Add agent text content to the chat log (during tool use steps)"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
+        header = Text()
+        header.append(f"[{timestamp}] ", style="dim")
+        header.append("Assistant", style="bold green")
+        header.append(f" (Step {step})", style="dim")
+        self.chat_log.write(header)
+
+        self.chat_log.write(Text(text))
+
+        # Empty line for spacing
+        self.chat_log.write("")
+
     def clear(self):
         """Clear the chat log"""
         self.chat_log.clear()

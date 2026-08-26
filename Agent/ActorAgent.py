@@ -18,7 +18,7 @@ from configurationLoader import config
 
 logger = logging.getLogger(__name__)
 
-# PromptRenderer 会为每条历史消息注入 [ID:msg_xxxxxxxx] 前缀（供 snip 工具使用），
+# PromptRenderer 会为每条历史消息注入 XML 标签（如 &lt;user_message id="msg_xxx"&gt;），
 # LLM 可能模仿这个格式在输出开头写入同样的 ID 标记。这里用正则剥离这些前缀。
 _ID_PREFIX_PATTERN = re.compile(r'^(\[ID:msg_[a-f0-9]+\]\s*)+')
 
@@ -262,7 +262,7 @@ class ActorAgent(LargeLanguageModel):
                 t.cancel()
             raise
 
-    async def act(self, max_retries=3, on_tool_call_start=None, on_thinking=None, on_tool_result=None, _interrupt_check=None, extra_system_prompt=None):
+    async def act(self, max_retries=3, on_tool_call_start=None, on_thinking=None, on_tool_result=None, on_text=None, _interrupt_check=None, extra_system_prompt=None):
         """
         执行一次推理，支持工具调用重试和并发执行多个工具
 
@@ -271,6 +271,7 @@ class ActorAgent(LargeLanguageModel):
             on_tool_call_start: 工具调用开始时的回调函数，接收(tool_name, args)
             on_thinking: 收到 thinking 块时立即回调，接收(thinking_text)，在工具执行前触发
             on_tool_result: 单个工具执行完成时立即回调，接收(tool_name, result_text)，不等其他工具
+            on_text: 收到 text 块时立即回调，接收(text_content)，在工具执行前触发
             _interrupt_check: 可选中断检查回调，返回 True 表示用户请求了中断
             extra_system_prompt: 额外的系统提示词（如 Snip 提醒），注入到本步 prompt 中
         """
@@ -303,10 +304,11 @@ class ActorAgent(LargeLanguageModel):
         return await self._act_with_native_tools(
             max_retries, on_tool_call_start, messages, anthropic_tools,
             on_thinking=on_thinking, on_tool_result=on_tool_result,
+            on_text=on_text,
             _interrupt_check=_interrupt_check
         )
 
-    async def _act_with_native_tools(self, max_retries=3, on_tool_call_start=None, messages=None, _reuse_tools=None, on_thinking=None, on_tool_result=None, _auto_continue_count=0, _interrupt_check=None):
+    async def _act_with_native_tools(self, max_retries=3, on_tool_call_start=None, messages=None, _reuse_tools=None, on_thinking=None, on_tool_result=None, on_text=None, _auto_continue_count=0, _interrupt_check=None):
         """
         使用 Anthropic 原生工具调用格式
 
@@ -378,6 +380,14 @@ class ActorAgent(LargeLanguageModel):
             if thinking_text:
                 on_thinking(thinking_text)
 
+        # 立即通过回调发出 text（在工具执行之前）
+        # 仅在伴随工具调用时发出：纯文本响应会作为 answer 返回，
+        # 若此时也发 text_content，同一段文本会在前端渲染两次。
+        if text_content and on_text and tool_use_blocks:
+            text_str = _strip_id_prefixes("\n".join(text_content).strip())
+            if text_str:
+                on_text(text_str)
+
         # ── max_tokens 截断自动续写 ──────────────────────
         MAX_AUTO_CONTINUE = 2
         stop_reason = getattr(response, "stop_reason", None)
@@ -399,6 +409,7 @@ class ActorAgent(LargeLanguageModel):
                 max_retries, on_tool_call_start, new_messages,
                 _reuse_tools=_reuse_tools,
                 on_thinking=on_thinking, on_tool_result=on_tool_result,
+                on_text=on_text,
                 _auto_continue_count=_auto_continue_count + 1,
                 _interrupt_check=_interrupt_check
             )
@@ -433,7 +444,7 @@ class ActorAgent(LargeLanguageModel):
                 return result
             # 空响应，重试
             if max_retries > 0:
-                return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check)
+                return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, on_text=on_text, _interrupt_check=_interrupt_check)
             raise ValueError("模型返回空响应")
 
         # 并发执行所有工具调用
@@ -549,7 +560,7 @@ class ActorAgent(LargeLanguageModel):
                 }],
             })
 
-            return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, _interrupt_check=_interrupt_check)
+            return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, on_text=on_text, _interrupt_check=_interrupt_check)
 
         # 记录所有成功的工具调用到 working memory
         # Separate backgrounded results from synchronous results

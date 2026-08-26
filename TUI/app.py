@@ -215,6 +215,7 @@ class TableHelperTUI(App):
         self.gateway.on_event("agent.ready", self._on_agent_ready)
         self.gateway.on_event("agent.thinking", self._on_agent_thinking)
         self.gateway.on_event("agent.thinking_content", self._on_agent_thinking_content)
+        self.gateway.on_event("agent.text_content", self._on_agent_text_content)
         self.gateway.on_event("agent.step", self._on_agent_step)
         self.gateway.on_event("agent.l1_extracting", self._on_l1_extracting)
         self.gateway.on_event("agent.llm_requesting", self._on_llm_requesting)
@@ -431,6 +432,18 @@ class TableHelperTUI(App):
         """Display thinking in chat (runs on main thread)"""
         chat_panel = self.query_one(ChatPanel)
         chat_panel.add_thinking_message(thinking, step)
+
+    def _on_agent_text_content(self, payload):
+        """Agent text content during tool use (called from gateway reader thread)"""
+        step = payload.get("step", 0)
+        text = payload.get("text", "")
+        if text:
+            self.call_from_thread(self._do_add_text_content, text, step)
+
+    def _do_add_text_content(self, text: str, step: int):
+        """Display text content in chat during tool use (runs on main thread)"""
+        chat_panel = self.query_one(ChatPanel)
+        chat_panel.add_text_content_message(text, step)
 
     def _on_agent_step(self, payload):
         """Agent is processing a step (called from reader thread)"""

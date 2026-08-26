@@ -219,7 +219,7 @@ registry.register(
     name="snip",
     description=(
         "删除对话历史中指定 ID 的消息，释放上下文空间。"
-        "传入一个或多个消息 ID（从历史消息的 [ID:xxx] 前缀获取），"
+        "传入一个或多个消息 ID（从历史消息的 user_message/assistant_message XML 标签的 id 属性中获取），"
         "工具会永久移除这些消息。"
     ),
     arguments_schema={
