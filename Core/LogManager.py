@@ -57,9 +57,7 @@ class LogManager:
         "Tools.task_guide": "tools",
         "Tools.tool_process_tracker": "tools",
         "Tools.platform_utils": "tools",
-        # Gateway / TUI
-        "TUI.gateway_entry": "gateway",
-        "TUI": "gateway",
+        # Gateway
         "Gateway": "gateway",
         # Prompting
         "Prompting": "agent",

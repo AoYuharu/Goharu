@@ -6,9 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Install dependencies from the checked-in requirements file:
   - `pip install -r requirements.txt`
 - Run the TUI application (primary entrypoint):
-  - `python run_tui.py`
-- Run the TypeScript/Ink TUI (alternative frontend, same Gateway backend):
-  - `python run_tui_ts.py` (requires `cd tui-ts && npm install && npm run build` once)
+  - `python run_tui_ts.py` (TypeScript/Ink TUI; requires `cd tui-ts && npm install && npm run build` once)
+  - The legacy Python/Textual TUI lives on the `python` branch.
   - Protocol contract between TUI and Gateway: `docs/tui-protocol.md`
 - TUI keyboard shortcuts:
   - `Ctrl+C` — Quit
@@ -24,9 +23,9 @@ The agent uses a simple ReAct loop: the actor calls tools step by step, then gen
 
 ## Architecture
 
-- `run_tui.py` is the primary runtime entrypoint.
-  - Launches a Textual TUI (`TUI/app.py`) which starts the agent backend as a subprocess (`TUI/gateway_entry.py`) and communicates via JSON-RPC over stdio.
-  - `TUI/gateway_entry.py` initializes `MemoryManager`, `ActorAgent`, and the in-process tool runtime, then runs the agent loop in `GatewaySession.process_message()`.
+- `run_tui_ts.py` is the primary runtime entrypoint.
+  - Launches the TypeScript TUI (`tui-ts/`, Ink) which starts the agent backend as a subprocess (`Gateway/gateway_entry.py`) and communicates via JSON-RPC over stdio.
+  - `Gateway/gateway_entry.py` initializes `MemoryManager`, `ActorAgent`, and the in-process tool runtime, then runs the agent loop in `GatewaySession.process_message()`.
   - The shared agent execution loop (`Agent/agent_loop.py`) is used by the Gateway path (`Gateway/agent_bridge.py`).
 
 - `Agent/LargeLanguageModel.py` is a thin wrapper over the singleton `Agent/LLMCore.py`.
@@ -90,7 +89,7 @@ The agent uses a simple ReAct loop: the actor calls tools step by step, then gen
 
 - `config.yaml` controls model paths, memory paths and retention, tool settings, and the retained embedding/rerank settings for the unused RAG shell. The checked-in paths are Windows-specific absolute local paths.
 - This repository is centered on local agent/runtime code. Fine-tuning scripts and runtime LoRA loading have been removed.
-- `run_tui.py` is the active execution mode: TUI-based multi-step agent workflow with actor/memory management
+- `run_tui_ts.py` is the active execution mode: TUI-based multi-step agent workflow with actor/memory management
 
 ## 开发理念
 - **模块化**：将代码分解为独立的模块和类，以便于理解和维护与后期延展

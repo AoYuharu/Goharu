@@ -2,7 +2,7 @@
 /**
  * Mock gateway for offline TUI development.
  *
- * Speaks the same NDJSON JSON-RPC protocol as TUI/gateway_entry.py.
+ * Speaks the same NDJSON JSON-RPC protocol as Gateway/gateway_entry.py.
  * Modes:
  *   (default)             ready → on send_message replay a scripted event sequence
  *   --die-before-ready    exit(1) immediately with stderr noise

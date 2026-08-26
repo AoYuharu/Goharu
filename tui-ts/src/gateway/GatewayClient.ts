@@ -1,8 +1,8 @@
 /**
  * GatewayClient — manages the gateway subprocess and NDJSON JSON-RPC transport.
  *
- * Port of TUI/gateway_client.py semantics:
- * - spawn `python -u TUI/gateway_entry.py` with cwd=project root, PYTHONIOENCODING=utf-8
+ * Port of the legacy Python gateway client (formerly TUI/gateway_client.py):
+ * - spawn `python -u Gateway/gateway_entry.py` with cwd=project root, PYTHONIOENCODING=utf-8
  * - NDJSON line protocol over stdout; stderr captured to ring buffer + log file
  * - request/response correlation by id with 30s timeout
  * - crash semantics: EOF before `gateway.ready` → synthesize `gateway.init_error`;
@@ -98,7 +98,7 @@ export class GatewayClient extends EventEmitter {
     const command = this.mock ? process.execPath : (process.env.PYTHON ?? "python");
     const args = this.mock
       ? [path.join(PROJECT_ROOT, "tui-ts", "test", "mock-gateway.mjs"), ...this.mockArgs]
-      : ["-u", path.join(PROJECT_ROOT, "TUI", "gateway_entry.py")];
+      : ["-u", path.join(PROJECT_ROOT, "Gateway", "gateway_entry.py")];
     const env = { ...process.env, PYTHONIOENCODING: "utf-8" };
 
     log("INFO", `Starting gateway: ${command} ${args.join(" ")}`);

@@ -1,12 +1,12 @@
 """
-TUI Gateway Entry Point
+Gateway Entry Point — agent backend subprocess.
 
 JSON-RPC server over stdio for TUI communication.
 Supports message batching: pending user messages are merged before each actor step.
 
 Protocol contract (methods/events/payloads): docs/tui-protocol.md
-— consumed by both TUI/ (Python Textual) and tui-ts/ (TypeScript Ink) frontends.
-Keep all three in sync when changing the protocol.
+— consumed by the tui-ts/ (TypeScript Ink) frontend. Keep both in sync
+when changing the protocol.
 """
 
 import asyncio

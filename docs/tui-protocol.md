@@ -1,7 +1,7 @@
 # TUI ↔ Gateway 协议契约
 
-前端（`TUI/` Python Textual 或 `tui-ts/` TypeScript Ink）与后端 Gateway
-（`TUI/gateway_entry.py` 子进程）之间的通信协议。**两侧修改协议时必须同步更新本文档。**
+前端（`tui-ts/` TypeScript Ink）与后端 Gateway
+（`Gateway/gateway_entry.py` 子进程）之间的通信协议。**两侧修改协议时必须同步更新本文档。**
 
 TS 侧类型定义：`tui-ts/src/gateway/protocol.ts`（discriminated union，编译期穷尽检查）。
 
@@ -54,7 +54,7 @@ TS 侧类型定义：`tui-ts/src/gateway/protocol.ts`（discriminated union，�
 
 ## 进程管理约定
 
-- 启动：`python -u TUI/gateway_entry.py`，cwd=项目根，env `PYTHONIOENCODING=utf-8`
+- 启动：`python -u Gateway/gateway_entry.py`，cwd=项目根，env `PYTHONIOENCODING=utf-8`
 - 崩溃语义：stdout EOF 发生在 `gateway.ready` 之前 → 客户端合成 `gateway.init_error`；之后 → 合成 `agent.error`；主动 kill 两者都不发
 - 客户端 5s 心跳检查子进程存活，死亡自动重启
 - Windows 强杀：`taskkill /pid <pid> /T /F`（杀整个进程树）

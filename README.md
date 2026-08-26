@@ -54,7 +54,7 @@
 
 #### 架构总览
 
-Goharu 采用分层架构。入口为 `run_tui.py`（终端 TUI），通过 JSON-RPC 与 Gateway 后端通信，Gateway 将请求转发给 Actor Agent。Agent 运行 ReAct 循环（思考 → 工具 → 观察 → 回答），内部由 PromptAssembler → LLMCore → ToolRuntime 串联。下层依赖三大系统：工具层（9 个内置模块）、记忆系统（L0→L3 金字塔 + 混合检索）、子 Agent（探索/规划/验证）。
+Goharu 采用分层架构。入口为 `run_tui_ts.py`（终端 TUI），通过 JSON-RPC 与 Gateway 后端通信，Gateway 将请求转发给 Actor Agent。Agent 运行 ReAct 循环（思考 → 工具 → 观察 → 回答），内部由 PromptAssembler → LLMCore → ToolRuntime 串联。下层依赖三大系统：工具层（9 个内置模块）、记忆系统（L0→L3 金字塔 + 混合检索）、子 Agent（探索/规划/验证）。
 
 #### 记忆金字塔
 
@@ -104,13 +104,13 @@ Goharu/
 │   ├── PromptLoader.py       #   加载 Markdown 提示词模板
 │   └── PromptRenderer.py     #   渲染 PromptDocument → LLM 消息
 │
-├── TUI/                      # 终端用户界面 (Textual)
-│   ├── app.py                #   主 TUI 应用
-│   ├── gateway_entry.py      #   后端子进程入口
-│   └── widgets/
-│       ├── chat_panel.py     #   流式消息展示
-│       ├── tool_panel.py     #   实时工具调用与结果视图
-│       └── status_bar.py     #   状态栏、Token 统计
+├── tui-ts/                   # 终端用户界面 (TypeScript + Ink)
+│   ├── src/components/       #   App/ChatLog/StatusBar/InputBar 等组件
+│   ├── src/gateway/          #   GatewayClient（子进程 + NDJSON 协议）
+│   └── test/                 #   mock gateway + UI 冒烟测试
+│
+├── Gateway/                  # 后端 Gateway 子进程入口
+│   └── gateway_entry.py      #   JSON-RPC over stdio，初始化 Agent/记忆/工具
 │
 ├── Core/                     # 共享数据结构
 │   ├── Config.py             #   类型化数据类
@@ -121,7 +121,7 @@ Goharu/
 ├── prompts/                  # Markdown 提示词模板
 ├── config.yaml               # 主配置文件
 ├── requirements.txt          # Python 依赖
-└── run_tui.py                # ▶ 主入口
+└── run_tui_ts.py             # ▶ 主入口
 ```
 
 ---
@@ -151,13 +151,13 @@ $env:ANTHROPIC_API_KEY="your-api-key-here"
 export ANTHROPIC_API_KEY="your-api-key-here"
 
 # 4. 启动
-python run_tui.py          # Python/Textual TUI（默认）
-python run_tui_ts.py       # TypeScript/Ink TUI（新前端，需先 cd tui-ts && npm install && npm run build）
+python run_tui_ts.py       # TypeScript/Ink TUI（需先 cd tui-ts && npm install && npm run build）
 ```
 
 base_url、模型等参数在 `config.yaml` → `model.large-language-model` 中配置。
 
-> **tui-ts**：TypeScript + Ink 实现的替代 TUI 前端（Ink 不捕获鼠标，终端原生框选复制可用）。
+> **tui-ts**：TypeScript + Ink 实现的 TUI 前端（Ink 不捕获鼠标，终端原生框选复制可用）。
+> 旧版 Python/Textual TUI 保留在 `python` 分支。
 > 与 Python TUI 共用同一 Gateway 后端和协议（见 `docs/tui-protocol.md`）。
 > 开发模式：`cd tui-ts && npm run dev`；离线 UI 开发：`npm run mock`。
 
@@ -167,7 +167,7 @@ base_url、模型等参数在 `config.yaml` → `model.large-language-model` 中
 
 #### TUI 界面
 
-TUI 采用左右分栏布局：左侧为对话面板（流式消息、思考过程、最终回答），右侧为工具面板（实时工具调用、执行结果、错误、后台任务状态）。底部状态栏显示连接状态、工具数量和 Token 统计。
+TUI 为单栏对话流布局：消息、思考过程、工具调用与结果、最终回答按时间顺序滚动展示；底部状态栏显示连接状态和 Token 统计。
 
 | 快捷键 | 功能 |
 |---|---|
@@ -236,7 +236,7 @@ Goharu 在本地运行所有工具，带**多层安全体系**：
 
 #### Architecture at a Glance
 
-Goharu uses a layered architecture. The entry point is `run_tui.py` (terminal TUI), which communicates with the Gateway backend via JSON-RPC. The Gateway routes requests to the Actor Agent. The Agent runs a ReAct loop (Think → Tools → Observe → Answer), internally wired as PromptAssembler → LLMCore → ToolRuntime. Three downstream systems support it: the Tools layer (9 built-in modules), the Memory system (L0→L3 pyramid + hybrid retrieval), and Sub-Agents (explore/plan/verify).
+Goharu uses a layered architecture. The entry point is `run_tui_ts.py` (terminal TUI), which communicates with the Gateway backend via JSON-RPC. The Gateway routes requests to the Actor Agent. The Agent runs a ReAct loop (Think → Tools → Observe → Answer), internally wired as PromptAssembler → LLMCore → ToolRuntime. Three downstream systems support it: the Tools layer (9 built-in modules), the Memory system (L0→L3 pyramid + hybrid retrieval), and Sub-Agents (explore/plan/verify).
 
 #### Memory Pyramid
 
@@ -286,13 +286,13 @@ Goharu/
 │   ├── PromptLoader.py       #   Loads markdown prompt templates
 │   └── PromptRenderer.py     #   Renders PromptDocument → LLM messages
 │
-├── TUI/                      # Terminal User Interface (Textual)
-│   ├── app.py                #   Main TUI application
-│   ├── gateway_entry.py      #   Backend subprocess entry
-│   └── widgets/
-│       ├── chat_panel.py     #   Streaming message display
-│       ├── tool_panel.py     #   Real-time tool call & result view
-│       └── status_bar.py     #   Status, token counts, metrics
+├── tui-ts/                   # Terminal User Interface (TypeScript + Ink)
+│   ├── src/components/       #   App/ChatLog/StatusBar/InputBar components
+│   ├── src/gateway/          #   GatewayClient (subprocess + NDJSON protocol)
+│   └── test/                 #   mock gateway + UI smoke tests
+│
+├── Gateway/                  # Backend Gateway subprocess entry
+│   └── gateway_entry.py      #   JSON-RPC over stdio, boots Agent/memory/tools
 │
 ├── Core/                     # Shared data structures
 │   ├── Config.py             #   Typed dataclasses
@@ -303,7 +303,7 @@ Goharu/
 ├── prompts/                  # Markdown prompt templates
 ├── config.yaml               # Main configuration
 ├── requirements.txt          # Python dependencies
-└── run_tui.py                # ▶ Primary entry point
+└── run_tui_ts.py             # ▶ Primary entry point
 ```
 
 ---
@@ -333,7 +333,7 @@ $env:ANTHROPIC_API_KEY="your-api-key-here"
 export ANTHROPIC_API_KEY="your-api-key-here"
 
 # 4. Launch
-python run_tui.py
+python run_tui_ts.py
 ```
 
 The base URL, model, and other parameters are configured in `config.yaml` → `model.large-language-model`.
