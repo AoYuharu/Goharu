@@ -95,7 +95,8 @@ class SceneExtractor:
             )
             return created_slugs
         except Exception as e:
-            logger.warning("SceneExtractor: LLM call failed: %s", e)
+            # 注意：异常不一定来自 LLM 调用——场景文件写入/索引阶段的错误也会走到这里
+            logger.warning("SceneExtractor: extraction failed: %s", e, exc_info=True)
             return []
 
     def _sync_sqlite_from_disk(self):

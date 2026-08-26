@@ -66,13 +66,20 @@ class SceneFileManager:
         return scenes
 
     def read_scene(self, slug):
-        """读取指定 slug 的场景文件，返回 (meta dict, body text) 或 (None, None)。"""
+        """读取指定 slug 的场景文件，返回 (meta dict, body text) 或 (None, None)。
+
+        注意：write_scene 落盘时会把 'slug' 从 frontmatter 剔除（存为 scene_id），
+        因此这里读回后必须把 slug 重新注入 meta，否则调用方拿着这份 meta 再去
+        write_scene 会触发 "Scene meta must contain 'slug'"。
+        """
         path = self._path_for(slug)
         if not path.exists():
             return None, None
         text = path.read_text(encoding="utf-8")
         meta = self.parse_meta(text)
         body = self._strip_meta(text)
+        if meta is not None:
+            meta["slug"] = slug
         return meta, body
 
     def write_scene(self, meta, body):

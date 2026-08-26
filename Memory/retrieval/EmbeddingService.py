@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import math
 import os
 from datetime import datetime
@@ -7,6 +8,9 @@ from pathlib import Path
 
 from Memory.MemoryDB import MemoryDB
 from configurationLoader import config
+
+logger = logging.getLogger(__name__)
+_hash_fallback_warned = False
 
 
 class EmbeddingService:
@@ -275,6 +279,10 @@ class EmbeddingService:
     def cosine_similarity(self, left, right):
         if not left or not right:
             return 0.0
+        if len(left) != len(right):
+            # 维度不一致说明混入了 hash 兜底向量（64 维），
+            # 截断比较会产生无意义分数，直接判为不相关
+            return 0.0
         size = min(len(left), len(right))
         if size == 0:
             return 0.0
@@ -292,6 +300,13 @@ class EmbeddingService:
 
     @staticmethod
     def _hash_embedding(text, dim=64):
+        global _hash_fallback_warned
+        if not _hash_fallback_warned:
+            _hash_fallback_warned = True
+            logger.warning(
+                "EmbeddingService: falling back to hash embedding (64-dim, non-semantic). "
+                "Vector search quality is degraded — check llama_cpp / sentence_transformers / remote provider."
+            )
         digest = hashlib.sha256(text.encode("utf-8")).digest()
         numbers = list(digest)
         vector = []
