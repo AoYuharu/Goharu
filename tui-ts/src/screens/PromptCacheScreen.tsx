@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import { getCachedPrompts, touchPrompt, removePrompt, type CacheEntry } from "../promptCache.js";
 
@@ -12,8 +12,17 @@ export function PromptCacheScreen({
   onSelect: (text: string) => void;
   onClose: () => void;
 }) {
-  const [entries, setEntries] = useState<CacheEntry[]>(() => getCachedPrompts());
+  const [entries, setEntries] = useState<CacheEntry[]>([]);
   const [index, setIndex] = useState(0);
+
+  // The component stays mounted while inactive — reload entries every time
+  // the screen opens, otherwise the list is frozen at app-start state.
+  useEffect(() => {
+    if (active) {
+      setEntries(getCachedPrompts());
+      setIndex(0);
+    }
+  }, [active]);
 
   useInput((input, key) => {
     if (key.escape) {

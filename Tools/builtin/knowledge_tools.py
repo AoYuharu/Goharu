@@ -5,7 +5,6 @@
 """
 
 import json
-import time
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
@@ -456,7 +455,7 @@ class KnowledgeTools:
         index_file.write_text("\n".join(lines), encoding='utf-8')
 
 
-# 导出工具函数供MCP使用
+# 导出工具函数供 core_tools 注册使用
 def add_insight(**kwargs):
     """添加研究洞察"""
     return KnowledgeTools.add_insight(**kwargs)

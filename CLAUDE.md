@@ -26,7 +26,6 @@ The agent uses a simple ReAct loop: the actor calls tools step by step, then gen
 - `run_tui_ts.py` is the primary runtime entrypoint.
   - Launches the TypeScript TUI (`tui-ts/`, Ink) which starts the agent backend as a subprocess (`Gateway/gateway_entry.py`) and communicates via JSON-RPC over stdio.
   - `Gateway/gateway_entry.py` initializes `MemoryManager`, `ActorAgent`, and the in-process tool runtime, then runs the agent loop in `GatewaySession.process_message()`.
-  - The shared agent execution loop (`Agent/agent_loop.py`) is used by the Gateway path (`Gateway/agent_bridge.py`).
 
 - `Agent/LargeLanguageModel.py` is a thin wrapper over the singleton `Agent/LLMCore.py`.
   - `LargeLanguageModel.query()` delegates to `LLMCore.generate()`.
@@ -51,7 +50,6 @@ The agent uses a simple ReAct loop: the actor calls tools step by step, then gen
   - **Security layer**: `Tools/security.py` implements command safety checks for `run_cmd`
   - **Dangerous commands blocked**: shutdown, restart, rm -rf, del /s, format, diskpart, reg delete, etc.
   - **Configuration**: Security settings in `config.yaml` under `tools.security`
-  - **Testing**: Run `python test_command_security.py` to verify security checks (100% pass rate)
 
 - File operation tools (`Tools/builtin/file_tools.py`):
   - **Write**: Create new files (fails if file exists)
@@ -79,15 +77,13 @@ The agent uses a simple ReAct loop: the actor calls tools step by step, then gen
   - Cache TTL: 5 minutes (Anthropic default)
   - Expected benefits: ~85-90% cost reduction on cached tokens, faster first-token latency
   - Implementation: `cache_control: {"type": "ephemeral"}` on PromptSection `→` PromptRenderer `→` LLMCore (Anthropic path only)
-  - Test: Run `python test_multilevel_cache.py` to verify caching strategy
 
-- Retrieval/RAG code exists, but it is not integrated into the main agent flow.
-  - `MCP/RAG.py` contains standalone embedding, Milvus, and reranking code.
+- Retrieval is handled by `Memory/retrieval/HybridRetriever.py` (FTS5 + embedding + BM25 → RRF fusion) and is integrated into the main flow via `MemoryManager.retrieve_prompt_memory()`.
   - The knowledge tools (`Tools/builtin/knowledge_tools.py`) provide the interface to the knowledge management system.
 
 ## Important repository specifics
 
-- `config.yaml` controls model paths, memory paths and retention, tool settings, and the retained embedding/rerank settings for the unused RAG shell. The checked-in paths are Windows-specific absolute local paths.
+- `config.yaml` controls model paths, memory paths and retention, tool settings, and retrieval/embedding settings. The checked-in paths are Windows-specific absolute local paths.
 - This repository is centered on local agent/runtime code. Fine-tuning scripts and runtime LoRA loading have been removed.
 - `run_tui_ts.py` is the active execution mode: TUI-based multi-step agent workflow with actor/memory management
 

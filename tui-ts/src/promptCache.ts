@@ -7,7 +7,13 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import path from "node:path";
 import { PROJECT_ROOT } from "./gateway/GatewayClient.js";
 
-const CACHE_FILE = path.join(PROJECT_ROOT, "runtime_memory", "prompt_cache.json");
+const DEFAULT_CACHE_FILE = path.join(PROJECT_ROOT, "runtime_memory", "prompt_cache.json");
+/** Test isolation: GOHARU_PROMPT_CACHE overrides the cache file location. */
+function cacheFile(): string {
+  return process.env.GOHARU_PROMPT_CACHE
+    ? path.resolve(process.env.GOHARU_PROMPT_CACHE)
+    : DEFAULT_CACHE_FILE;
+}
 const MIN_LENGTH = 15;
 const MAX_ENTRIES = 5;
 
@@ -17,9 +23,10 @@ export interface CacheEntry {
 }
 
 function loadCache(): CacheEntry[] {
-  if (!existsSync(CACHE_FILE)) return [];
+  const file = cacheFile();
+  if (!existsSync(file)) return [];
   try {
-    const data = JSON.parse(readFileSync(CACHE_FILE, "utf8"));
+    const data = JSON.parse(readFileSync(file, "utf8"));
     if (Array.isArray(data)) {
       return data.filter((e) => e && typeof e.text === "string");
     }
@@ -28,8 +35,9 @@ function loadCache(): CacheEntry[] {
 }
 
 function saveCache(cache: CacheEntry[]): void {
-  mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
-  writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
+  const file = cacheFile();
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify(cache, null, 2), "utf8");
 }
 
 export function detectAndCache(message: string): void {

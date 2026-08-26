@@ -7,8 +7,14 @@
  */
 import React from "react";
 import { render } from "ink-testing-library";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+// Isolate prompt cache from the real user data BEFORE App/promptCache load.
+const TEST_CACHE = join(tmpdir(), `goharu_prompt_cache_test_${process.pid}.json`);
+process.env.GOHARU_PROMPT_CACHE = TEST_CACHE;
+
 import { App } from "../src/components/App.js";
 import { PROJECT_ROOT } from "../src/gateway/GatewayClient.js";
 
@@ -93,7 +99,7 @@ async function main() {
     stdin.write("\r");
     await sleep(300);
     try {
-      const raw = readFileSync(join(PROJECT_ROOT, "runtime_memory", "prompt_cache.json"), "utf8");
+      const raw = readFileSync(TEST_CACHE, "utf8");
       check(raw.includes("足够长的测试消息"), "long prompt cached to prompt_cache.json");
     } catch {
       check(false, "long prompt cached to prompt_cache.json");
@@ -132,6 +138,7 @@ async function main() {
   }
 
   unmount();
+  try { rmSync(TEST_CACHE); } catch { /* ignore */ }
   console.log(failed ? "RESULT: FAIL" : "RESULT: PASS");
   process.exit(failed ? 1 : 0);
 }
