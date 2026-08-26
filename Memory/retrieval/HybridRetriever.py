@@ -1,3 +1,6 @@
+import json
+import time
+
 from Memory.MemoryDB import MemoryDB
 from Memory.repositories.L1Repository import L1Repository
 from Memory.repositories.L2Repository import L2Repository
@@ -25,6 +28,9 @@ class HybridRetriever:
         self.default_query_window = int(config.get("memory.retrieval.query_window_messages", 6))
         self._scene_file_manager = None
         self._persona_generator = None
+        # BM25 IDF 缓存：条目数变化或超过 60s 才重建
+        self._bm25_idf_count = -1
+        self._bm25_idf_time = 0.0
 
     @property
     def scene_file_manager(self):
@@ -122,20 +128,25 @@ class HybridRetriever:
             "SELECT source_table, source_id, vector_blob FROM embeddings WHERE model_name = ?",
             (self.embedding_service.model_name,),
         )
+        # 先算分再 hydrate：避免对全表每行做一次 get_atom/get_scene SQL（N+1），
+        # 向量也直接解码行内 blob，不再走 get_embedding 的二次查询
         scored = []
         for row in rows:
-            vector = self.embedding_service.get_embedding(row["source_table"], row["source_id"])
+            try:
+                vector = json.loads(bytes(row["vector_blob"]).decode("utf-8"))
+            except Exception:
+                continue
             similarity = self.embedding_service.cosine_similarity(query_vector, vector)
             if similarity <= 0.0:
                 continue
-            candidate = self._hydrate_candidate(row["source_table"], row["source_id"])
+            scored.append((similarity, row["source_table"], row["source_id"]))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        results = []
+        for rank, (similarity, source_table, source_id) in enumerate(scored[: int(top_k)], start=1):
+            candidate = self._hydrate_candidate(source_table, source_id)
             if candidate is None:
                 continue
             candidate["embedding_similarity"] = similarity
-            scored.append(candidate)
-        scored.sort(key=lambda item: item.get("embedding_similarity", 0.0), reverse=True)
-        results = []
-        for rank, candidate in enumerate(scored[: int(top_k)], start=1):
             candidate["embedding_rank"] = rank
             candidate["score"] = candidate.get("score", 0.0) + self._rank_to_score(rank)
             results.append(candidate)
@@ -144,24 +155,28 @@ class HybridRetriever:
     def _bm25_search(self, query, top_k=8):
         """Sparse BM25 vector search using stored term-frequency vectors.
 
-        Loads all BM25 entries from the database, builds IDF from the
-        document collection, encodes the query, and scores every document.
+        IDF 按语料缓存：条目数变化或超过 60s 才重建，避免每次查询全量重算。
         """
         entries = self.db.get_all_bm25_entries()
         if not entries:
             return []
 
-        # Build IDF from all stored document vectors
-        all_doc_vectors = []
-        for entry in entries:
-            tf = self.db.loads_json(entry["term_freq_json"], default={})
-            if tf:
-                all_doc_vectors.append(tf)
+        now = time.time()
+        if (
+            self._bm25_idf_count != len(entries)
+            or now - self._bm25_idf_time > 60
+        ):
+            all_doc_vectors = []
+            for entry in entries:
+                tf = self.db.loads_json(entry["term_freq_json"], default={})
+                if tf:
+                    all_doc_vectors.append(tf)
+            if not all_doc_vectors:
+                return []
+            self.bm25.fit_idf(all_doc_vectors)
+            self._bm25_idf_count = len(entries)
+            self._bm25_idf_time = now
 
-        if not all_doc_vectors:
-            return []
-
-        self.bm25.fit_idf(all_doc_vectors)
         query_vec = self.bm25.encode_query(query)
         if not query_vec:
             return []

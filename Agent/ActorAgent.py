@@ -121,6 +121,36 @@ class ActorAgent(LargeLanguageModel):
     def build_messages(self, extra_system_prompt=None):
         return self.build_messages_with_document(extra_system_prompt)["messages"]
 
+    @staticmethod
+    def _truncate_history(history, max_messages):
+        """保留最近 N 条消息，防止上下文随会话无限膨胀。
+
+        截断必须保持 tool_use/tool_result 配对完整：若截断点落在
+        assistant tool_use 与其 user tool_result 之间，首条消息会是
+        孤立的 tool_result（配对的 tool_use 已被截掉），Anthropic API
+        会直接报 400——因此持续丢弃首部的孤立 tool_result 消息。
+        """
+        if max_messages <= 0 or len(history) <= max_messages:
+            return history
+        trimmed = history[-max_messages:]
+        dropped_pairs = 0
+        while trimmed:
+            first = trimmed[0]
+            content = first.get("content") if isinstance(first, dict) else None
+            has_tool_result = isinstance(content, list) and any(
+                isinstance(block, dict) and block.get("type") == "tool_result"
+                for block in content
+            )
+            if not has_tool_result:
+                break
+            trimmed = trimmed[1:]
+            dropped_pairs += 1
+        logger.info(
+            "Context truncation: %d → %d messages (dropped %d orphan tool_result)",
+            len(history), len(trimmed), dropped_pairs,
+        )
+        return trimmed
+
     def build_messages_with_document(self, extra_system_prompt=None):
         tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
 
@@ -138,8 +168,13 @@ class ActorAgent(LargeLanguageModel):
             except Exception:
                 retrieval_pack = None
 
+        history = self._truncate_history(
+            self.working.get_context(),
+            int(configurationLoader.config.get("agent.max_context_messages", 0) or 0),
+        )
+
         document = self.prompt_assembler.build_actor_document(
-            history=self.working.get_context(),
+            history=history,
             soul_markdown=self.working.get_soul_markdown(),
             extra_system_prompt=extra_system_prompt,
             tool_definitions=tool_definitions,

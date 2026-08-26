@@ -10,6 +10,7 @@ Trigger model:
   L3: 每50条新L1原子 / 首次提取 / LLM显式请求
 """
 
+import json
 import logging
 import os
 import threading
@@ -20,6 +21,9 @@ from pathlib import Path
 from configurationLoader import config
 
 logger = logging.getLogger(__name__)
+
+_STATE_PATH = Path(config.get("memory.root_dir", "./runtime_memory")) / ".pipeline_state.json"
+_MAX_DAY_ATTEMPTS = 3  # 过期日 summarize 连续空结果的重试上限
 
 
 class PipelineManager:
@@ -146,7 +150,32 @@ class PipelineManager:
             self._warmup_threshold = 1
             self._turn_count = 0
             self._new_l1_atoms_since_l3 = 0
+        # 会话清除后，L1 增量游标也要重置，否则新会话的消息会被跳过
+        self._save_state({})
         logger.info("PipelineManager: warmup reset (threshold=1)")
+
+    # ------------------------------------------------------------------
+    # Persistent pipeline state (L1 增量游标、过期日重试计数)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_state():
+        try:
+            if _STATE_PATH.exists():
+                data = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+    @staticmethod
+    def _save_state(state):
+        try:
+            _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _STATE_PATH.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            logger.debug("PipelineManager: failed to save state: %s", e)
 
     def shutdown(self):
         """优雅关闭：取消所有定时器。"""
@@ -263,26 +292,76 @@ class PipelineManager:
 
         logger.info("PipelineManager: summarizing day %s (%d messages)", target_day, len(history))
         summary = self.summarizer.summarize_day(history, {}, existing_atoms=existing_atoms)
-        mm.working.delete_day(target_day)
+        db_atoms = summary.get("atoms") or []
 
-        # DB pipeline: feed atoms to L1
-        if self._db_pipeline_enabled():
-            db_atoms = summary.get("atoms") or []
-            if db_atoms:
+        if db_atoms:
+            # 提取出原子才删除原始消息；空结果保留数据下轮重试
+            mm.working.delete_day(target_day)
+            state = self._load_state()
+            state.get("day_attempts", {}).pop(target_day, None)
+            self._save_state(state)
+            if self._db_pipeline_enabled():
                 self._ingest_atoms(db_atoms)
+            return
+
+        # summarize 返回空 atoms：不删除原始数据，记录重试次数
+        state = self._load_state()
+        attempts = state.setdefault("day_attempts", {})
+        attempts[target_day] = int(attempts.get(target_day, 0)) + 1
+        self._save_state(state)
+        if attempts[target_day] >= _MAX_DAY_ATTEMPTS:
+            logger.warning(
+                "PipelineManager: day %s produced no atoms after %d attempts, "
+                "deleting raw messages (content likely non-memorable)",
+                target_day, attempts[target_day],
+            )
+            mm.working.delete_day(target_day)
+            attempts.pop(target_day, None)
+            self._save_state(state)
+        else:
+            logger.info(
+                "PipelineManager: day %s produced no atoms (attempt %d/%d), keeping raw messages",
+                target_day, attempts[target_day], _MAX_DAY_ATTEMPTS,
+            )
 
     def _extract_from_current_messages(self, messages, existing_atoms=None):
-        """从当前对话消息中提取 L1 原子（当无过期天数时）。"""
+        """从当前对话消息中提取 L1 原子（当无过期天数时）。
+
+        增量提取：以上次处理到的消息 id 为游标，只处理新消息，
+        避免每个触发周期对同样的最近 40 条重复 summarize。
+        """
         mm = self.memory_manager
         if mm is None:
             return
 
         try:
+            state = self._load_state()
+            last_id = state.get("last_extracted_msg_id")
+            if last_id:
+                idx = next(
+                    (i for i, m in enumerate(messages)
+                     if isinstance(m, dict) and m.get("id") == last_id),
+                    None,
+                )
+                if idx is not None:
+                    messages = messages[idx + 1:]
+                # 游标消息不在当前上下文（被 compact/clear 掉）→ 回退到最近 40 条
+
+            if not messages:
+                logger.info("PipelineManager: no new messages since last L1, skipping")
+                return
+
             recent = messages[-40:] if len(messages) > 40 else messages
             summary = self.summarizer.summarize_day(recent, {}, existing_atoms=existing_atoms)
             db_atoms = summary.get("atoms") or []
             if db_atoms and self._db_pipeline_enabled():
                 self._ingest_atoms(db_atoms)
+
+            # 无论是否产出原子都推进游标（这批消息已经看过）
+            last_msg = recent[-1]
+            if isinstance(last_msg, dict) and last_msg.get("id"):
+                state["last_extracted_msg_id"] = last_msg["id"]
+                self._save_state(state)
         except Exception as e:
             logger.warning("PipelineManager: current message extraction failed: %s", e)
 
