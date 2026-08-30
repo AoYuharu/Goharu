@@ -22,8 +22,13 @@ export interface UpdateConfigResult { success: boolean; key: string; old_value: 
 
 export interface HistoryMessage {
   role: string;
-  content: string;
-  type: string; // "text" | "tool_call" | "tool_result"
+  kind: "text" | "thinking" | "tool";
+  text?: string;
+  tool?: string;
+  args?: string;
+  args_full?: string;
+  result?: string | null;
+  is_error?: boolean;
   timestamp: string;
 }
 export interface GetHistoryResult { messages: HistoryMessage[] }
@@ -42,6 +47,16 @@ export type MethodName = keyof RpcMethods;
 // ── Events (gateway → client) ───────────────────────────────────────
 
 export interface ToolCallSummary { tool_name?: string; arguments?: unknown }
+
+export interface SubagentUpdatePayload {
+  agent_id: string;
+  agent_type: string;
+  task: string;
+  kind: "started" | "activity" | "finished";
+  level: "info" | "warning" | "error" | "debug";
+  message: string;
+  status?: "success" | "partial" | "error";
+}
 
 export type GatewayEvent =
   | { type: "gateway.ready"; payload: Record<string, never> }
@@ -67,7 +82,8 @@ export type GatewayEvent =
   | { type: "task.background.started"; payload: { tool_calls: ToolCallSummary[] } }
   | { type: "task.background.completed"; payload: { count: number; task_ids: number[] } }
   | { type: "task.background.status"; payload: { pending_results: number } & Record<string, unknown> }
-  | { type: "command.complete"; payload: { command: string; success: boolean; error?: string } };
+  | { type: "command.complete"; payload: { command: string; success: boolean; error?: string } }
+  | { type: "subagent.update"; payload: SubagentUpdatePayload };
 
 export type GatewayEventType = GatewayEvent["type"];
 export type GatewayEventPayload<T extends GatewayEventType> =

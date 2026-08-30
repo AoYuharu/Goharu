@@ -60,6 +60,8 @@ export function TextInput({
       return;
     }
     if (!input) return;
+    // Ignore unparsed escape sequences (e.g. mouse report fragments)
+    if (input.includes("\x1b")) return;
 
     const clean = input.replace(/[\r\n]+/g, " ");
     const next = value.slice(0, cursorOffset) + clean + value.slice(cursorOffset);

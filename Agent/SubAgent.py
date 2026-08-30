@@ -303,9 +303,16 @@ class SubAgent:
         )
 
     def _notify(self, message: str, level: str = "info"):
-        """通知输出消息"""
+        """通知输出消息（结构化 payload，供 Gateway 转发 TUI）"""
         if self.output_callback:
-            self.output_callback(message, level)
+            self.output_callback({
+                "agent_id": self.agent_id,
+                "agent_type": self.agent_type,
+                "task": self.task,
+                "kind": "activity",
+                "level": level,
+                "message": message,
+            })
 
     def _build_anthropic_tools(self) -> List[Dict[str, Any]]:
         """构建 Anthropic 原生格式的工具定义"""

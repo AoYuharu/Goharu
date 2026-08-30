@@ -1,24 +1,39 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Box, Static, Text, useApp, useInput } from "ink";
+import { Box, Text, useApp, useInput } from "ink";
 import Spinner from "ink-spinner";
+import chalk from "chalk";
 import clipboardy from "clipboardy";
 import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { GatewayClient, PROJECT_ROOT } from "../gateway/GatewayClient.js";
 import type { HistoryMessage } from "../gateway/protocol.js";
 import { formatTokens, nowHHMMSS } from "../format.js";
-import { MessageItem, type ChatMessage } from "./MessageItem.js";
+import { wrappedMessageLines, type ChatMessage } from "./MessageItem.js";
 import { StatusBar, type StatusState, type StatusType, type TokenStats } from "./StatusBar.js";
 import { InputBar } from "./InputBar.js";
 import { CommandSuggestions } from "./CommandSuggestions.js";
+import {
+  ToolDetailPanel,
+  formatArgsBrief,
+  formatArgsFull,
+  makeSummary,
+  toolDetailLines,
+  TOOL_PANEL_ROWS,
+  type ToolHistoryEntry,
+} from "./ToolDetailPanel.js";
+import { SubagentBar, type SubagentInfo } from "./SubagentBar.js";
+import { setMouseEnabled } from "../mouse.js";
+import { debugLog } from "../debugLog.js";
 import { filterCommands, HELP_LINES } from "../commands.js";
 import { detectAndCache } from "../promptCache.js";
 import { TextViewerScreen } from "../screens/TextViewer.js";
 import { PromptCacheScreen } from "../screens/PromptCacheScreen.js";
 import { PromptEditorScreen } from "../screens/PromptEditorScreen.js";
 import { ConfigEditorScreen } from "../screens/ConfigEditorScreen.js";
+import { SubagentScreen } from "../screens/SubagentScreen.js";
 
-type ScreenName = "textviewer" | "promptcache" | "prompteditor" | "config";
+type ScreenName = "textviewer" | "promptcache" | "prompteditor" | "config" | "subagent";
+type BrowseMode = "none" | "agents";
 
 let nextId = 1;
 
@@ -29,18 +44,8 @@ interface LiveTool {
   callId: string;
   tool: string;
   args: string;
+  argsFull: string;
   step: number;
-}
-
-function summarizeArgs(args: unknown, max = 120): string {
-  let rendered: string;
-  try {
-    rendered = JSON.stringify(args) ?? String(args);
-  } catch {
-    rendered = String(args);
-  }
-  const compact = rendered.replace(/\s+/g, " ").trim();
-  return compact.length <= max ? compact : compact.slice(0, max - 3) + "...";
 }
 
 const SPLASH: Array<{ text: string; color?: string }> = [
@@ -87,7 +92,7 @@ function parseTs(raw: string | undefined): string {
   return nowHHMMSS();
 }
 
-const HISTORY_REPLAY_LIMIT = 5;
+const HISTORY_REPLAY_FALLBACK = 20;
 const SESSION_ID = "default";
 
 export function App({ mock = false }: { mock?: boolean }) {
@@ -99,11 +104,35 @@ export function App({ mock = false }: { mock?: boolean }) {
   const [inputValue, setInputValue] = useState("");
   const [selIndex, setSelIndex] = useState(0);
   const [screen, setScreen] = useState<ScreenName | null>(null);
+  const [browseMode, setBrowseMode] = useState<BrowseMode>("none");
+  const [toolHistory, setToolHistory] = useState<ToolHistoryEntry[]>([]);
+  const [detailToolId, setDetailToolId] = useState<number | null>(null);
+  const [detailScroll, setDetailScroll] = useState(0);
+  const [subagents, setSubagents] = useState<SubagentInfo[]>([]);
+  const [agentSel, setAgentSel] = useState(0);
+  const [selectedAgentId, setSelectedAgentId] = useState<string>("main");
   const liveToolsRef = useRef<LiveTool[]>([]);
   const gatewayRef = useRef<GatewayClient | null>(null);
   const answerRenderedRef = useRef(false);
   const lastAssistantRef = useRef("");
   const historyRef = useRef<string[]>([]);
+  // Chat viewport: app-managed scrolling (replaces terminal scrollback)
+  const [scroll, setScroll] = useState<{ pinned: boolean; top: number }>({ pinned: false, top: 0 });
+  const [hoverId, setHoverId] = useState<number | null>(null);
+  const scrollRef = useRef(scroll);
+  scrollRef.current = scroll;
+  const hoverRef = useRef<number | null>(null);
+  hoverRef.current = hoverId;
+  // Mouse hit-map: viewport row → line owner (rebuilt every render)
+  const layoutRef = useRef<{
+    top: number;
+    viewH: number;
+    maxTop: number;
+    lines: Array<{ id: number; kind: string }>;
+  }>({ top: 0, viewH: 1, maxTop: 0, lines: [] });
+  const clickHandlerRef = useRef<(x: number, y: number) => void>(() => {});
+  const detailIdRef = useRef<number | null>(null);
+  detailIdRef.current = detailToolId;
 
   const addMsg = (msg: NewMessage & { ts?: string }) =>
     setMessages((prev) => [...prev, { ...msg, id: nextId++, ts: msg.ts ?? nowHHMMSS() } as ChatMessage]);
@@ -115,30 +144,62 @@ export function App({ mock = false }: { mock?: boolean }) {
 
   const replayMessages = (all: HistoryMessage[]) => {
     const add = addRef.current;
-    const chatOnly = all.filter(
-      (m) => m.type === "text" && (m.role === "user" || m.role === "assistant") && m.content,
-    );
-    if (!chatOnly.length) {
+    // 优先回放今天的全部条目，让界面"好像从未关闭"；跨天无内容时回退最近 N 条
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const todayPrefix = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+    let entries = all.filter((m) => (m.timestamp ?? "").startsWith(todayPrefix));
+    let truncated = 0;
+    if (entries.length === 0 && all.length > 0) {
+      entries = all.slice(-HISTORY_REPLAY_FALLBACK);
+      truncated = all.length - entries.length;
+    }
+    if (entries.length === 0) {
       add({ kind: "system", text: "--- No history to restore ---" });
       return;
     }
-    let slice = chatOnly;
-    if (chatOnly.length > HISTORY_REPLAY_LIMIT) {
-      add({ kind: "system", text: `(更久远的对话... ${chatOnly.length - HISTORY_REPLAY_LIMIT} messages)` });
-      slice = chatOnly.slice(-HISTORY_REPLAY_LIMIT);
+    if (truncated > 0) {
+      add({ kind: "system", text: `(更久远的对话... ${truncated} entries)` });
     }
-    slice.forEach((m, i) => {
+    entries.forEach((m, i) => {
       setTimeout(() => {
         const ts = parseTs(m.timestamp);
-        if (m.role === "user") {
-          add({ kind: "user", text: m.content, ts });
-          historyRef.current.push(`[${ts}] You: ${m.content}`);
+        if (m.kind === "thinking") {
+          add({ kind: "thinking", text: m.text ?? "", step: 0, ts });
+        } else if (m.kind === "tool") {
+          const result = m.result ?? "(no result recorded)";
+          const { summary, isError } = makeSummary(result);
+          add({
+            kind: "tool",
+            tool: m.tool ?? "?",
+            args: m.args ?? "",
+            argsFull: m.args_full ?? m.args ?? "",
+            result,
+            isError: Boolean(m.is_error) || isError,
+            ts,
+          });
+          setToolHistory((prev) => [
+            ...prev.slice(-49),
+            {
+              callId: `replay_${m.timestamp}_${m.tool ?? ""}`,
+              tool: m.tool ?? "?",
+              args: m.args ?? "",
+              argsFull: m.args_full ?? m.args ?? "",
+              result,
+              isError: Boolean(m.is_error) || isError,
+              ts,
+              summary,
+            },
+          ]);
+        } else if (m.role === "user") {
+          add({ kind: "user", text: m.text ?? "", ts });
+          historyRef.current.push(`[${ts}] You: ${m.text ?? ""}`);
         } else {
-          lastAssistantRef.current = m.content;
-          historyRef.current.push(`[${ts}] Assistant:\n${m.content}`);
-          add({ kind: "assistant", text: m.content, ts });
+          lastAssistantRef.current = m.text ?? "";
+          historyRef.current.push(`[${ts}] Assistant:\n${m.text ?? ""}`);
+          add({ kind: "assistant", text: m.text ?? "", ts });
         }
-      }, 60 * (i + 1));
+      }, 30 * (i + 1));
     });
   };
 
@@ -186,7 +247,8 @@ export function App({ mock = false }: { mock?: boolean }) {
       const entry: LiveTool = {
         callId,
         tool: String(p.tool ?? "unknown"),
-        args: summarizeArgs(p.arguments),
+        args: formatArgsBrief(p.arguments),
+        argsFull: formatArgsFull(p.arguments),
         step: Number(p.step ?? 0),
       };
       liveToolsRef.current = [...liveToolsRef.current.filter((t) => t.callId !== callId), entry];
@@ -198,9 +260,47 @@ export function App({ mock = false }: { mock?: boolean }) {
       const t = liveToolsRef.current.find((x) => x.callId === callId);
       liveToolsRef.current = liveToolsRef.current.filter((x) => x.callId !== callId);
       setLiveTools(liveToolsRef.current);
-      if (t) {
-        add({ kind: "tool", tool: t.tool, args: t.args, result: String(p.result ?? "") });
-      }
+      const result = String(p.result ?? "");
+      const toolName = t?.tool ?? String(p.tool ?? "unknown");
+      const argsBrief = t?.args ?? "";
+      const argsFull = t?.argsFull ?? "";
+      const { summary, isError } = makeSummary(result);
+      setToolHistory((prev) => [
+        ...prev.slice(-49),
+        { callId, tool: toolName, args: argsBrief, argsFull, result, isError, ts: nowHHMMSS(), summary },
+      ]);
+      add({ kind: "tool", tool: toolName, args: argsBrief, argsFull, result, isError });
+    });
+    gw.on("subagent.update", (p) => {
+      setSubagents((prev) => {
+        const idx = prev.findIndex((a) => a.agentId === p.agent_id);
+        let next: SubagentInfo[];
+        if (p.kind === "started" || idx < 0) {
+          const info: SubagentInfo = {
+            agentId: p.agent_id,
+            agentType: p.agent_type,
+            task: p.task,
+            status: p.kind === "finished" ? p.status ?? "success" : "running",
+            startedAtMs: Date.now(),
+            activities: [{ level: p.level, message: p.message }],
+          };
+          next = idx >= 0 ? prev.map((a, i) => (i === idx ? info : a)) : [...prev, info];
+        } else {
+          next = prev.map((a, i) => {
+            if (i !== idx) return a;
+            const activities = [...a.activities.slice(-99), { level: p.level, message: p.message }];
+            return p.kind === "finished"
+              ? { ...a, activities, status: p.status ?? "success" }
+              : { ...a, activities };
+          });
+        }
+        // Prune oldest finished agents beyond 10 (running agents never pruned)
+        const finishedIdxs = next
+          .map((a, i) => (a.status !== "running" ? i : -1))
+          .filter((i) => i >= 0);
+        if (finishedIdxs.length > 10) next.splice(finishedIdxs[0], 1);
+        return next;
+      });
     });
     gw.on("token.stats", (p) => {
       setStats({
@@ -257,7 +357,17 @@ export function App({ mock = false }: { mock?: boolean }) {
     return () => gw.stop();
   }, [mock]);
 
+  // Re-render on terminal resize (screen is cleared in main.tsx before render)
+  useEffect(() => {
+    const onResize = () => setScroll((s) => ({ ...s }));
+    process.stdout.on("resize", onResize);
+    return () => {
+      process.stdout.off("resize", onResize);
+    };
+  }, []);
+
   const quit = () => {
+    setMouseEnabled(false);
     gatewayRef.current?.stop();
     exit();
   };
@@ -266,6 +376,13 @@ export function App({ mock = false }: { mock?: boolean }) {
     clearTerminal();
     setMessages([]);
     historyRef.current = [];
+    setToolHistory([]);
+    setSubagents([]);
+    setBrowseMode("none");
+    setDetailToolId(null);
+    setDetailScroll(0);
+    setScroll({ pinned: false, top: 0 });
+    setHoverId(null);
     setStatus({ kind: "static", text: "Chat cleared", type: "success" });
     gatewayRef.current
       ?.call("agent.clear_session", { session_id: SESSION_ID })
@@ -302,6 +419,73 @@ export function App({ mock = false }: { mock?: boolean }) {
       else addRef.current({ kind: "system", text: "No assistant message to view" });
       return;
     }
+    // Swallow leaked mouse-report fragments (parsed by mouse.ts separately)
+    if (input.includes("\x1b[<")) return;
+    // ── Browse modes own all keys (Esc exits mode, never interrupts) ──
+    if (detailToolId !== null) {
+      // Tool detail panel open: arrows scroll, Esc closes
+      const detailMsg = messages.find((m) => m.id === detailToolId);
+      const width = Math.max(20, (process.stdout.columns || 80) - 2);
+      const lineCount =
+        detailMsg && detailMsg.kind === "tool"
+          ? toolDetailLines(
+              {
+                tool: detailMsg.tool,
+                argsBrief: detailMsg.args,
+                argsFull: detailMsg.argsFull ?? detailMsg.args,
+                result: detailMsg.result,
+                isError: detailMsg.isError,
+                ts: detailMsg.ts,
+              },
+              width,
+            ).length
+          : 0;
+      const maxScroll = Math.max(0, lineCount - (TOOL_PANEL_ROWS - 3));
+      if (key.escape) {
+        setDetailToolId(null);
+        return;
+      }
+      if (key.upArrow) {
+        setDetailScroll((s) => Math.max(0, s - 1));
+        return;
+      }
+      if (key.downArrow) {
+        setDetailScroll((s) => Math.min(maxScroll, s + 1));
+        return;
+      }
+      if (key.pageUp) {
+        setDetailScroll((s) => Math.max(0, s - 10));
+        return;
+      }
+      if (key.pageDown) {
+        setDetailScroll((s) => Math.min(maxScroll, s + 10));
+        return;
+      }
+      return;
+    }
+    if (browseMode === "agents") {
+      const rowCount = 1 + subagents.length;
+      if (key.escape) {
+        setBrowseMode("none");
+        return;
+      }
+      if (key.upArrow) {
+        setAgentSel((i) => Math.max(0, i - 1));
+        return;
+      }
+      if (key.downArrow) {
+        setAgentSel((i) => Math.min(Math.max(0, rowCount - 1), i + 1));
+        return;
+      }
+      if (key.return) {
+        setSelectedAgentId(agentSel === 0 ? "main" : subagents[agentSel - 1]?.agentId ?? "main");
+        setBrowseMode("none");
+        setScreen("subagent");
+        return;
+      }
+      return;
+    }
+
     if (inputValue.startsWith("/") && suggestions.length > 0) {
       if (key.upArrow) {
         setSelIndex((i) => (i - 1 + suggestions.length) % suggestions.length);
@@ -316,6 +500,21 @@ export function App({ mock = false }: { mock?: boolean }) {
         setSelIndex(0);
         return;
       }
+    }
+    if (inputValue === "") {
+      if (key.downArrow && subagents.length > 0) {
+        setAgentSel(0);
+        setBrowseMode("agents");
+        return;
+      }
+    }
+    if (key.pageUp || key.pageDown) {
+      const L = layoutRef.current;
+      const cur = scrollRef.current;
+      const base = cur.pinned ? cur.top : L.maxTop;
+      const next = Math.max(0, Math.min(L.maxTop, base + (key.pageUp ? -L.viewH : L.viewH)));
+      setScroll({ pinned: next < L.maxTop, top: next });
+      return;
     }
     if (key.escape) {
       interrupt();
@@ -425,11 +624,105 @@ export function App({ mock = false }: { mock?: boolean }) {
     return `✅ ${key} = ${JSON.stringify(value)}（旧值: ${JSON.stringify(r.old_value)}）`;
   };
 
+  // ── Chat viewport geometry (deterministic: every line is pre-wrapped) ──
+  const width = Math.max(20, process.stdout.columns || 80);
+  const termRows = process.stdout.rows || 24;
+  let bottomRows = 0;
+  if (screen === null) {
+    if (liveTools.length > 0) bottomRows += liveTools.length;
+    if (subagents.length > 0 || browseMode === "agents")
+      bottomRows += browseMode === "agents" ? subagents.length + 2 : 1;
+    if (suggestions.length > 0) bottomRows += suggestions.length + 2; // border box
+    if (detailToolId !== null) bottomRows += TOOL_PANEL_ROWS;
+    if (scroll.pinned) bottomRows += 1; // "scrolled up" hint
+    bottomRows += 2; // StatusBar + InputBar
+  }
+  const viewH = Math.max(3, termRows - bottomRows);
+
+  const allLines: Array<{ id: number; kind: string; text: string }> = [];
+  for (const m of messages) {
+    for (const text of wrappedMessageLines(m, width)) {
+      allLines.push({ id: m.id, kind: m.kind, text });
+    }
+  }
+  const maxTop = Math.max(0, allLines.length - viewH);
+  const effTop = scroll.pinned ? Math.min(scroll.top, maxTop) : maxTop;
+  const visibleLines = allLines.slice(effTop, effTop + viewH);
+  layoutRef.current = {
+    top: effTop,
+    viewH,
+    maxTop,
+    lines: allLines.map((l) => ({ id: l.id, kind: l.kind })),
+  };
+
+  const scrollChatBy = (delta: number) => {
+    const cur = scrollRef.current;
+    const base = cur.pinned ? cur.top : layoutRef.current.maxTop;
+    const next = Math.max(0, Math.min(layoutRef.current.maxTop, base + delta));
+    setScroll({ pinned: next < layoutRef.current.maxTop, top: next });
+  };
+
+  clickHandlerRef.current = (_x, y) => {
+    const layout = layoutRef.current;
+    if (y < 1 || y > layout.viewH) {
+      debugLog("click", `@y=${y} outside viewport (viewH=${layout.viewH}) — ignored`);
+      return;
+    }
+    const line = layout.lines[layout.top + (y - 1)];
+    debugLog("click", `@y=${y} → line[${layout.top + (y - 1)}] kind=${line?.kind ?? "none"} id=${line?.id ?? "-"}`);
+    if (line && line.kind === "tool") {
+      setDetailScroll(0);
+      setDetailToolId((cur) => (cur === line.id ? null : line.id));
+    }
+  };
+
+  // Mouse reporting: active only on the main chat view (screens need native selection)
+  useEffect(() => {
+    setMouseEnabled(
+      screen === null,
+      (x, y) => clickHandlerRef.current(x, y),
+      (dir, _x, y) => {
+        const layout = layoutRef.current;
+        if (y > layout.viewH) {
+          // Over bottom UI: wheel scrolls the open detail panel
+          if (detailIdRef.current !== null) {
+            setDetailScroll((s) => Math.max(0, s + (dir === "up" ? -3 : 3)));
+          }
+          return;
+        }
+        scrollChatBy(dir === "up" ? -3 : 3);
+      },
+      (_x, y) => {
+        const layout = layoutRef.current;
+        let id: number | null = null;
+        if (y >= 1 && y <= layout.viewH) {
+          const line = layout.lines[layout.top + (y - 1)];
+          if (line && line.kind === "tool") id = line.id;
+        }
+        if (hoverRef.current !== id) {
+          debugLog("hover", `@y=${y} → toolId=${id ?? "-"}`);
+          hoverRef.current = id;
+          setHoverId(id);
+        }
+      },
+    );
+  }, [screen]);
+  useEffect(() => () => setMouseEnabled(false), []);
+
   return (
     <Box flexDirection="column">
-      <Static items={messages}>
-        {(msg) => <MessageItem key={msg.id} msg={msg} />}
-      </Static>
+      {screen === null && (
+        <Box flexDirection="column" height={viewH} overflow="hidden">
+          {visibleLines.map((l, i) => (
+            <Text key={effTop + i} wrap="truncate">
+              {l.id === hoverId && l.kind === "tool" ? chalk.inverse(l.text) : l.text}
+            </Text>
+          ))}
+        </Box>
+      )}
+      {screen === null && scroll.pinned && (
+        <Text dimColor>↑ scrolled — wheel/PgDn to bottom to follow</Text>
+      )}
       {screen === null && liveTools.length > 0 && (
         <Box flexDirection="column">
           {liveTools.map((t) => (
@@ -439,10 +732,30 @@ export function App({ mock = false }: { mock?: boolean }) {
           ))}
         </Box>
       )}
+      {screen === null && (subagents.length > 0 || browseMode === "agents") && (
+        <SubagentBar agents={subagents} selectMode={browseMode === "agents"} selIndex={agentSel} />
+      )}
       {screen === null && <CommandSuggestions suggestions={suggestions} selectedIndex={selIndex} />}
       {screen === null && <StatusBar status={status} stats={stats} />}
+      {screen === null && detailToolId !== null && (() => {
+        const m = messages.find((x) => x.id === detailToolId);
+        if (!m || m.kind !== "tool") return null;
+        return (
+          <ToolDetailPanel
+            data={{
+              tool: m.tool,
+              argsBrief: m.args,
+              argsFull: m.argsFull ?? m.args,
+              result: m.result,
+              isError: m.isError,
+              ts: m.ts,
+            }}
+            scroll={detailScroll}
+          />
+        );
+      })()}
       {screen === null && (
-        <InputBar value={inputValue} onChange={setInputValue} onSubmit={onSubmit} focus />
+        <InputBar value={inputValue} onChange={setInputValue} onSubmit={onSubmit} focus={browseMode === "none"} />
       )}
       <TextViewerScreen
         active={screen === "textviewer"}
@@ -468,6 +781,16 @@ export function App({ mock = false }: { mock?: boolean }) {
         onClose={() => setScreen(null)}
         onSave={saveConfig}
         onResult={(msg) => addRef.current({ kind: "system", text: msg })}
+      />
+      <SubagentScreen
+        active={screen === "subagent"}
+        agent={
+          selectedAgentId === "main"
+            ? null
+            : subagents.find((a) => a.agentId === selectedAgentId) ?? null
+        }
+        mainTools={toolHistory}
+        onClose={() => setScreen(null)}
       />
     </Box>
   );

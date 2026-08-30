@@ -278,6 +278,18 @@ class GatewaySession:
             BackgroundTaskManager().register_callback(_on_bg_complete)
             logger.info("Background task completion callback registered")
 
+            # Wire subagent (AgentDelegate) lifecycle/activity events to TUI
+            from Tools.builtin import agent_delegate as _agent_delegate
+
+            def _on_subagent_event(payload: dict):
+                write_json({
+                    "jsonrpc": "2.0", "method": "event",
+                    "params": {"type": "subagent.update", "payload": payload},
+                })
+
+            _agent_delegate._manager.set_output_callback(_on_subagent_event)
+            logger.info("Subagent output callback registered")
+
             self._initialized = True
             logger.info("Gateway session initialized successfully")
 
@@ -949,62 +961,103 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             }
 
         elif method == "agent.get_history":
-            """获取聊天历史记录"""
-            history = _session.memory_manager.get_context()
-            # 序列化为可传输的格式（只保留 role 和 content）
-            serialized = []
-            for msg in history:
-                if isinstance(msg, dict):
-                    # Skip context-only messages (internal system messages)
-                    if CoreMessage.is_context_only(msg):
-                        continue
-                    role = msg.get("role", "unknown")
-                    content = msg.get("content", "")
-                    msg_type = "text"  # 标记消息类型，TUI 据此渲染
+            """获取聊天历史记录（结构化回放条目：text/thinking/tool）。
 
-                    if isinstance(content, list):
-                        # Anthropic 原生 content list 格式
-                        parts = []
-                        has_tool_use = False
-                        has_tool_result = False
-                        for item in content:
-                            if not isinstance(item, dict):
-                                continue
-                            block_type = item.get("type")
-                            if block_type == "text":
-                                parts.append(item.get("text", ""))
-                            elif block_type == "thinking":
-                                parts.append(f"[思考] {item.get('thinking', '')}")
-                            elif block_type == "tool_use":
-                                tool_name = item.get("name", "?")
-                                tool_input = item.get("input", {})
-                                # 精简参数显示
-                                args_brief = ", ".join(
-                                    f"{k}={str(v)[:80]}"
-                                    for k, v in (tool_input.items() if isinstance(tool_input, dict) else {})
-                                )
-                                parts.append(f"> tool: {tool_name}({args_brief})")
-                                has_tool_use = True
-                            elif block_type == "tool_result":
-                                result_content = item.get("content", "")
-                                if isinstance(result_content, str):
-                                    parts.append(result_content[:500])
-                                elif isinstance(result_content, list):
-                                    for rc in result_content:
-                                        if isinstance(rc, dict) and rc.get("type") == "text":
-                                            parts.append(rc.get("text", "")[:500])
-                                has_tool_result = True
-                        content = "\n".join(p for p in parts if p)
-                        if has_tool_use:
-                            msg_type = "tool_call"
-                        elif has_tool_result:
-                            msg_type = "tool_result"
-                    serialized.append({
-                        "role": role,
-                        "content": str(content)[:1000],
-                        "type": msg_type,
-                        "timestamp": msg.get("timestamp", ""),
-                    })
+            tool_use 与其后的 tool_result 按 tool_use_id 配对回填，
+            使 TUI 能以与实时一致的形态（折叠工具行、thinking 块）重建界面。
+            """
+            history = _session.memory_manager.get_context()
+            serialized = []
+            pending_tools = {}  # tool_use_id → 已追加的 tool 条目（等待结果回填）
+
+            for msg in history:
+                if not isinstance(msg, dict):
+                    continue
+                # Skip context-only messages (internal system messages)
+                if CoreMessage.is_context_only(msg):
+                    continue
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                ts = msg.get("timestamp", "")
+
+                if isinstance(content, str):
+                    if content.strip():
+                        serialized.append({
+                            "role": role, "kind": "text",
+                            "text": content, "timestamp": ts,
+                        })
+                    continue
+                if not isinstance(content, list):
+                    continue
+
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    block_type = item.get("type")
+                    if block_type == "text":
+                        text = item.get("text", "")
+                        if text.strip():
+                            serialized.append({
+                                "role": role, "kind": "text",
+                                "text": text, "timestamp": ts,
+                            })
+                    elif block_type == "thinking":
+                        thinking = item.get("thinking", "")
+                        if thinking.strip():
+                            serialized.append({
+                                "role": role, "kind": "thinking",
+                                "text": thinking[:4000], "timestamp": ts,
+                            })
+                    elif block_type == "tool_use":
+                        tool_input = item.get("input", {})
+                        # 极简显示：只列参数值（逗号分隔），不带参数名
+                        if isinstance(tool_input, dict):
+                            args_brief = ", ".join(
+                                (str(v)[:24] + "…") if len(str(v)) > 24 else str(v)
+                                for v in tool_input.values()
+                            )
+                        else:
+                            args_brief = str(tool_input)[:40]
+                        entry = {
+                            "role": "assistant", "kind": "tool",
+                            "tool": item.get("name", "?"),
+                            "args": args_brief,
+                            "args_full": json.dumps(tool_input, ensure_ascii=False, indent=2)[:2000],
+                            "result": None,
+                            "is_error": False,
+                            "timestamp": ts,
+                        }
+                        serialized.append(entry)
+                        pending_tools[item.get("id", "")] = entry
+                    elif block_type == "tool_result":
+                        result_content = item.get("content", "")
+                        if isinstance(result_content, str):
+                            result_text = result_content
+                        elif isinstance(result_content, list):
+                            result_text = "\n".join(
+                                rc.get("text", "")
+                                for rc in result_content
+                                if isinstance(rc, dict) and rc.get("type") == "text"
+                            )
+                        else:
+                            result_text = str(result_content)
+                        entry = pending_tools.pop(item.get("tool_use_id", ""), None)
+                        if entry is not None:
+                            entry["result"] = result_text[:4000]
+                            entry["is_error"] = bool(item.get("is_error"))
+                        else:
+                            serialized.append({
+                                "role": role, "kind": "tool",
+                                "tool": "?", "args": "",
+                                "result": result_text[:4000],
+                                "is_error": bool(item.get("is_error")),
+                                "timestamp": ts,
+                            })
+
+            # 会话中断残留的 tool_use（无结果）
+            for entry in pending_tools.values():
+                entry["result"] = "(no result — session interrupted)"
+
             return {
                 "jsonrpc": "2.0",
                 "result": {"messages": serialized},

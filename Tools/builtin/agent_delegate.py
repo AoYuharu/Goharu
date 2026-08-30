@@ -92,13 +92,16 @@ class AgentDelegateManager:
                 self.running_agents[agent_type_lower] = max(0, self.running_agents[agent_type_lower] - 1)
 
     def set_output_callback(self, callback):
-        """设置输出回调函数"""
+        """设置输出回调函数，callback(payload: dict)"""
         self.output_callback = callback
 
-    def notify_output(self, message: str, level: str = "info"):
-        """通知输出消息"""
+    def notify_output(self, payload: dict):
+        """转发结构化子代理事件（started/activity/finished）"""
         if self.output_callback:
-            self.output_callback(message, level)
+            try:
+                self.output_callback(payload)
+            except Exception:
+                pass
 
     def _hash_task(self, agent_type: str, task: str) -> str:
         """生成任务哈希值（用于去重）"""
@@ -252,7 +255,14 @@ async def AgentDelegate(
     _manager.register_task(agent_type, task, agent_id)
 
     # 通知开始执行
-    _manager.notify_output(f"🚀 启动 {agent_type} agent [{agent_id}]", "info")
+    _manager.notify_output({
+        "agent_id": agent_id,
+        "agent_type": agent_type,
+        "task": task,
+        "kind": "started",
+        "level": "info",
+        "message": f"🚀 启动 {agent_type} agent [{agent_id}]",
+    })
 
     # 在线程池中执行子agent（阻塞等待，runtime 层管理超时/后台化）
     loop = asyncio.get_event_loop()
@@ -277,7 +287,15 @@ async def AgentDelegate(
         status_icon = "⚠️"
     else:
         status_icon = "❌"
-    _manager.notify_output(f"{status_icon} {agent_type} agent [{agent_id}] 完成", "info")
+    _manager.notify_output({
+        "agent_id": agent_id,
+        "agent_type": agent_type,
+        "task": task,
+        "kind": "finished",
+        "level": "info" if result.get("status") != "error" else "error",
+        "message": f"{status_icon} {agent_type} agent [{agent_id}] 完成",
+        "status": result.get("status"),
+    })
 
     # 添加总体统计
     total_duration = int((time.time() - start_time) * 1000)
