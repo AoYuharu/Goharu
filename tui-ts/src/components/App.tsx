@@ -425,22 +425,18 @@ export function App({ mock = false }: { mock?: boolean }) {
     if (detailToolId !== null) {
       // Tool detail panel open: arrows scroll, Esc closes
       const detailMsg = messages.find((m) => m.id === detailToolId);
-      const width = Math.max(20, (process.stdout.columns || 80) - 2);
       const lineCount =
         detailMsg && detailMsg.kind === "tool"
-          ? toolDetailLines(
-              {
-                tool: detailMsg.tool,
-                argsBrief: detailMsg.args,
-                argsFull: detailMsg.argsFull ?? detailMsg.args,
-                result: detailMsg.result,
-                isError: detailMsg.isError,
-                ts: detailMsg.ts,
-              },
-              width,
-            ).length
+          ? toolDetailLines({
+              tool: detailMsg.tool,
+              argsBrief: detailMsg.args,
+              argsFull: detailMsg.argsFull ?? detailMsg.args,
+              result: detailMsg.result,
+              isError: detailMsg.isError,
+              ts: detailMsg.ts,
+            }).length
           : 0;
-      const maxScroll = Math.max(0, lineCount - (TOOL_PANEL_ROWS - 3));
+      const maxScroll = Math.max(0, lineCount - (TOOL_PANEL_ROWS - 4));
       if (key.escape) {
         setDetailToolId(null);
         return;
