@@ -64,6 +64,8 @@ class LogManager:
         "Prompting.PromptAssembler": "agent",
         "Prompting.PromptRenderer": "agent",
         "Prompting.PromptLoader": "agent",
+        # Timing
+        "Core.timing": "timing",
     }
 
     def __new__(cls):
@@ -129,7 +131,7 @@ class LogManager:
         self._log_dir.mkdir(parents=True, exist_ok=True)
 
         # 创建子目录
-        for subdir in ("agent", "memory", "api", "tools", "gateway", "system"):
+        for subdir in ("agent", "memory", "api", "tools", "gateway", "system", "timing"):
             (self._log_dir / subdir).mkdir(parents=True, exist_ok=True)
 
         # Root logger 配置

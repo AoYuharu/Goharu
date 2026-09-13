@@ -16,10 +16,11 @@
 import { debugLog } from "./debugLog.js";
 
 export interface MouseEvent {
-  kind: "click" | "wheel" | "move";
+  kind: "press" | "release" | "wheel" | "move";
   x: number;
   y: number;
   dir?: "up" | "down";
+  dragging?: boolean; // move with left button held
 }
 
 const MOUSE_SEQ = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/;
@@ -62,18 +63,19 @@ export function drainMouseSequences(buffer: string): {
     if (b & 64) {
       if (press) events.push({ kind: "wheel", x, y, dir: b & 1 ? "down" : "up" });
     } else if (b & 32) {
-      if (press) events.push({ kind: "move", x, y });
-    } else if (press && (b & 3) === 0) {
-      events.push({ kind: "click", x, y });
+      if (press) events.push({ kind: "move", x, y, dragging: (b & 3) !== 3 });
+    } else if ((b & 3) === 0) {
+      events.push({ kind: press ? "press" : "release", x, y });
     }
     i = start + m[0].length;
   }
   return { rest, pending: "", events };
 }
 
-let clickHandler: ((x: number, y: number) => void) | null = null;
+let pressHandler: ((x: number, y: number) => void) | null = null;
+let releaseHandler: ((x: number, y: number) => void) | null = null;
 let wheelHandler: ((dir: "up" | "down", x: number, y: number) => void) | null = null;
-let moveHandler: ((x: number, y: number) => void) | null = null;
+let moveHandler: ((x: number, y: number, dragging: boolean) => void) | null = null;
 let pending = "";
 let enabled = false;
 let installed = false;
@@ -103,13 +105,16 @@ function installCapture(): void {
       out += drained.rest;
       eventCount += drained.events.length;
       for (const ev of drained.events) {
-        if (ev.kind === "click") {
-          debugLog("mouse", `click @${ev.x},${ev.y}`);
-          clickHandler?.(ev.x, ev.y);
+        if (ev.kind === "press") {
+          debugLog("mouse", `press @${ev.x},${ev.y}`);
+          pressHandler?.(ev.x, ev.y);
+        } else if (ev.kind === "release") {
+          debugLog("mouse", `release @${ev.x},${ev.y}`);
+          releaseHandler?.(ev.x, ev.y);
         } else if (ev.kind === "wheel") {
           wheelHandler?.(ev.dir ?? "down", ev.x, ev.y);
         } else {
-          moveHandler?.(ev.x, ev.y);
+          moveHandler?.(ev.x, ev.y, ev.dragging ?? false);
         }
       }
       chunk = origRead();
@@ -121,11 +126,13 @@ function installCapture(): void {
 
 export function setMouseEnabled(
   on: boolean,
-  onClick?: (x: number, y: number) => void,
+  onPress?: (x: number, y: number) => void,
+  onRelease?: (x: number, y: number) => void,
   onWheel?: (dir: "up" | "down", x: number, y: number) => void,
-  onMove?: (x: number, y: number) => void,
+  onMove?: (x: number, y: number, dragging: boolean) => void,
 ): void {
-  if (onClick) clickHandler = onClick;
+  if (onPress) pressHandler = onPress;
+  if (onRelease) releaseHandler = onRelease;
   if (onWheel) wheelHandler = onWheel;
   if (onMove) moveHandler = onMove;
   if (on === enabled) return;

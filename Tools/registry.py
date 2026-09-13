@@ -59,6 +59,10 @@ class ToolRegistry:
     def get_entry(self, name):
         return self._tools.get(str(name or "").strip())
 
+    def unregister(self, name):
+        """移除工具（MCP 热卸载用）。返回被移除的 ToolEntry 或 None。"""
+        return self._tools.pop(str(name or "").strip(), None)
+
     def list_entries(self, group=None):
         entries = list(self._tools.values())
         if group is not None:

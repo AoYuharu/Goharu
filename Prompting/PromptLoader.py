@@ -33,6 +33,11 @@ class PromptLoader:
             content = path.read_text(encoding="utf-8").strip()
             if not content:
                 continue
+            # 主 Actor 提示词附加当前运行环境（OS/Shell/可用命令），
+            # 避免模型生成错配系统的 shell 命令
+            if key == "actor" and i == len(paths) - 1:
+                from Tools.platform_utils import get_environment_hint
+                content = content + "\n\n" + get_environment_hint()
             kwargs = dict(
                 kind="system",
                 title=path.stem,

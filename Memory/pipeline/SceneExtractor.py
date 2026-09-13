@@ -8,9 +8,7 @@ SceneExtractor — LLM-driven L2 scene extraction.
 
 import logging
 
-from Agent.LargeLanguageModel import LargeLanguageModel
-from configurationLoader import config
-
+from Memory.memory_config import resolve_config
 from Memory.repositories.L1Repository import L1Repository
 from Memory.repositories.L2Repository import L2Repository
 from Memory.retrieval.EmbeddingService import EmbeddingService
@@ -22,16 +20,26 @@ logger = logging.getLogger(__name__)
 class SceneExtractor:
     """LLM-driven scene extraction from unassigned L1 atoms."""
 
-    def __init__(self, scene_file_manager=None, l1_repo=None, l2_repo=None, embedding_service=None):
-        self.scene_file_mgr = scene_file_manager or SceneFileManager()
+    def __init__(self, scene_file_manager=None, l1_repo=None, l2_repo=None,
+                 embedding_service=None, llm=None, cfg=None):
+        cfg = resolve_config(cfg)
+        self._cfg = cfg
+        self.scene_file_mgr = scene_file_manager or SceneFileManager(cfg=cfg)
         self.l1_repo = l1_repo or L1Repository()
         self.l2_repo = l2_repo or L2Repository(self.l1_repo.db)
-        self.embedding_service = embedding_service or EmbeddingService(self.l1_repo.db)
-        self._llm = None
+        self.embedding_service = embedding_service or EmbeddingService(self.l1_repo.db, cfg=cfg)
+        self._llm = llm
 
     @property
     def llm(self):
         if self._llm is None:
+            try:
+                from Agent.LargeLanguageModel import LargeLanguageModel
+            except ImportError as e:
+                raise RuntimeError(
+                    "SceneExtractor 需要 LLM：请通过 llm= 参数注入一个 "
+                    "具有 query(messages) 方法的对象（独立使用 Memory 包时）"
+                ) from e
             self._llm = LargeLanguageModel()
         return self._llm
 
@@ -131,7 +139,9 @@ class SceneExtractor:
                 for aid in atom_ids:
                     self.l1_repo.set_scene(aid, scene_row["id"])
             # 索引
-            search_text = SceneFileManager.extract_search_text(slug)
+            search_text = SceneFileManager.extract_search_text(
+                slug, base_dir=self.scene_file_mgr.base_dir,
+            )
             self.l2_repo.db.replace_fts_entry("l2", scene_row["id"], search_text)
             tf_vec = self.l2_repo.bm25.encode_document(search_text)
             if tf_vec:
@@ -183,7 +193,7 @@ class SceneExtractor:
         return "\n".join(lines)
 
     def _load_base_prompt(self):
-        prompts = config.get("prompt.system.scene_extractor", [])
+        prompts = self._cfg.get("prompt.system.scene_extractor", [])
         if prompts:
             try:
                 from Prompting.PromptLoader import PromptLoader
@@ -198,14 +208,21 @@ class SceneExtractor:
     def _parse_and_write_scenes(self, llm_output, atoms, existing_scenes):
         """解析 LLM JSON 输出并写入 scene_blocks/*.md 文件。"""
         import json
-        from Agent.json_parser import JSONParser
+        try:
+            from Agent.json_parser import JSONParser
+        except ImportError:  # 独立使用 Memory 包时无 Agent 依赖
+            JSONParser = None
 
         existing_slugs = {s.get("slug") for s in existing_scenes}
         created = []
 
-        try:
-            parsed = JSONParser.parse_with_retry(llm_output)
-        except Exception:
+        parsed = None
+        if JSONParser is not None:
+            try:
+                parsed = JSONParser.parse_with_retry(llm_output)
+            except Exception:
+                parsed = None
+        if parsed is None:
             try:
                 parsed = json.loads(llm_output)
             except json.JSONDecodeError:
@@ -303,7 +320,9 @@ class SceneExtractor:
             for aid in atom_ids:
                 self.l1_repo.set_scene(aid, scene_row["id"])
         # 索引
-        search_text = SceneFileManager.extract_search_text(slug)
+        search_text = SceneFileManager.extract_search_text(
+            slug, base_dir=self.scene_file_mgr.base_dir,
+        )
         self.l2_repo.db.replace_fts_entry("l2", scene_row["id"], search_text)
         tf_vec = self.l2_repo.bm25.encode_document(search_text)
         if tf_vec:

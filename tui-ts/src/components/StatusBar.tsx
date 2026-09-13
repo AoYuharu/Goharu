@@ -31,9 +31,12 @@ export interface TokenStats {
   cache: string;
 }
 
-export function StatusBar({ status, stats }: { status: StatusState; stats: TokenStats | null }) {
+export function StatusBar({ status, stats, model }: { status: StatusState; stats: TokenStats | null; model?: string }) {
   return (
     <Box>
+      {model ? (
+        <Text bold color="magenta">[{model}] </Text>
+      ) : null}
       {status.kind === "spinner" ? (
         <Text color="cyan">
           <Spinner type="dots" /> {status.label}
@@ -48,7 +51,7 @@ export function StatusBar({ status, stats }: { status: StatusState; stats: Token
         <Text>
           <Text dimColor>Current Tokens: </Text>
           <Text bold color="cyan">{stats.tokens}</Text>
-          <Text dimColor> | Prompt Cache Ratio: </Text>
+          <Text dimColor> | Cache Hit: </Text>
           <Text bold color="green">{stats.cache}</Text>
         </Text>
       )}

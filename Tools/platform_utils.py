@@ -10,8 +10,6 @@ import os
 import sys
 import signal
 import subprocess
-import locale
-from typing import Tuple
 
 
 # ==================== 平台检测 ====================
@@ -37,6 +35,79 @@ def get_platform_name() -> str:
     elif is_linux():
         return 'Linux'
     return sys.platform
+
+
+def get_environment_hint(for_subagent: bool = False) -> str:
+    """生成注入 Agent 系统提示词的当前运行环境说明块。
+
+    让模型直接知道自己在什么系统上该用什么命令，
+    转译层（cmd_translate）只是兜底，不替代本机命令直觉。
+    """
+    import platform
+
+    os_name = f"{get_platform_name()} ({platform.system()} {platform.release()})"
+    cwd = os.getcwd()
+    if is_windows():
+        lines = [
+            f"- 操作系统: {os_name}，Shell: bash（Git Bash，不是 cmd.exe）",
+            f"- 当前工作目录: {cwd}",
+            "- 路径: Windows 盘符；bash 下可用 POSIX 风格路径（如 /e/Goharu）或 E:/Goharu；Python 命令为 python（通常无 python3）",
+            "- 常用命令: ls/cp/mv/rm/grep/which/ps 等标准 POSIX 工具（bash 原生支持，无需翻译）",
+            "- 多行 Python 脚本请用 heredoc（python <<'EOF' ... EOF）或写临时 .py 文件，避免复杂的 python -c 引号转义",
+        ]
+        if for_subagent:
+            lines.append(
+                "- 你只允许只读命令（ls/wc/sort/git 只读子命令等），可附带 2>/dev/null；"
+                "powershell 不可用；读写/搜索文件一律用 Read/Edit/Grep/Glob 工具"
+            )
+    else:
+        shell = os.environ.get("SHELL", "/bin/sh")
+        lines = [
+            f"- 操作系统: {os_name}，Shell: {shell}",
+            f"- 当前工作目录: {cwd}",
+            "- 常用命令: ls/cp/mv/rm/grep/which/ps 等标准 POSIX 工具",
+        ]
+        if for_subagent:
+            lines.append(
+                "- 你只允许只读命令（ls/wc/sort/git 只读子命令等），可附带 2>/dev/null；"
+                "读写/搜索文件一律用 Read/Edit/Grep/Glob 工具"
+            )
+    return "## 运行环境（当前机器）\n\n" + "\n".join(lines)
+
+
+def resolve_bash_path() -> str:
+    """返回用于执行 run_cmd 的 shell 路径。
+
+    Windows 上返回 Git Bash 的 bash.exe 完整路径（bash 才是模型命令的稳定执行环境，
+    cmd.exe 的引号/换行规则与 python -c 等多行命令不兼容）；POSIX 返回 'bash'。
+
+    找不到 Git Bash 时抛 RuntimeError（等价于 Claude Code 在 Windows 上对 git-bash 的硬依赖）。
+    """
+    if not is_windows():
+        return "bash"
+    for env_name in ("GOHARU_BASH_PATH", "CLAUDE_CODE_GIT_BASH_PATH"):
+        p = os.environ.get(env_name)
+        if p and os.path.isfile(p):
+            return p
+    candidates = [
+        r"D:\Git\bin\bash.exe",
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ]
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if localappdata:
+        candidates.append(os.path.join(localappdata, r"Programs\Git\bin\bash.exe"))
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    import shutil
+    found = shutil.which("bash")
+    if found and "system32" not in found.lower():
+        return found
+    raise RuntimeError(
+        "Git Bash 未找到。请安装 Git for Windows（https://git-scm.com/downloads/win），"
+        "或设置环境变量 GOHARU_BASH_PATH 指向 bash.exe"
+    )
 
 
 # ==================== 进程管理 ====================
@@ -95,46 +166,6 @@ def get_subprocess_creation_flags() -> int:
     return 0
 
 
-def get_subprocess_silent_flags() -> int:
-    """
-    返回静默创建进程的标记（无窗口）。
-
-    Windows: CREATE_NO_WINDOW
-    Linux/macOS: 0
-    """
-    if is_windows():
-        try:
-            return subprocess.CREATE_NO_WINDOW
-        except AttributeError:
-            return 0
-    return 0
-
-
-# ==================== 编码 ====================
-
-def get_system_encoding() -> str:
-    """返回平台合适的系统编码"""
-    encoding = locale.getpreferredencoding(do_setlocale=False)
-    return encoding or ('utf-8')
-
-
-def ascii_filename(filename: str) -> str:
-    """
-    返回去除 emoji 等特殊字符的安全文件名。
-    适用于 Windows 不兼容的字符场景。
-    """
-    result: list[str] = []
-    for ch in filename:
-        if ord(ch) < 128:
-            result.append(ch)
-        elif ch.isascii():
-            result.append(ch)
-        else:
-            result.append('_')
-    safe = ''.join(result).strip()
-    return safe or 'untitled'
-
-
 # ==================== subprocess 环境 ====================
 
 def get_subprocess_env() -> dict:
@@ -146,18 +177,6 @@ def get_subprocess_env() -> dict:
     env['PYTHONUTF8'] = '1'
     env['PYTHONIOENCODING'] = 'utf-8'
     return env
-
-
-def get_effective_shell() -> Tuple[str, bool]:
-    """
-    返回执行 shell 命令所需的信息。
-    返回 (executable, use_shell)：
-      Linux/macOS: (None, True) — 使用 /bin/sh
-      Windows: (None, True) — 使用 cmd.exe
-    """
-    # subprocess 的 shell=True 会自动选择当前平台的 shell:
-    #  Windows → cmd.exe, Unix → /bin/sh
-    return (None, True)
 
 
 # ==================== 系统信息收集 ====================

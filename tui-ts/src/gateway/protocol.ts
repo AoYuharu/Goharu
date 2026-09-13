@@ -19,6 +19,9 @@ export interface UpdateConfigParams { key: string; value: unknown }
 export interface QueuedResult { queued: boolean; command?: string }
 export interface InterruptResult { interrupted: boolean }
 export interface UpdateConfigResult { success: boolean; key: string; old_value: unknown; new_value: unknown }
+export interface CancelBackgroundTaskParams { task_id: number }
+export interface CancelBackgroundTaskResult { cancelled: boolean; task_id: number }
+export interface ConfirmResponseResult { ok: boolean; approved: boolean }
 
 export interface HistoryMessage {
   role: string;
@@ -33,6 +36,40 @@ export interface HistoryMessage {
 }
 export interface GetHistoryResult { messages: HistoryMessage[] }
 
+export interface VoiceStatus {
+  installed: boolean;
+  mic_available: boolean;
+  mic_consent: boolean;
+  asr_enabled: boolean;
+  wakeup_enabled: boolean;
+  models: { kws: boolean; vad: boolean; tokens: boolean; sensevoice: boolean };
+  models_ready: boolean;
+  need_download?: boolean;
+  download_running: boolean;
+  download_error: string | null;
+  models_root: string;
+}
+
+export interface ModelHistoryEntry { model: string; base_url: string; api_key_env?: string }
+export interface ModelStatus {
+  model: string;
+  base_url: string;
+  provider: string;
+  api_key_env: string;
+  api_key_set: boolean;
+  api_key_masked: string;
+  history: ModelHistoryEntry[];
+}
+export interface ModelSetConfigParams { model?: string; base_url?: string; api_key?: string; api_key_env?: string }
+export interface ModelSetConfigResult {
+  success: boolean;
+  changed: string[];
+  /** success=false 时：失败分类与一句可读原因；切换已回滚，原模型继续生效 */
+  error_kind?: "auth" | "network" | "route" | "unknown";
+  message?: string;
+  fallback_model?: string;
+}
+
 export interface RpcMethods {
   "agent.send_message": { params: SendMessageParams; result: QueuedResult };
   "agent.clear_session": { params: SessionParams; result: QueuedResult };
@@ -40,6 +77,13 @@ export interface RpcMethods {
   "agent.get_history": { params: Record<string, never>; result: GetHistoryResult };
   "agent.update_config": { params: UpdateConfigParams; result: UpdateConfigResult };
   "agent.interrupt": { params: Record<string, never>; result: InterruptResult };
+  "agent.confirm_response": { params: { confirm_id: string; approved: boolean }; result: ConfirmResponseResult };
+  "agent.cancel_background_task": { params: CancelBackgroundTaskParams; result: CancelBackgroundTaskResult };
+  "voice.get_status": { params: Record<string, never>; result: VoiceStatus };
+  "voice.set_config": { params: { mic_consent?: boolean; asr_enabled?: boolean; wakeup_enabled?: boolean }; result: VoiceStatus };
+  "voice.download_model": { params: Record<string, never>; result: { started: boolean; message: string } };
+  "model.get_status": { params: Record<string, never>; result: ModelStatus };
+  "model.set_config": { params: ModelSetConfigParams; result: ModelSetConfigResult };
 }
 
 export type MethodName = keyof RpcMethods;
@@ -48,14 +92,36 @@ export type MethodName = keyof RpcMethods;
 
 export interface ToolCallSummary { tool_name?: string; arguments?: unknown }
 
+export interface SubagentTokenStats {
+  current_tokens?: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
+  uncached_input_tokens?: number;
+  prompt_cache_ratio?: number;
+}
+
 export interface SubagentUpdatePayload {
   agent_id: string;
   agent_type: string;
   task: string;
-  kind: "started" | "activity" | "finished";
+  kind: "started" | "activity" | "finished" | "stats";
   level: "info" | "warning" | "error" | "debug";
   message: string;
   status?: "success" | "partial" | "error";
+  category?: "iteration" | "thinking" | "tool_call" | "tool_result" | "final" | "error" | "info";
+  content?: string;
+  tool?: string;
+  is_error?: boolean;
+  /** kind="stats" 时携带：该子代理最近一次 LLM 请求的 Token/Cache 统计 */
+  token_stats?: SubagentTokenStats;
+}
+
+export interface BgTaskUpdatePayload {
+  task_id: number;
+  tool: string;
+  args?: string;
+  status: "running" | "success" | "error";
+  started_at?: number;
 }
 
 export type GatewayEvent =
@@ -67,6 +133,7 @@ export type GatewayEvent =
   | { type: "agent.text_content"; payload: { step: number; text: string } }
   | { type: "agent.step"; payload: { step: number } }
   | { type: "agent.llm_requesting"; payload: Record<string, never> }
+  | { type: "agent.retry"; payload: { attempt: number; max_retries: number; backoff: number; phase: "backoff" | "requesting"; step: number } }
   | { type: "agent.l1_extracting"; payload: Record<string, never> }
   | { type: "agent.answer"; payload: { answer: string } }
   | { type: "agent.streaming"; payload: { chunk: string } }
@@ -74,7 +141,7 @@ export type GatewayEvent =
   | { type: "agent.error"; payload: { message: string } }
   | { type: "tool.call"; payload: { tool: string; arguments: unknown; call_id: string; step: number } }
   | { type: "tool.result"; payload: { tool: string; call_id: string; result: string } }
-  | { type: "token.stats"; payload: { current_tokens?: number; prompt_cache_ratio?: number } & Record<string, unknown> }
+  | { type: "token.stats"; payload: { current_tokens?: number; prompt_cache_ratio?: number; cache_read_tokens?: number; cache_write_tokens?: number; uncached_input_tokens?: number } & Record<string, unknown> }
   | { type: "user.batch"; payload: { count: number; combined: string } }
   | { type: "user.merge"; payload: { count: number; merged: string } }
   | { type: "message.complete"; payload: { answer: string } }
@@ -83,7 +150,14 @@ export type GatewayEvent =
   | { type: "task.background.completed"; payload: { count: number; task_ids: number[] } }
   | { type: "task.background.status"; payload: { pending_results: number } & Record<string, unknown> }
   | { type: "command.complete"; payload: { command: string; success: boolean; error?: string } }
-  | { type: "subagent.update"; payload: SubagentUpdatePayload };
+  | { type: "subagent.update"; payload: SubagentUpdatePayload }
+  | { type: "tool.output"; payload: { line: string; stream: string; cmd: string } }
+  | { type: "tool.confirm_request"; payload: { confirm_id: string; cmd: string; description: string } }
+  | { type: "task.background.update"; payload: BgTaskUpdatePayload }
+  | { type: "voice.download_progress"; payload: { downloaded_bytes: number; total_bytes: number; percent: number } }
+  | { type: "voice.download_complete"; payload: { ok: boolean; error?: string; status?: VoiceStatus } }
+  | { type: "voice.transcript"; payload: { text: string } }
+  | { type: "voice.state"; payload: { state: string } };
 
 export type GatewayEventType = GatewayEvent["type"];
 export type GatewayEventPayload<T extends GatewayEventType> =

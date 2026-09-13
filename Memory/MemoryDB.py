@@ -4,7 +4,7 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
-from configurationLoader import config
+from Memory.memory_config import resolve_config
 
 
 class MemoryDB:
@@ -37,10 +37,11 @@ class MemoryDB:
                 pass
         return str(text or "")
 
-    def __init__(self, db_path=None):
-        root_dir = Path(config.get("memory.root_dir", "./runtime_memory"))
+    def __init__(self, db_path=None, cfg=None):
+        cfg = resolve_config(cfg)
+        root_dir = Path(cfg.get("memory.root_dir", "./runtime_memory"))
         default_path = root_dir / "memory.db"
-        self.path = Path(db_path or config.get("memory.sqlite.path", str(default_path)))
+        self.path = Path(db_path or cfg.get("memory.sqlite.path", str(default_path)))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self.fts_enabled = False

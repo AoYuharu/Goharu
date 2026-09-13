@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-from configurationLoader import config
+from Memory.memory_config import resolve_config
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +40,11 @@ _(new scene — to be filled by SceneExtractor)_
 class SceneFileManager:
     """管理 scene_blocks/ 目录下的 Markdown 场景文件。"""
 
-    def __init__(self, base_dir=None):
-        root = config.get("memory.root_dir", "./runtime_memory")
+    def __init__(self, base_dir=None, cfg=None):
+        cfg = resolve_config(cfg)
+        root = cfg.get("memory.root_dir", "./runtime_memory")
         default_dir = os.path.join(root, "scene_blocks")
-        self.base_dir = Path(base_dir or config.get("memory.scene_blocks.dir", default_dir))
+        self.base_dir = Path(base_dir or cfg.get("memory.scene_blocks.dir", default_dir))
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -155,9 +156,9 @@ class SceneFileManager:
         return sections
 
     @staticmethod
-    def extract_search_text(slug):
+    def extract_search_text(slug, base_dir=None):
         """从场景文件中提取用于 FTS/BM25 索引的搜索文本。"""
-        mgr = SceneFileManager()
+        mgr = SceneFileManager(base_dir=base_dir)
         meta, body = mgr.read_scene(slug)
         if meta is None:
             return ""

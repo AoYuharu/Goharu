@@ -18,12 +18,6 @@ try:
 except ImportError:
     pdfplumber = None
 
-try:
-    from PIL import Image
-    import pytesseract
-except ImportError:
-    pytesseract = None
-
 from .models import (
     PDFMetadata, PDFSection, PDFFigure, PDFTable,
     PDFEquation, PDFReference
@@ -86,10 +80,7 @@ class MetadataExtractor(BaseExtractor):
 
 
 class TextExtractor(BaseExtractor):
-    """文本提取器 - 使用 pdfplumber + PyMuPDF + OCR"""
-
-    def __init__(self, use_ocr: bool = True):
-        self.use_ocr = use_ocr
+    """文本提取器 - 使用 pdfplumber + PyMuPDF（仅文本层，无 OCR）"""
 
     def extract(self, pdf_path: str, **kwargs) -> str:
         """提取完整文本"""
@@ -102,12 +93,6 @@ class TextExtractor(BaseExtractor):
         # 如果 pdfplumber 不可用或提取失败，使用 PyMuPDF
         if not text and fitz:
             text = self._extract_with_pymupdf(pdf_path)
-
-        # 如果文本很少且启用了OCR，尝试OCR
-        if len(text.strip()) < 100 and self.use_ocr and pytesseract:
-            ocr_text = self._extract_with_ocr(pdf_path)
-            if len(ocr_text) > len(text):
-                text = ocr_text
 
         return text
 
@@ -136,25 +121,6 @@ class TextExtractor(BaseExtractor):
             return "\n\n".join(text_parts)
         except Exception as e:
             print(f"PyMuPDF extraction failed: {e}", file=sys.stderr)
-            return ""
-
-    def _extract_with_ocr(self, pdf_path: str) -> str:
-        """使用 OCR 提取文本（扫描版PDF）"""
-        try:
-            doc = fitz.open(pdf_path)
-            text_parts = []
-
-            for page_num in range(min(5, len(doc))):  # 只OCR前5页
-                page = doc[page_num]
-                pix = page.get_pixmap()
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                text = pytesseract.image_to_string(img, lang='eng')
-                text_parts.append(text)
-
-            doc.close()
-            return "\n\n".join(text_parts)
-        except Exception as e:
-            print(f"OCR extraction failed: {e}", file=sys.stderr)
             return ""
 
     def extract_sections(self, pdf_path: str, full_text: str) -> Dict[str, PDFSection]:

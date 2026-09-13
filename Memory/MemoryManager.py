@@ -2,11 +2,16 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from configurationLoader import config
+from Memory.memory_config import resolve_config
 from Memory.WorkingMemory import WorkingMemory
 from Memory.retrieval.HybridRetriever import HybridRetriever
 
-
+try:
+    from Core.LogManager import get_logger
+    logger = get_logger(__name__)
+except ImportError:  # 独立使用 Memory 包时无 Core 依赖
+    import logging
+    logger = logging.getLogger(__name__)
 
 
 class MemoryManager:
@@ -16,22 +21,23 @@ class MemoryManager:
     编排逻辑在 Agent.PipelineManager 中。
     """
 
-    def __init__(self):
-        self.working = WorkingMemory()
-        self._hybrid_retriever = None
-        self._persona_generator = None
+    def __init__(self, cfg=None, working=None, retriever=None, persona_generator=None):
+        self._cfg = resolve_config(cfg)
+        self.working = working or WorkingMemory(cfg=self._cfg)
+        self._hybrid_retriever = retriever
+        self._persona_generator = persona_generator
 
     @property
     def hybrid_retriever(self):
         if self._hybrid_retriever is None:
-            self._hybrid_retriever = HybridRetriever()
+            self._hybrid_retriever = HybridRetriever(cfg=self._cfg)
         return self._hybrid_retriever
 
     @property
     def persona_generator(self):
         if self._persona_generator is None:
             from Memory.pipeline.PersonaGenerator import PersonaGenerator
-            self._persona_generator = PersonaGenerator()
+            self._persona_generator = PersonaGenerator(cfg=self._cfg)
         return self._persona_generator
 
     # ── 快捷属性（供 PipelineManager 内部使用） ──
@@ -51,18 +57,6 @@ class MemoryManager:
     def get_context(self):
         return self.working.get_messages()
 
-    # ── SOUL.md（角色定义，不属于金字塔，始终注入） ──────────────────
-
-    def get_soul_markdown(self):
-        root = config.get("memory.root_dir", "./runtime_memory")
-        soul_path = Path(root) / "SOUL.md"
-        try:
-            if soul_path.exists():
-                return soul_path.read_text(encoding="utf-8")
-        except Exception:
-            pass
-        return ""
-
     # ── Pyramid: L0-L3 retrieval ────────────────────────────────────
 
     def retrieve_prompt_memory(self):
@@ -73,6 +67,23 @@ class MemoryManager:
         pack = retriever.retrieve(query)
         pack["query_text"] = query
         self._dump_retrieval_log(query, pack)
+
+        # 可读检索日志：每轮一条，含 query 摘要 + 各层命中数 + 命中标题
+        memories = pack.get("memories") or []
+        scenes = pack.get("scenes") or []
+        atom_titles = ", ".join(
+            str(m.get("title", "?"))[:40] for m in memories[:5]
+        )
+        scene_titles = ", ".join(
+            str(s.get("title", "?"))[:40] for s in scenes[:3]
+        )
+        logger.info(
+            "检索：query=%.80s | L1=%d[%s] | L2=%d[%s] | persona=%s",
+            (query or "(empty)"),
+            len(memories), atom_titles,
+            len(scenes), scene_titles,
+            "yes" if pack.get("profile_summary") else "no",
+        )
         return pack
 
     def get_persona_markdown(self):
@@ -84,7 +95,7 @@ class MemoryManager:
     # ── Logging ─────────────────────────────────────────────────────
 
     def _dump_retrieval_log(self, query, pack):
-        log_dir = config.get("memory.root_dir", "./runtime_memory")
+        log_dir = self._cfg.get("memory.root_dir", "./runtime_memory")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "retrieval_log.txt")
 

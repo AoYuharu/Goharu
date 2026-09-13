@@ -16,6 +16,10 @@ class ToolCallGuard:
         Args:
             available_tools: 可用工具列表，格式 [{"name": "...", "inputSchema": {...}}]
         """
+        self.update_tools(available_tools)
+
+    def update_tools(self, available_tools: list[dict]):
+        """重建工具索引（MCP 工具热增删后调用）。"""
         self.available_tools = {tool["name"]: tool for tool in available_tools}
         self.tool_names = list(self.available_tools.keys())
         self.tool_names_lower = {name.lower(): name for name in self.tool_names}

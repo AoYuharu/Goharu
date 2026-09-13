@@ -21,6 +21,7 @@ class MessageSource(Enum):
     MICRO_COMPACT = "micro_compact"
     REACTIVATION = "reactivation"
     INTERRUPT = "interrupt"
+    VOICE = "voice"
 
 
 class MessageVisibility(Enum):

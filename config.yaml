@@ -32,9 +32,9 @@ memory:
     embedding_model_name: Qwen3-Embedding-0.6B
     embedding_model_path: ./models/embedding_model/Qwen3-Embedding-0.6B
     embedding_provider: local
-    embedding_base_url: ""
-    embedding_api_key_env: ""
-    embedding_dimensions: 768
+    embedding_base_url: ''
+    embedding_api_key_env: ''
+    embedding_dimensions: 1024
     embedding_timeout: 30
     reranker_model_path: ./models/rerank_model/bge-reranker-v2-m3
   pipeline:
@@ -50,15 +50,19 @@ prompt:
     shared: []
     actor:
     - ./prompts/actor/base.md
-    summarizer:
-    - ./prompts/summarizer/base.md
+    day_summary:
+    - ./prompts/summarizer/day_summary.md
+    topic_merge:
+    - ./prompts/summarizer/topic_merge.md
+    context_compact:
+    - ./prompts/summarizer/context_compact.md
     scene_extractor:
-    - ./prompts/scene_extractor/base.md
+    - ./prompts/memory_pyramid/scene_extractor.md
     persona_generator:
-    - ./prompts/persona_generator/base.md
+    - ./prompts/memory_pyramid/persona_generator.md
 model:
   large-language-model:
-    provider: anthropic_compatible
+    provider: auto
     model: MiniMax-M2.7
     api_key_env: ANTHROPIC_API_KEY
     base_url: https://api.minimaxi.com/anthropic
@@ -66,23 +70,42 @@ model:
     temperature: 0.7
     top_p: 0.9
     api_timeout: 120
+    max_retries: 10
+  model_history:
+  - model: MiniMax-M2.7
+    base_url: https://api.minimaxi.com/anthropic
+    api_key_env: ANTHROPIC_API_KEY
+  - model: glm-5.3-Flash
+    base_url: https://open.bigmodel.cn/api/anthropic
+    api_key_env: ZHIPU_API_KEY
 tools:
   runtime: in_process
-  background_timeout: 120  # seconds before moving to background (0 to disable)
+  background_timeout: 120
+  result_format:
+    enabled: true
+  verify_nudge:
+    enabled: true
+    mutation_threshold: 3
+    gate_final_answer: true
+    max_gate_fires: 2
   result_budget:
     cache_dir: ./runtime_memory/tool_cache
-    max_single_tokens: 8000  # per-result token limit
-    max_batch_tokens: 24000  # batch total token limit
+    max_single_tokens: 8000
+    max_batch_tokens: 24000
   builtin_modules:
   - Tools.builtin.core_tools
   - Tools.builtin.file_tools
   - Tools.builtin.glob_tool
   - Tools.builtin.agent_delegate
   - Tools.builtin.pdf_tools
+  - Tools.builtin.document_tools
   - Tools.builtin.system_info_tool
   - Tools.builtin.skill_tool
   - Tools.builtin.snip_tool
   - Tools.builtin.sleep_tool
+  - Tools.builtin.mcp_tools
+  mcp:
+    servers: {}
   security:
     dangerous_commands:
     - shutdown
@@ -103,40 +126,35 @@ tools:
     - runas
     - killall
     - pkill
-    - reg delete
-    - reg add
     - nmap
-    - metasploit
-    - hydra
-    - bcdedit
-    - bcdboot
-    - powershell -encodedcommand
-    - powershell -enc
     require_confirmation:
     - del
     - rmdir
     - taskkill
+    - reg delete
+    - reg add
     - 'reg '
+    - hydra
+    - metasploit
+    - bcdedit
+    - bcdboot
+    - powershell -encodedcommand
+    - powershell -enc
     enabled: true
-    allow_confirmation: false
+    allow_confirmation: true
 agent:
   maxDepth: 200
-  max_context_messages: 20  # 保留最近N条消息，防止上下文爆炸
-  background_watch_window: 1800  # 30 min post-answer watch for late completions
-  background_max_reactivations: 3  # max times agent can be reactivated by bg tasks
+  step_watchdog_seconds: 150
+  max_context_messages: 100000
+  background_watch_window: 1800
+  background_max_reactivations: 3
   micro_compact:
     enabled: true
-    age_threshold_hours: 1  # messages older than this are candidates for compaction
-    keep_tool_results: 5  # keep latest N tool results from expired period
+    age_threshold_hours: 1
+    keep_tool_results: 5
+    min_content_chars: 120
   context_compact:
     enabled: true
-    threshold_tokens: 80000   # 超过此 token 数触发自动摘要
-    trigger_before_step: true # 每步 actor 调用前检查
-  snip:
-    enabled: true
-    reminder_threshold_tokens: 40000  # 累计token超过此值后每轮提醒使用 Snip
-debug:
-  enabled: true
 logging:
   base_dir: ./runtime_memory/logs
   level: INFO
@@ -153,23 +171,15 @@ agent_delegate:
     max_concurrent: 2
   verify:
     max_concurrent: 1
-    max_iterations: 12
+    max_iterations: 50
   max_iterations: 20
   max_history_turns: 3
 ui:
-  verbose: true
-  show_memory_events: false
-  show_actor_output: true
   see:
-    thinking: true  # 实时展示模型 thinking 过程
-    text: true      # 实时展示模型在工具调用间的说明文字
-  acp:
-    enabled: true
-    host: 127.0.0.1
-    port: 8765
-  platforms:
-    qq:
-      enabled: true
-      app_id: '102839705'
-      markdown_support: false
+    thinking: true
+    text: true
 test: {}
+voice:
+  wakeup_enabled: true
+  asr_enabled: true
+  mic_consent: true

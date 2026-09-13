@@ -4,10 +4,13 @@ import atexit
 import json
 import logging
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from Core.Message import CoreMessage, MessageSource
 from Core.ToolCall import ToolCall
+from Core.LifecycleLog import lifecycle
+from Core.timing import timeit
 from Prompting.PromptAssembler import PromptAssembler
 from Prompting.PromptRenderer import PromptRenderer
 from Tools.guard import ToolCallGuard
@@ -27,11 +30,97 @@ def _strip_id_prefixes(text):
     """移除 LLM 输出中从 Prompt 上下文模仿的 [ID:xxx] 前缀。"""
     return _ID_PREFIX_PATTERN.sub('', text)
 
+# ── 文本格式工具调用打捞 ──────────────────────────────────────────
+# 部分模型（如 MiniMax）偶发不走原生 tool_use，而是把工具调用写成
+# 文本标记。检测并转换为合成 tool_use 块，让正常执行链路接管。
+_TEXT_TOOL_CALL_RE = re.compile(r"\[TOOL_CALL\]\s*(?P<body>.*?)\s*\[/TOOL_CALL\]", re.DOTALL)
+_TEXT_TOOL_NAME_RE = re.compile(r'tool\s*=>\s*"(?P<name>[^"]+)"')
+_TEXT_ARGS_RE = re.compile(r"args\s*=>\s*\{(?P<args>.*)", re.DOTALL)
+_ARG_PAIR_RE = re.compile(r"--(?P<key>[A-Za-z_][\w-]*)\s+(?P<value>[^\n]+)")
+_MINIMAX_TC_RE = re.compile(r"<minimax:tool_call>\s*(?P<body>.*?)\s*</minimax:tool_call>", re.DOTALL)
+
+
+def _coerce_arg_value(raw):
+    v = raw.strip().rstrip(",").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+        return v[1:-1]
+    for cast in (int, float):
+        try:
+            return cast(v)
+        except ValueError:
+            pass
+    if v.lower() == "true":
+        return True
+    if v.lower() == "false":
+        return False
+    return v
+
+
+def _salvage_text_tool_calls(text_content):
+    """从文本内容中打捞文本格式的工具调用。
+
+    Returns:
+        (tool_use_blocks, remaining_text_content) 或 None（无打捞）。
+    """
+    full = "\n".join(text_content)
+    if "[TOOL_CALL]" not in full and "<minimax:tool_call>" not in full:
+        return None
+
+    blocks = []
+    # 格式 A: [TOOL_CALL] {tool => "X", args => { --k v }} [/TOOL_CALL]
+    for m in _TEXT_TOOL_CALL_RE.finditer(full):
+        body = m.group("body")
+        name_m = _TEXT_TOOL_NAME_RE.search(body)
+        if not name_m:
+            continue
+        args = {}
+        args_m = _TEXT_ARGS_RE.search(body)
+        if args_m:
+            inner = args_m.group("args").rstrip("}\n ")
+            for pair in _ARG_PAIR_RE.finditer(inner):
+                args[pair.group("key")] = _coerce_arg_value(pair.group("value"))
+        blocks.append({
+            "type": "tool_use",
+            "id": f"salvaged_{uuid.uuid4().hex[:12]}",
+            "name": name_m.group("name"),
+            "input": args,
+        })
+
+    # 格式 B: <minimax:tool_call>JSON</minimax:tool_call>
+    for m in _MINIMAX_TC_RE.finditer(full):
+        body = m.group("body")
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        name = data.get("name") or data.get("tool")
+        args = data.get("arguments") or data.get("args") or {}
+        if name and isinstance(args, dict):
+            blocks.append({
+                "type": "tool_use",
+                "id": f"salvaged_{uuid.uuid4().hex[:12]}",
+                "name": name,
+                "input": args,
+            })
+
+    if not blocks:
+        return None
+
+    remaining = _TEXT_TOOL_CALL_RE.sub("", full)
+    remaining = _MINIMAX_TC_RE.sub("", remaining)
+    remaining = remaining.replace("</minimax:tool_call>", "").strip()
+
+    logger.warning(
+        "Salvaged %d text-format tool call(s) (model bypassed native tool_use): %s",
+        len(blocks), ", ".join(b["name"] for b in blocks),
+    )
+    return blocks, ([remaining] if remaining else [])
+
 # 专用 executor，不受事件循环生命周期影响
 # Python 3.9+ 的 ThreadPoolExecutor 会在 __init__ 注册 atexit handler，
 # 导致进程关闭时 executor 被自动 shutdown。这里主动 unregister 该 handler，
 # 只在手动调用 shutdown_llm_executor() 时才关闭。
-_LLM_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm-query-")
+_LLM_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="llm-query-")
 _LLM_EXECUTOR_LOCK = threading.Lock()
 _LLM_EXECUTOR_SHUTDOWN = False
 
@@ -61,11 +150,18 @@ class ActorAgent(LargeLanguageModel):
         self.prompt_assembler = PromptAssembler()
         self.prompt_renderer = PromptRenderer()
         self.guard = None  # 延迟初始化，等待工具列表加载
+        # 记忆检索缓存：只在 turn 开始搜一次，后续 step 复用
+        self._retrieval_cache = None
+        self._retrieval_done = False
+        # 每轮检索结果的记账表：用户消息 id → 记忆上下文块。
+        # 渲染时按 id 永久贴回原消息，保证历史前缀跨 turn 逐字节稳定
+        # （prompt cache 命中的前提；只贴最新消息会使旧前缀失效）。
+        self._memory_contexts = {}
 
-
-        # 原生 Anthropic 工具调用是唯一支持的模式
-        llm_config = config.get("model.large-language-model", {}) or {}
-        self.provider = llm_config.get("provider", "anthropic_compatible")
+    def reset_retrieval_cache(self):
+        """清空记忆检索缓存（Gateway 在每轮 turn 开始时调用，act 是每步级的不能在这重置）。"""
+        self._retrieval_done = False
+        self._retrieval_cache = None
 
     @staticmethod
     def _stringify_tool_result(result):
@@ -76,6 +172,26 @@ class ActorAgent(LargeLanguageModel):
             except TypeError:
                 return str(content)
         return str(content)
+
+    @staticmethod
+    def _build_assistant_content(thinking_content, text_content, tool_use_blocks):
+        """按 Anthropic Messages API 格式重建 assistant 消息内容。
+
+        严格透明：模型输出的 thinking / text / tool_use 块原样回传
+        （仅剥离 [ID:msg_xxx] 前缀），thinking 不再被丢弃。
+        """
+        content = []
+        for t in thinking_content:
+            t = _strip_id_prefixes(str(t).strip())
+            if t:
+                content.append({"type": "thinking", "thinking": t})
+        for t in text_content:
+            t = _strip_id_prefixes(str(t).strip())
+            if t:
+                content.append({"type": "text", "text": t})
+        for tb in tool_use_blocks:
+            content.append(tb)
+        return content
 
     @staticmethod
     def _preview_text(text, max_length=160):
@@ -151,36 +267,151 @@ class ActorAgent(LargeLanguageModel):
         )
         return trimmed
 
+    @staticmethod
+    def _sanitize_messages_for_api(messages):
+        """清理不符合 Anthropic API 规则的消息序列。
+
+        API 要求：assistant 的 tool_use 必须被后续 user 的 tool_result 配对；
+        任何孤立的 tool_use 或 tool_result 都会触发 400/2013。
+        这里只修复“配对完整性”，不修改消息语义。
+        """
+        if not messages:
+            return messages
+
+        n = len(messages)
+        keep = [True] * n
+
+        # pending_assistants: assistant 消息索引 -> 未匹配 tool_use_id 集合
+        pending_assistants = {}
+
+        for i, msg in enumerate(messages):
+            role = msg.get("role")
+            content = msg.get("content") or []
+            blocks = content if isinstance(content, list) else []
+
+            if role == "assistant":
+                tool_use_ids = {
+                    block.get("id")
+                    for block in blocks
+                    if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id")
+                }
+                if tool_use_ids:
+                    pending_assistants[i] = tool_use_ids
+            elif role == "user":
+                result_ids = {
+                    block.get("tool_use_id")
+                    for block in blocks
+                    if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id")
+                }
+                if not result_ids:
+                    continue
+
+                # 优先匹配最近一个待处理的 assistant
+                matched_idx = None
+                for idx in sorted(pending_assistants.keys(), reverse=True):
+                    if result_ids.issubset(pending_assistants[idx]):
+                        matched_idx = idx
+                        break
+
+                if matched_idx is not None:
+                    pending_assistants[matched_idx] -= result_ids
+                    if not pending_assistants[matched_idx]:
+                        del pending_assistants[matched_idx]
+                else:
+                    # 孤立的 tool_result：只移除 tool_result 块
+                    non_result_blocks = [
+                        block for block in blocks
+                        if not (isinstance(block, dict) and block.get("type") == "tool_result")
+                    ]
+                    if non_result_blocks:
+                        messages[i]["content"] = non_result_blocks
+                    else:
+                        keep[i] = False
+
+        # 处理仍未完全匹配的 assistant：删除未匹配的 tool_use 块
+        for idx, unmatched_ids in pending_assistants.items():
+            content = messages[idx].get("content") or []
+            blocks = content if isinstance(content, list) else []
+            new_blocks = [
+                block for block in blocks
+                if not (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("id") in unmatched_ids
+                )
+            ]
+            if new_blocks:
+                messages[idx]["content"] = new_blocks
+            else:
+                keep[idx] = False
+
+        cleaned = [msg for i, msg in enumerate(messages) if keep[i]]
+
+        # 防御性处理：如果清理后最前面是尚未配对的 assistant tool_use，直接删除
+        while cleaned:
+            first = cleaned[0]
+            if first.get("role") != "assistant":
+                break
+            content = first.get("content") or []
+            blocks = content if isinstance(content, list) else []
+            has_tool_use = any(
+                isinstance(b, dict) and b.get("type") == "tool_use"
+                for b in blocks
+            )
+            if not has_tool_use:
+                break
+            cleaned.pop(0)
+
+        if len(cleaned) != len(messages):
+            logger.info(
+                "History sanitized for API: %d → %d messages",
+                len(messages), len(cleaned),
+            )
+        return cleaned
+
     def build_messages_with_document(self, extra_system_prompt=None):
         tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
 
-        # 初始化防护器（首次调用时）
-        if self.guard is None and tool_definitions:
-            self.guard = ToolCallGuard(tool_definitions)
+        # 初始化防护器（首次调用时）；之后每次同步工具表，MCP 热增删的工具即时生效
+        if tool_definitions:
+            if self.guard is None:
+                self.guard = ToolCallGuard(tool_definitions)
+            elif len(self.guard.available_tools) != len(tool_definitions):
+                self.guard.update_tools(tool_definitions)
 
         import configurationLoader
         retrieval_enabled = bool(configurationLoader.config.get("memory.retrieval.enabled", False))
 
-        retrieval_pack = None
-        if retrieval_enabled and hasattr(self.working, "retrieve_prompt_memory"):
-            try:
-                retrieval_pack = self.working.retrieve_prompt_memory()
-            except Exception:
-                retrieval_pack = None
+        retrieval_pack = self._retrieval_cache if self._retrieval_done else None
+        if not self._retrieval_done:
+            if retrieval_enabled and hasattr(self.working, "retrieve_prompt_memory"):
+                try:
+                    with timeit("actor.build.retrieve"):
+                        retrieval_pack = self.working.retrieve_prompt_memory()
+                    lifecycle("记忆检索", "完成", level=2)
+                except Exception:
+                    retrieval_pack = None
+            # 缓存本轮检索结果，后续 step 直接复用，不重复检索
+            self._retrieval_cache = retrieval_pack
+            self._retrieval_done = True
 
         history = self._truncate_history(
             self.working.get_context(),
             int(configurationLoader.config.get("agent.max_context_messages", 0) or 0),
         )
+        history = self._sanitize_messages_for_api(history)
 
-        document = self.prompt_assembler.build_actor_document(
-            history=history,
-            soul_markdown=self.working.get_soul_markdown(),
-            extra_system_prompt=extra_system_prompt,
-            tool_definitions=tool_definitions,
-            retrieval_pack=retrieval_pack,
-        )
-        messages = self.prompt_renderer.render_document(document)
+        with timeit("actor.build.assemble"):
+            document = self.prompt_assembler.build_actor_document(
+                history=history,
+                extra_system_prompt=extra_system_prompt,
+                tool_definitions=tool_definitions,
+                retrieval_pack=retrieval_pack,
+                memory_contexts=self._memory_contexts,
+            )
+        with timeit("actor.build.render"):
+            messages = self.prompt_renderer.render_document(document)
+        lifecycle("提示词组装", f"{len(messages)} 条消息", level=2)
         return {
             "document": document,
             "messages": messages,
@@ -217,21 +448,24 @@ class ActorAgent(LargeLanguageModel):
         return anthropic_tools
 
     def _should_use_native_tools(self):
-        """判断是否满足 Anthropic 原生工具调用前提"""
+        """判断当前 provider 是否支持原生工具调用且工具定义已加载"""
         tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
 
         return (
-            self.provider == "anthropic_compatible"
+            self.core.provider_supports_native_tools
             and tool_definitions is not None
             and bool(tool_definitions)
         )
 
     @staticmethod
-    async def _run_llm_with_interrupt(query_fn, interrupt_check, poll_interval=0.3):
-        """在后台线程运行阻塞的 LLM 查询，定期检查中断标志。
+    async def _run_llm_with_interrupt(
+        query_fn, interrupt_check, poll_interval=0.3
+    ):
+        """在后台线程运行阻塞的 LLM 查询，只定期检查中断标志。
 
-        使用专用的 _LLM_EXECUTOR。如果 executor 已被 shutdown（进程关闭），
-        返回 None 让调用方当作中断处理，而非抛出异常导致 crash。
+        看门狗只负责用户中断（ESC），不再强制 LLM 硬超时——LLM 超时由
+        provider 每请求客户端超时 + LLMCore 内层重试循环负责。
+        executor 已被 shutdown（进程关闭）时返回 None 让调用方当作中断处理。
         """
         global _LLM_EXECUTOR, _LLM_EXECUTOR_SHUTDOWN
 
@@ -260,11 +494,15 @@ class ActorAgent(LargeLanguageModel):
 
         while True:
             if interrupt_check():
-                return None  # 用户中断，放弃等待
+                future.cancel()
+                return None
+
             try:
-                return await asyncio.wait_for(asyncio.shield(future), timeout=poll_interval)
+                return await asyncio.wait_for(
+                    asyncio.shield(future), timeout=poll_interval
+                )
             except asyncio.TimeoutError:
-                pass  # 超时后再次检查中断标志
+                pass
 
     @staticmethod
     async def _run_tasks_with_interrupt(tasks: list, interrupt_check):
@@ -297,7 +535,7 @@ class ActorAgent(LargeLanguageModel):
                 t.cancel()
             raise
 
-    async def act(self, max_retries=3, on_tool_call_start=None, on_thinking=None, on_tool_result=None, on_text=None, _interrupt_check=None, extra_system_prompt=None):
+    async def act(self, max_retries=3, on_tool_call_start=None, on_thinking=None, on_tool_result=None, on_text=None, on_retry=None, _interrupt_check=None, extra_system_prompt=None, on_built=None):
         """
         执行一次推理，支持工具调用重试和并发执行多个工具
 
@@ -309,6 +547,8 @@ class ActorAgent(LargeLanguageModel):
             on_text: 收到 text 块时立即回调，接收(text_content)，在工具执行前触发
             _interrupt_check: 可选中断检查回调，返回 True 表示用户请求了中断
             extra_system_prompt: 额外的系统提示词（如 Snip 提醒），注入到本步 prompt 中
+            on_built: 消息组装完成后的回调，接收 build_result dict。Gateway 用它
+                      基于同一次构建发 token 统计，避免每步重复组装一次。
         """
         # 确保工具定义已加载（防止首次调用来不及加载）
         tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
@@ -323,10 +563,16 @@ class ActorAgent(LargeLanguageModel):
         build_result = self.build_messages_with_document(extra_system_prompt)
         messages = build_result["messages"]
         tool_definitions = build_result["tool_definitions"]
+        if on_built is not None:
+            try:
+                on_built(build_result)
+            except Exception as exc:
+                logger.warning("on_built callback failed: %s", exc)
+        logger.info("act: messages built (%d msgs), entering LLM call", len(messages))
 
         if not self._should_use_native_tools():
             raise ValueError(
-                "ActorAgent requires anthropic_compatible provider and loaded tool definitions"
+                "ActorAgent requires a tool-capable provider and loaded tool definitions"
             )
 
         anthropic_tools = self._convert_tools_to_anthropic_format(tool_definitions)
@@ -339,11 +585,11 @@ class ActorAgent(LargeLanguageModel):
         return await self._act_with_native_tools(
             max_retries, on_tool_call_start, messages, anthropic_tools,
             on_thinking=on_thinking, on_tool_result=on_tool_result,
-            on_text=on_text,
+            on_text=on_text, on_retry=on_retry,
             _interrupt_check=_interrupt_check
         )
 
-    async def _act_with_native_tools(self, max_retries=3, on_tool_call_start=None, messages=None, _reuse_tools=None, on_thinking=None, on_tool_result=None, on_text=None, _auto_continue_count=0, _interrupt_check=None):
+    async def _act_with_native_tools(self, max_retries=3, on_tool_call_start=None, messages=None, _reuse_tools=None, on_thinking=None, on_tool_result=None, on_text=None, on_retry=None, _auto_continue_count=0, _interrupt_check=None):
         """
         使用 Anthropic 原生工具调用格式
 
@@ -377,10 +623,22 @@ class ActorAgent(LargeLanguageModel):
             return {"type": "interrupted"}
 
         # 调用 LLM（可被 ESC 中断：查询在后台线程运行，主循环轮询中断标志）
-        response = await self._run_llm_with_interrupt(
-            lambda: self.query(messages, **gen_kwargs),
-            _interrupt_check
-        )
+        logger.info("act: dispatching LLM request (messages=%d)", len(messages))
+        with timeit("actor.llm.query"):
+            try:
+                response = await self._run_llm_with_interrupt(
+                    lambda: self.query(messages, on_retry=on_retry, **gen_kwargs),
+                    _interrupt_check
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # 重试耗尽或不可重试错误：优雅报错，不向上抛、不触发 Gateway 崩溃重启
+                logger.error("LLM query failed after retries: %s", e)
+                return {
+                    "type": "error",
+                    "error": f"LLM 调用失败（已重试 10 次）: {type(e).__name__}: {e}",
+                }
         if response is None:
             return {"type": "interrupted"}
 
@@ -409,6 +667,12 @@ class ActorAgent(LargeLanguageModel):
             elif block_type == "thinking":
                 thinking_content.append(block_dict.get("thinking", ""))
 
+        # ── 打捞文本格式的工具调用（模型未走原生 tool_use 的降级路径）──
+        if not tool_use_blocks:
+            salvaged = _salvage_text_tool_calls(text_content)
+            if salvaged:
+                tool_use_blocks, text_content = salvaged
+
         # 立即通过回调发出 thinking（在工具执行之前）
         if thinking_content and on_thinking:
             thinking_text = _strip_id_prefixes("\n".join(thinking_content).strip())
@@ -423,28 +687,105 @@ class ActorAgent(LargeLanguageModel):
             if text_str:
                 on_text(text_str)
 
-        # ── max_tokens 截断自动续写 ──────────────────────
+        # ── max_tokens 截断自动续写 / 工具调用截断恢复 ──────────────────────
         MAX_AUTO_CONTINUE = 2
         stop_reason = getattr(response, "stop_reason", None)
-        if stop_reason == "max_tokens" and not tool_use_blocks and _auto_continue_count < MAX_AUTO_CONTINUE:
-            # 记录截断的输出（剥离 LLM 可能模仿的 [ID:xxx] 前缀）
-            if thinking_content:
-                thinking_text = _strip_id_prefixes("\n".join(thinking_content).strip())
-                self.working.append({"role": "assistant", "content": thinking_text})
-            if text_content:
-                partial = _strip_id_prefixes("\n".join(text_content).strip())
-                self.working.append({"role": "assistant", "content": partial})
-            # 注入续写指令
-            self.working.append({
-                "role": "user",
-                "content": "Continue exactly where you stopped. Do not repeat previous content."
-            })
+        if stop_reason == "max_tokens" and _auto_continue_count < MAX_AUTO_CONTINUE:
+            if tool_use_blocks:
+                # 原生 tool_use 被截断：视为参数非法，不执行，直接返回错误让模型重试
+                logger.warning(
+                    "Native tool_use truncated by max_tokens; treating as invalid tool calls"
+                )
+                error_msgs = []
+                tool_results = []
+                for block in tool_use_blocks:
+                    tool_name = block.get("name", "?")
+                    error_msg = (
+                        f"InputValidationError: tool call '{tool_name}' was truncated by the output "
+                        f"token limit and its arguments are incomplete/invalid. "
+                        f"last tool use has been wrongly stopped by output token limit."
+                    )
+                    error_msgs.append(error_msg)
+                    tool_results.append(
+                        ToolCall.create_anthropic_tool_result(
+                            block.get("id"),
+                            error_msg,
+                            is_error=True,
+                        )
+                    )
+
+                self.working.append({
+                    "role": "assistant",
+                    "content": [block for block in response.content],
+                })
+                self.working.append({
+                    "role": "user",
+                    "content": tool_results + [{
+                        "type": "text",
+                        "text": (
+                            f"部分工具调用失败: {'; '.join(error_msgs)}\n"
+                            "请重新生成正确的工具调用。"
+                        ),
+                    }],
+                })
+
+                if max_retries > 0:
+                    return await self._act_with_native_tools(
+                        max_retries - 1, on_tool_call_start,
+                        _reuse_tools=_reuse_tools,
+                        on_thinking=on_thinking, on_tool_result=on_tool_result,
+                        on_text=on_text, on_retry=on_retry, _interrupt_check=_interrupt_check
+                    )
+                return {
+                    "type": "error",
+                    "error": "; ".join(error_msgs),
+                }
+
+            # 非工具调用文本截断：记录截断输出并让模型继续
+            truncated_content = self._build_assistant_content(thinking_content, text_content, [])
+            if truncated_content:
+                self.working.append({"role": "assistant", "content": truncated_content})
+
+            # 判断输出里是否包含未打捞成功的伪工具调用标记
+            # （模型把工具调用写成文本但被 max_tokens 截断，导致 JSON/XML 不完整）
+            full_text = "\n".join(text_content)
+            has_truncated_tool_call = (
+                "[TOOL_CALL]" in full_text or "<minimax:tool_call>" in full_text
+            ) and _salvage_text_tool_calls(text_content) is None
+
+            if has_truncated_tool_call:
+                # 工具调用被截断：继续续写只会重复/补全无效 JSON，
+                # 应让模型拆分成更小粒度重新生成。
+                logger.warning(
+                    "Tool call truncated by max_tokens; instructing model to chunk content"
+                )
+                self.working.append({
+                    "role": "system",
+                    "content": (
+                        "Your previous output contained a tool call that was truncated by the "
+                        "output token limit and cannot be executed. Do not continue the truncated "
+                        "content. Instead, split the task into smaller pieces: first Write a "
+                        "minimal runnable skeleton, then fill it in incrementally with multiple "
+                        "Edit calls, or split large files into smaller modules."
+                    ),
+                })
+            else:
+                # 普通文本截断：让模型继续输出
+                self.working.append({
+                    "role": "system",
+                    "content": (
+                        "Output token limit hit. Resume directly — no apology, no recap of what you "
+                        "were doing. Pick up mid-thought if that is where the cut happened. Break "
+                        "remaining work into smaller pieces."
+                    ),
+                })
+
             new_messages = self.build_messages()
             return await self._act_with_native_tools(
                 max_retries, on_tool_call_start, new_messages,
                 _reuse_tools=_reuse_tools,
                 on_thinking=on_thinking, on_tool_result=on_tool_result,
-                on_text=on_text,
+                on_text=on_text, on_retry=on_retry,
                 _auto_continue_count=_auto_continue_count + 1,
                 _interrupt_check=_interrupt_check
             )
@@ -453,7 +794,10 @@ class ActorAgent(LargeLanguageModel):
         if thinking_content and not text_content and not tool_use_blocks:
             thinking_text = _strip_id_prefixes("\n".join(thinking_content).strip())
             if thinking_text:
-                self.working.append({"role": "assistant", "content": thinking_text})
+                self.working.append({
+                    "role": "assistant",
+                    "content": self._build_assistant_content(thinking_content, [], []),
+                })
                 return {
                     "type": "continue",
                     "content": thinking_text,
@@ -466,7 +810,26 @@ class ActorAgent(LargeLanguageModel):
         if not tool_use_blocks:
             answer = _strip_id_prefixes("\n".join(text_content).strip())
             if answer:
-                self.working.append({"role": "assistant", "content": answer})
+                # verify 硬闸门：有足量未验证的文件修改时拦截最终答案，
+                # 强制先调 verify 子智能体（防绕过验收）
+                from Tools.verify_nudge import verify_nudge
+                gate_msg = verify_nudge.gate_final_answer()
+                if gate_msg:
+                    self.working.append({
+                        "role": "assistant",
+                        "content": self._build_assistant_content(thinking_content, text_content, []),
+                    })
+                    self.working.append({"role": "user", "content": gate_msg})
+                    return await self._act_with_native_tools(
+                        max_retries, on_tool_call_start, self.build_messages(),
+                        _reuse_tools=anthropic_tools,
+                        on_thinking=on_thinking, on_tool_result=on_tool_result,
+                        on_text=on_text, on_retry=on_retry, _interrupt_check=_interrupt_check
+                    )
+                self.working.append({
+                    "role": "assistant",
+                    "content": self._build_assistant_content(thinking_content, text_content, []),
+                })
                 result = {
                     "type": "answer",
                     "answer": answer,
@@ -479,8 +842,13 @@ class ActorAgent(LargeLanguageModel):
                 return result
             # 空响应，重试
             if max_retries > 0:
-                return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, on_text=on_text, _interrupt_check=_interrupt_check)
-            raise ValueError("模型返回空响应")
+                return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, on_text=on_text, on_retry=on_retry, _interrupt_check=_interrupt_check)
+            # 重试耗尽：优雅报错，绝不上抛——冲出这里会触发 Gateway 崩溃重启
+            logger.error("Empty LLM response after exhausting %d retries", max_retries)
+            return {
+                "type": "error",
+                "error": "模型连续返回空响应（多次重试后仍为空）。请检查模型配置或稍后重试。",
+            }
 
         # 并发执行所有工具调用
 
@@ -515,18 +883,34 @@ class ActorAgent(LargeLanguageModel):
 
             # 通知工具调用开始
             call_id = tool_use_block.get("id", "")
+            lifecycle("工具调用", f"{tool_name}({self._summarize_arguments(args)})", level=2)
             if on_tool_call_start:
                 on_tool_call_start(tool_name, args, call_id, guard_result)
 
             # 执行工具调用
             try:
-                result = await self.tool_runtime.call_tool(tool_name, args)
+                with timeit(f"tool.execute.{tool_name}"):
+                    result = await self.tool_runtime.call_tool(tool_name, args)
             except asyncio.CancelledError:
                 return {
                     "error": "AbortError: User aborted",
                     "tool_use_id": tool_use_block.get("id"),
                 }
             result_text = self._stringify_tool_result(result)
+            lifecycle("工具结果", f"{tool_name}: {self._preview_text(result_text)}", level=2)
+
+            # 记录到工具调用历史板（供 Verify 审计主 Agent 本轮做了什么）
+            try:
+                from Tools.tool_call_board import record_main_call
+                record_main_call(
+                    tool_name,
+                    self._summarize_arguments(args),
+                    self._preview_text(result_text),
+                    is_error=ToolCall.classify_is_error(tool_name, result_text),
+                    backgrounded=self._is_backgrounded(result_text),
+                )
+            except Exception:
+                pass
 
             # 立即通过回调发出单个工具结果（不等其他工具）
             if on_tool_result:
@@ -557,9 +941,6 @@ class ActorAgent(LargeLanguageModel):
         # 检查是否有错误
         errors = [r for r in results if "error" in r]
         if errors and max_retries > 0:
-            # 构建错误反馈消息
-            error_msgs = [r["error"] for r in errors]
-
             # 将原始响应的 tool_use 块存入上下文
             self.working.append({
                 "role": "assistant",
@@ -567,13 +948,17 @@ class ActorAgent(LargeLanguageModel):
             })
 
             # 为所有工具调用添加 tool_result（成功和失败都要配对，避免 400/2013 错误）
+            # 错误结果统一用 InputValidationError: 前缀兜底，方便模型识别
             tool_results = []
             for r in results:
                 if "error" in r:
+                    error_text = r["error"]
+                    if not str(error_text).startswith("InputValidationError:"):
+                        error_text = f"InputValidationError: {error_text}"
                     tool_results.append(
                         ToolCall.create_anthropic_tool_result(
                             r["tool_use_id"],
-                            r["error"],
+                            error_text,
                             is_error=True,
                         )
                     )
@@ -587,6 +972,7 @@ class ActorAgent(LargeLanguageModel):
                         )
                     )
 
+            error_msgs = [r["error"] for r in errors]
             self.working.append({
                 "role": "user",
                 "content": tool_results + [{
@@ -595,29 +981,23 @@ class ActorAgent(LargeLanguageModel):
                 }],
             })
 
-            return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, on_text=on_text, _interrupt_check=_interrupt_check)
+            return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, on_text=on_text, on_retry=on_retry, _interrupt_check=_interrupt_check)
 
         # 记录所有成功的工具调用到 working memory
         # Separate backgrounded results from synchronous results
-        assistant_content = []
         user_content = []
         backgrounded_results = []
         synchronous_results = []
+        kept_tool_uses = []  # 非 error 结果的 tool_use 块，用于重建 assistant 消息
 
-        # 1. 如果有 text 内容，先添加 text 块（保留 LLM 的说明文字）
-        if text_content:
-            text_str = "\n".join(text_content).strip()
-            if text_str:
-                assistant_content.append({"type": "text", "text": text_str})
-
-        # 2. 分类处理 tool_use 块
+        # 分类处理 tool_use 块（tool_result 配对 + 后台/同步区分）
         for i, result in enumerate(results):
             if "error" in result:
                 continue
             is_bg = self._is_backgrounded(result["result_text"])
             if is_bg:
                 backgrounded_results.append(result)
-                assistant_content.append(tool_use_blocks[i])
+                kept_tool_uses.append(tool_use_blocks[i])
                 # Extract background task info
                 try:
                     bg_info = json.loads(result["result_text"])
@@ -650,7 +1030,7 @@ class ActorAgent(LargeLanguageModel):
                 ).to_dict())
             else:
                 synchronous_results.append(result)
-                assistant_content.append(tool_use_blocks[i])
+                kept_tool_uses.append(tool_use_blocks[i])
                 is_error = ToolCall.classify_is_error(result["tool_name"], result["result_text"])
                 user_content.append(
                     ToolCall.create_anthropic_tool_result(
@@ -660,7 +1040,10 @@ class ActorAgent(LargeLanguageModel):
                     )
                 )
 
-        # 记录到 working memory (all results include tool_result for API pairing)
+        # 记录到 working memory：严格透明回传 thinking + text + tool_use（Anthropic 格式）
+        assistant_content = self._build_assistant_content(
+            thinking_content, text_content, kept_tool_uses
+        )
         if assistant_content:
             self.working.append({
                 "role": "assistant",

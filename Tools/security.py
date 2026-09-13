@@ -17,6 +17,23 @@ class CommandSecurityChecker:
         self.dangerous_commands = self.security_config.get("dangerous_commands", [])
         self.require_confirmation = self.security_config.get("require_confirmation", [])
 
+    def classify_command(self, cmd: str) -> str:
+        """三态分类：'safe' | 'blocked'（硬黑名单）| 'confirm'（需用户确认）。
+
+        confirm 仅在 allow_confirmation=True 时返回；否则 require_confirmation
+        命令按 blocked 处理（保持旧的硬拦行为）。
+        """
+        if not self.enabled:
+            return "safe"
+        cmd_lower = cmd.lower().strip()
+        for dangerous_pattern in self.dangerous_commands:
+            if self._matches_pattern(cmd_lower, dangerous_pattern.lower()):
+                return "blocked"
+        for confirm_pattern in self.require_confirmation:
+            if self._matches_pattern(cmd_lower, confirm_pattern.lower()):
+                return "confirm" if self.allow_confirmation else "blocked"
+        return "safe"
+
     def check_command(self, cmd: str) -> Tuple[bool, Optional[str]]:
         """
         检查命令是否安全

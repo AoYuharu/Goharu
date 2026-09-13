@@ -5,9 +5,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from Tools.registry import registry
+from Tools.touched_files import record as record_touched_file
 
 
 SKIPPED_DIRS = {".git", ".cache", "__pycache__", ".venv", "venv", "node_modules"}
+
+# 单次 Write 内容上限（字符数）。超过此值会让模型改用 Edit 分段追加，
+# 避免一次性输出过大导致 max_tokens 截断、伪工具调用解析失败。
+# 按混合中英文代码约 3 字符/token 估算，8000 字符约 2600 token，
+# 加上工具调用包装后仍远小于 8192 的 max_tokens 上限。
+MAX_WRITE_CHARS = 8000
 
 
 @dataclass
@@ -298,6 +305,22 @@ async def Read(path: str, start_line: int = 1, end_line: int | None = None, acto
     finally:
         await _file_state.release_read(file_key, actor_id)
 
+    # 显式视图状态提醒：部分视图 vs 已读完整文件，防止模型把"读到上限"误认为"文件结束"
+    if start_line > total_lines:
+        notice = (
+            f"<system-reminder>文件共 {total_lines} 行，起始行 {start_line} 已超出文件末尾，"
+            f"未返回任何内容。</system-reminder>"
+        )
+    elif actual_end < total_lines:
+        notice = (
+            f"<system-reminder>部分视图：文件共 {total_lines} 行，当前仅显示第 {start_line}-{actual_end} 行。"
+            f"这不是完整文件；如需继续阅读，用 start_line={actual_end + 1} 再次调用 Read。</system-reminder>"
+        )
+    else:
+        notice = (
+            f"<system-reminder>已读到文件末尾（共 {total_lines} 行），这是完整内容。</system-reminder>"
+        )
+
     return _json(
         {
             "file": str(path_obj),
@@ -305,6 +328,7 @@ async def Read(path: str, start_line: int = 1, end_line: int | None = None, acto
             "end_line": actual_end,
             "total_lines": total_lines,
             "content": content,
+            "notice": notice,
         }
     )
 
@@ -320,6 +344,13 @@ async def Write(
     if path_obj.exists():
         return _error("文件已存在，请使用 Edit 工具修改", path=str(path_obj))
 
+    if len(content) > MAX_WRITE_CHARS:
+        return _error(
+            f"内容过长（{len(content)} 字符），超过单次 Write 上限 {MAX_WRITE_CHARS} 字符",
+            hint="大文件请先 Write 一个最小可运行骨架，再用多次 Edit 分段补充；或拆成多个小文件",
+            path=str(path_obj),
+        )
+
     file_key = _file_state.normalize_path(str(path_obj))
     blocked = await _file_state.acquire_write(file_key, actor_id)
     if blocked is not None:
@@ -334,6 +365,7 @@ async def Write(
         newline = "\n"  # 默认使用 LF
         has_trailing_newline = True
         _write_file_text(path_obj, lines, newline, has_trailing_newline)
+        record_touched_file(str(path_obj))
     finally:
         await _file_state.release_write(file_key, actor_id)
 
@@ -403,6 +435,7 @@ async def Edit(
         new_has_trailing = new_text.endswith(("\n", "\r\n", "\r"))
 
         _write_file_text(path_obj, new_lines, newline, new_has_trailing)
+        record_touched_file(str(path_obj))
     finally:
         await _file_state.release_write(file_key, actor_id)
 
@@ -414,6 +447,47 @@ async def Edit(
             "new_length": len(new_string),
         }
     )
+
+
+async def WriteTestFile(
+    filename: str,
+    content: str,
+    actor_id: str = "agent",
+) -> str:
+    """Create a test file inside a system temp directory (never the project dir).
+
+    供 Verify 子 agent 写入自编测试用例/复现脚本，路径固定在系统临时目录下，
+    绝不触碰项目目录，避免污染 git status 或 SWE-bench 的 patch 提取。
+    """
+    import tempfile
+
+    name = Path(filename).name
+    if not name or name != filename or name in (".", ".."):
+        return _error("文件名必须是纯文件名（不含路径分隔符或为空）", filename=filename)
+
+    base = Path(tempfile.gettempdir()) / "goharu_verify"
+    path_obj = base / name
+
+    if path_obj.exists():
+        return _error("文件已存在，请换一个文件名", path=str(path_obj))
+    if len(content) > MAX_WRITE_CHARS:
+        return _error(
+            f"内容过长（{len(content)} 字符），超过单次写入上限 {MAX_WRITE_CHARS} 字符",
+            hint="拆成多个测试文件，或精简测试用例",
+        )
+
+    file_key = _file_state.normalize_path(str(path_obj))
+    blocked = await _file_state.acquire_write(file_key, actor_id)
+    if blocked is not None:
+        return _json(blocked)
+
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        path_obj.write_text(content, encoding="utf-8")
+    finally:
+        await _file_state.release_write(file_key, actor_id)
+
+    return _json({"ok": True, "file": str(path_obj)})
 
 
 registry.register(
@@ -435,13 +509,13 @@ registry.register(
 
 registry.register(
     name="Read",
-    description="Read a file from the local filesystem. Returns line-by-line content with 1-based line numbers. After reading, grants Edit permission for that file. Cannot read directories (use run_cmd dir instead). MAX 300 lines per call: if end_line is omitted, defaults to start_line+299; if range exceeds 300 lines, returns an error. Use multiple calls with different start_line/end_line to read large files.",
+    description="Read a file from the local filesystem. Returns line-by-line content with 1-based line numbers. After reading, grants Edit permission for that file. Cannot read directories (use run_cmd dir instead). MAX 200 lines per call: if end_line is omitted, defaults to start_line+199; if range exceeds 200 lines, returns an error. Use multiple calls with different start_line/end_line to read large files.",
     arguments_schema={
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Absolute file path to read (e.g. 'C:/project/main.py')."},
             "start_line": {"type": "integer", "description": "Start line number (1-based). Default: 1 (beginning)."},
-            "end_line": {"type": "integer", "description": "End line number (1-based, inclusive). Default: start_line+299 (max 300 lines total). Range cannot exceed 300 lines."},
+            "end_line": {"type": "integer", "description": "End line number (1-based, inclusive). Default: start_line+199 (max 200 lines total). Range cannot exceed 200 lines."},
         },
         "required": ["path"],
     },
@@ -477,5 +551,20 @@ registry.register(
         "required": ["path", "old_string", "new_string"],
     },
     handler=Edit,
+    group="file",
+)
+
+registry.register(
+    name="WriteTestFile",
+    description="Write a test file into a system temp directory (NEVER the project directory). Use this to create pytest test cases or repro scripts for verification. Returns the absolute file path; run it with `python -m pytest <path>` or `python <path>`. Accepts a pure filename only (no path separators). Fails if the file already exists.",
+    arguments_schema={
+        "type": "object",
+        "properties": {
+            "filename": {"type": "string", "description": "Pure filename (no path separators), e.g. 'test_repro_13032.py'."},
+            "content": {"type": "string", "description": "Full test file content."},
+        },
+        "required": ["filename", "content"],
+    },
+    handler=WriteTestFile,
     group="file",
 )

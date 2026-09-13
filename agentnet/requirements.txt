@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+sentence-transformers
+jieba
+modelscope

@@ -66,19 +66,31 @@ async function replayScript(message) {
   await sleep(300);
   event("tool.result", { tool: "run_cmd", call_id: "call_1", result: "hello\n" });
   event("agent.text_content", { step: 1, text: "工具执行完成，我来整理结果。" });
+  // ── 后台任务事件（task.background.update 协议演示）──
+  event("task.background.update", { task_id: 7, tool: "run_cmd", args: "python train_model.py --epochs 50", status: "running", started_at: Date.now() / 1000 });
+  event("task.background.update", { task_id: 8, tool: "parse_pdf", args: "big_report.pdf, 1-20", status: "running", started_at: Date.now() / 1000 });
   await sleep(200);
-  // ── subagent 事件序列（subagent.update 协议演示）──
-  event("subagent.update", { agent_id: "explore_a1b2c3d4", agent_type: "explore", task: "Search for config files in E:/Goharu/src which refer to Animation and Rendering", kind: "started", level: "info", message: "🚀 启动 explore agent [explore_a1b2c3d4]" });
-  event("subagent.update", { agent_id: "plan_e5f6a7b8", agent_type: "plan", task: "Design the rendering pipeline", kind: "started", level: "info", message: "🚀 启动 plan agent [plan_e5f6a7b8]" });
+  // ── subagent 事件序列（subagent.update 结构化协议演示）──
+  const exploreTask = "Search for config files in E:/Goharu/src which refer to Animation and Rendering";
+  const planTask = "Design the rendering pipeline";
+  const base1 = { agent_id: "explore_a1b2c3d4", agent_type: "explore", task: exploreTask };
+  const base2 = { agent_id: "plan_e5f6a7b8", agent_type: "plan", task: planTask };
+  event("subagent.update", { ...base1, kind: "started", level: "info", message: "🚀 启动 explore agent [explore_a1b2c3d4]" });
+  event("subagent.update", { ...base2, kind: "started", level: "info", message: "🚀 启动 plan agent [plan_e5f6a7b8]" });
   await sleep(400);
-  event("subagent.update", { agent_id: "explore_a1b2c3d4", agent_type: "explore", task: "Search for config files", kind: "activity", level: "info", message: "  🔄 [explore_a1b2c3d4] 迭代 1/8" });
-  event("subagent.update", { agent_id: "explore_a1b2c3d4", agent_type: "explore", task: "Search for config files", kind: "activity", level: "info", message: "  🔧 [explore_a1b2c3d4] 调用工具: Glob({pattern: \"**/*.yaml\"})" });
+  event("subagent.update", { ...base1, kind: "activity", level: "info", category: "iteration", content: "1/8", message: "🔄 迭代 1/8" });
+  event("subagent.update", { ...base1, kind: "activity", level: "debug", category: "thinking", content: "我需要先找到所有 yaml 配置文件，然后逐一检查是否涉及 Animation。\n先从 src 目录开始。", message: "💭 思考" });
+  event("subagent.update", { ...base1, kind: "activity", level: "info", category: "tool_call", tool: "Glob", content: '{"pattern": "**/*.yaml"}', message: "🔧 调用工具: Glob" });
   await sleep(400);
-  event("subagent.update", { agent_id: "explore_a1b2c3d4", agent_type: "explore", task: "Search for config files", kind: "activity", level: "debug", message: "  ✓ [explore_a1b2c3d4] 工具结果: found 3 files..." });
-  event("subagent.update", { agent_id: "plan_e5f6a7b8", agent_type: "plan", task: "Design the rendering pipeline", kind: "activity", level: "info", message: "  💭 [plan_e5f6a7b8] 思考: 需要分层架构..." });
+  event("subagent.update", { ...base1, kind: "activity", level: "debug", category: "tool_result", tool: "Glob", content: '{"filenames": ["src/config.yaml", "src/anim.yaml"]}', message: "✓ 工具结果" });
+  event("subagent.update", { ...base2, kind: "activity", level: "info", category: "iteration", content: "1/5", message: "🔄 迭代 1/5" });
+  event("subagent.update", { ...base2, kind: "activity", level: "debug", category: "thinking", content: "渲染管线需要分层设计：数据层、布局层、绘制层。", message: "💭 思考" });
   await sleep(400);
-  event("subagent.update", { agent_id: "explore_a1b2c3d4", agent_type: "explore", task: "Search for config files", kind: "finished", level: "info", message: "✅ explore agent [explore_a1b2c3d4] 完成", status: "success" });
-  event("subagent.update", { agent_id: "plan_e5f6a7b8", agent_type: "plan", task: "Design the rendering pipeline", kind: "finished", level: "error", message: "❌ plan agent [plan_e5f6a7b8] 完成", status: "error" });
+  event("subagent.update", { ...base1, kind: "activity", level: "info", category: "final", content: "找到 3 个相关配置文件：**src/config.yaml**、src/anim.yaml、src/render.yaml。", message: "✅ 得出最终结论" });
+  event("subagent.update", { ...base1, kind: "finished", level: "info", message: "✅ explore agent 完成", status: "success" });
+  event("subagent.update", { ...base2, kind: "finished", level: "error", message: "❌ plan agent 完成", status: "error" });
+  event("task.background.update", { task_id: 7, tool: "run_cmd", status: "success" });
+  event("task.background.completed", { count: 1, task_ids: [7] });
   event("agent.step", { step: 2 });
   event("agent.llm_requesting");
   await sleep(300);

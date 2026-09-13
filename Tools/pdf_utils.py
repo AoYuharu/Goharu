@@ -4,28 +4,18 @@ PDF 工具模块 - 与 Claude Code Read 工具对齐的 PDF 处理逻辑
 提供：
 - PDF 魔法字节校验（防止非 PDF 文件误处理）
 - 页面计数（PyMuPDF，替代 pdfinfo）
-- 页面提取为 JPEG（PyMuPDF，替代 pdftoppm）
 - 页码范围解析（支持 "1-5" / "3" / "3-" 格式）
-- 文件扩展名检查
+- 逐页文本层提取（纯文本，无 OCR）
 
 常量阈值与 Claude Code 保持一致。
 """
 
-import base64
-import os
 from pathlib import Path
 from typing import Optional
 
 # =============================================================================
 # 常量（与 Claude Code apiLimits.ts 对齐）
 # =============================================================================
-
-# 最大原始 PDF 文件大小（20 MB），超过此值不读取为 base64
-# 因为 base64 编码后 +33%，20 MB 解码后大约 26.7 MB，在 32 MB API 请求限制内
-PDF_TARGET_RAW_SIZE = 20 * 1024 * 1024  # 20 MB
-
-# 文件大小阈值（3 MB），超过此值的大 PDF 应提取为页面图片而非发送 base64
-PDF_EXTRACT_SIZE_THRESHOLD = 3 * 1024 * 1024  # 3 MB
 
 # 页面提取路径的最大 PDF 文件大小（100 MB）
 PDF_MAX_EXTRACT_SIZE = 100 * 1024 * 1024  # 100 MB
@@ -35,16 +25,6 @@ PDF_MAX_PAGES_PER_READ = 20
 
 # @ mention 内联阈值：页数超过此值时引导 Agent 使用 pages 参数
 PDF_AT_MENTION_INLINE_THRESHOLD = 10
-
-# =============================================================================
-# 文件扩展名检查
-# =============================================================================
-
-
-def is_pdf_extension(path: str) -> bool:
-    """检查文件路径的扩展名是否为 .pdf"""
-    ext = os.path.splitext(path)[1]
-    return ext.lower() == ".pdf"
 
 
 # =============================================================================
@@ -69,75 +49,6 @@ def validate_pdf_magic_bytes(filepath: str) -> bool:
         return header == b"%PDF-"
     except (IOError, OSError):
         return False
-
-
-# =============================================================================
-# PDF 读取（base64 编码）
-# =============================================================================
-
-
-def read_pdf(filepath: str) -> dict:
-    """读取 PDF 文件为 base64 编码字符串
-
-    与 Claude Code readPDF() 对齐：
-    - 检查文件非空
-    - 检查文件不超过 PDF_TARGET_RAW_SIZE
-    - 校验 %PDF- 魔法字节
-    - 返回 base64 编码的 PDF 内容
-
-    Args:
-        filepath: PDF 文件路径
-
-    Returns:
-        dict: {"success": True, "data": {"base64": str, "size": int}}
-        或    {"success": False, "error": {"reason": str, "message": str}}
-    """
-    try:
-        filepath_obj = Path(filepath)
-        if not filepath_obj.exists():
-            return {
-                "success": False,
-                "error": {"reason": "unavailable", "message": f"File not found: {filepath}"},
-            }
-
-        file_size = filepath_obj.stat().st_size
-        if file_size == 0:
-            return {
-                "success": False,
-                "error": {"reason": "empty", "message": "PDF file is empty"},
-            }
-
-        if file_size > PDF_TARGET_RAW_SIZE:
-            return {
-                "success": False,
-                "error": {
-                    "reason": "too_large",
-                    "message": f"PDF file size ({file_size} bytes) exceeds maximum ({PDF_TARGET_RAW_SIZE} bytes)",
-                },
-            }
-
-        if not validate_pdf_magic_bytes(filepath):
-            return {
-                "success": False,
-                "error": {
-                    "reason": "corrupted",
-                    "message": "File does not appear to be a valid PDF (missing %PDF- header)",
-                },
-            }
-
-        with open(filepath, "rb") as f:
-            pdf_bytes = f.read()
-
-        b64_content = base64.b64encode(pdf_bytes).decode("ascii")
-        return {
-            "success": True,
-            "data": {"base64": b64_content, "size": file_size},
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": {"reason": "unknown", "message": str(e)},
-        }
 
 
 # =============================================================================
@@ -230,30 +141,26 @@ def parse_pdf_page_range(pages_str: str) -> Optional[dict]:
 
 
 # =============================================================================
-# 页面提取（PyMuPDF 渲染为 JPEG）
+# 页面文本提取（PyMuPDF）
 # =============================================================================
 
 
-def extract_pdf_pages(
+def extract_pdf_page_texts(
     filepath: str,
     first_page: int,
     last_page: Optional[int],
-    output_dir: str,
-    dpi: int = 100,
 ) -> dict:
-    """使用 PyMuPDF 渲染指定页面为 JPEG 图片
-
-    与 Claude Code extractPDFPages() 对齐，但使用 PyMuPDF 替代 pdftoppm。
+    """使用 PyMuPDF 提取指定页码范围的文本层（替代旧的 JPEG 渲染路径——
+    纯文本模型无法查看图片，逐页文本才是可读内容）。
 
     Args:
         filepath: PDF 文件路径
         first_page: 起始页码（1-based）
-        last_page: 结束页码（1-based，None 表示到文件末尾但不超过 max_pages）
-        output_dir: 输出目录
-        dpi: 渲染 DPI（默认 100，与 pdftoppm 默认值对齐）
+        last_page: 结束页码（1-based，None 表示到文件末尾但不超过 MAX_PAGES_PER_READ）
 
     Returns:
-        dict: {"success": True, "data": {"images": [...], "output_dir": str, "page_count": int}}
+        dict: {"success": True, "data": {"pages": [{"page": int, "text": str}],
+              "page_count": int, "total_pages": int, "has_text": bool}}
         或    {"success": False, "error": {"reason": str, "message": str}}
     """
     try:
@@ -342,48 +249,23 @@ def extract_pdf_pages(
                 },
             }
 
-        if actual_first > actual_last:
-            doc.close()
-            return {
-                "success": False,
-                "error": {
-                    "reason": "corrupted",
-                    "message": "Invalid page range",
-                },
-            }
-
-        # --- 创建输出目录 ---
-        out_path = Path(output_dir)
-        out_path.mkdir(parents=True, exist_ok=True)
-
-        # --- 渲染页面 ---
-        images = []
+        # --- 逐页提取文本 ---
+        pages = []
+        total_chars = 0
         for page_num in range(actual_first - 1, actual_last):  # 0-based index
-            page = doc[page_num]
-            pix = page.get_pixmap(dpi=dpi)
-            page_label = page_num + 1  # 1-based
-            image_filename = f"page-{page_label:02d}.jpg"
-            image_path = out_path / image_filename
-            pix.save(str(image_path))
-
-            images.append(
-                {
-                    "page": page_label,
-                    "path": str(image_path),
-                    "width": pix.width,
-                    "height": pix.height,
-                }
-            )
+            text = str(doc[page_num].get_text())
+            total_chars += len(text.strip())
+            pages.append({"page": page_num + 1, "text": text})
 
         doc.close()
 
         return {
             "success": True,
             "data": {
-                "images": images,
-                "output_dir": str(out_path),
-                "page_count": len(images),
+                "pages": pages,
+                "page_count": len(pages),
                 "total_pages": total_pages,
+                "has_text": total_chars > 0,
             },
         }
 

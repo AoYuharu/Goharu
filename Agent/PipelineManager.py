@@ -402,6 +402,7 @@ class PipelineManager:
         with self._lock:
             timer = threading.Timer(self.l2_delay_after_l1, self._run_l2)
             timer.daemon = True
+            timer.name = "PipelineManager-L2"
             self._l2_timer = timer
         timer.start()
         logger.info("PipelineManager: L2 scheduled in %.0fs", self.l2_delay_after_l1)
@@ -586,6 +587,7 @@ class PipelineManager:
         self._cancel_timer("_idle_timer")
         with self._lock:
             timer = threading.Timer(self.l1_idle_timeout, self._on_idle_timeout)
+            timer.name = "PipelineManager-Idle"
             timer.daemon = True
             self._idle_timer = timer
         timer.start()

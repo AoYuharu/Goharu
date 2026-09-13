@@ -31,12 +31,16 @@ export function messageToLines(msg: ChatMessage): string[] {
   return lines;
 }
 
+/** Uncached variant for synthetic/live-updating messages (subagent view). */
+export const buildMessageLines = buildLines;
+
 function buildLines(msg: ChatMessage): string[] {
   const ts = chalk.dim(`[${msg.ts}] `);
   switch (msg.kind) {
     case "splash": {
       const styles: Record<string, (s: string) => string> = {
         cyan: chalk.cyan, blue: chalk.blue, magenta: chalk.magenta,
+        gray: chalk.gray, yellow: chalk.yellow, green: chalk.green, red: chalk.red,
       };
       const style = (msg.color && styles[msg.color]) || ((s: string) => s);
       return [style(msg.text)];
@@ -57,7 +61,7 @@ function buildLines(msg: ChatMessage): string[] {
     case "note":
       return [
         ts + chalk.bold.green("Assistant") + chalk.dim(` (Step ${msg.step})`),
-        ...msg.text.split("\n"),
+        ...renderMarkdown(msg.text).split("\n"),
         " ",
       ];
     case "tool": {

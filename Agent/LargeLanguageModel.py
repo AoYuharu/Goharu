@@ -8,8 +8,8 @@ class LargeLanguageModel:
     def getTokenSize(self, text):
         return self.core.get_token_size(text)
 
-    def query(self, messages, **kwargs):
-        return self.core.generate(messages, **kwargs)
+    def query(self, messages, on_retry=None, **kwargs):
+        return self.core.generate(messages, on_retry=on_retry, **kwargs)
 
     def get_last_thinking(self):
         """获取最近一次 API 调用返回的 thinking 内容（若无则返回 None）"""

@@ -2,6 +2,7 @@ import React from "react";
 import { Box, Text } from "ink";
 import chalk from "chalk";
 import wrapAnsi from "wrap-ansi";
+import { highlightLine } from "../format.js";
 
 export interface ToolHistoryEntry {
   callId: string;
@@ -128,11 +129,18 @@ export function toolDetailLines(data: ToolDetailData): string[] {
   ];
 }
 
-export function ToolDetailPanel({ data, scroll }: { data: ToolDetailData; scroll: number }) {
-  const contentRows = TOOL_PANEL_ROWS - 4; // border×2 + header + hint
-  const lines = toolDetailLines(data);
-  const maxScroll = Math.max(0, lines.length - contentRows);
-  const off = Math.min(scroll, maxScroll);
+export function ToolDetailPanel({
+  data,
+  scroll,
+  selFrom = -1,
+  selTo = -1,
+}: {
+  data: ToolDetailData;
+  scroll: number;
+  selFrom?: number; // highlighted interior-line range (inclusive), -1 = none
+  selTo?: number;
+}) {
+  const lines = toolPanelLines(data, scroll);
   const accent = data.isError ? "red" : "magenta";
 
   return (
@@ -144,21 +152,34 @@ export function ToolDetailPanel({ data, scroll }: { data: ToolDetailData; scroll
       backgroundColor={PANEL_BG}
       paddingX={1}
     >
-      <Text backgroundColor={PANEL_BG}>
-        <Text color={accent}>⚙ </Text>
-        <Text bold color={accent}>{data.tool}</Text>
-        <Text dimColor>({data.argsBrief})</Text>
-        <Text dimColor>  [{data.ts}] </Text>
-        <Text color={data.isError ? "red" : "green"}>{data.isError ? "✗ failed" : "✓ done"}</Text>
-      </Text>
-      <Box flexDirection="column" height={contentRows}>
-        {lines.slice(off, off + contentRows).map((line, i) => (
-          <Text key={off + i} wrap="truncate" backgroundColor={PANEL_BG}>{line}</Text>
-        ))}
-      </Box>
-      <Text dimColor backgroundColor={PANEL_BG}>
-        ↑↓ Scroll{maxScroll > 0 ? ` ${off + 1}-${Math.min(off + contentRows, lines.length)}/${lines.length}` : ""} | Click tool again or Esc to close
-      </Text>
+      {lines.map((line, i) => (
+        <Text key={i} wrap="truncate" backgroundColor={PANEL_BG}>
+          {i >= selFrom && i <= selTo ? highlightLine(line) : line}
+        </Text>
+      ))}
     </Box>
   );
+}
+
+/** The panel's exact interior lines (header + content window + hint). */
+export function toolPanelLines(data: ToolDetailData, scroll: number): string[] {
+  const contentRows = TOOL_PANEL_ROWS - 4; // border×2 + header + hint
+  const lines = toolDetailLines(data);
+  const maxScroll = Math.max(0, lines.length - contentRows);
+  const off = Math.min(scroll, maxScroll);
+  const colorName = data.isError ? "red" : "magenta";
+
+  const header =
+    chalk[colorName]("⚙ ") +
+    chalk.bold[colorName](data.tool) +
+    chalk.dim(`(${data.argsBrief})`) +
+    chalk.dim(`  [${data.ts}] `) +
+    (data.isError ? chalk.red("✗ failed") : chalk.green("✓ done"));
+  const hint = chalk.dim(
+    `↑↓ Scroll${maxScroll > 0 ? ` ${off + 1}-${Math.min(off + contentRows, lines.length)}/${lines.length}` : ""} | Click tool again or Esc to close`,
+  );
+
+  const content = lines.slice(off, off + contentRows);
+  while (content.length < contentRows) content.push(" ");
+  return [header, ...content, hint];
 }

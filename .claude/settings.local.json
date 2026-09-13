@@ -22,7 +22,8 @@
       "Bash(find prompts -type f -name \"*.md\" -exec sh -c 'echo \"\"$\\(basename $\\(dirname \\)\\)/$\\(basename {}\\)\"\"' ;)"
     ],
     "additionalDirectories": [
-      "D:\\MyProject\\Programming\\AgentDevelop\\TencentDB-Agent-Memory"
+      "D:\\MyProject\\Programming\\AgentDevelop\\TencentDB-Agent-Memory",
+      "D:\\MyProject\\Programming\\AgentDevelop\\claude-code"
     ]
   }
 }

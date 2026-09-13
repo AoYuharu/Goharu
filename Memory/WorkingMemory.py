@@ -3,19 +3,24 @@ import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from configurationLoader import config
-from Core.ToolCall import ToolCall
+from Memory.memory_config import resolve_config
 from Memory.repositories.L0Repository import L0Repository
+
+try:
+    from Core.ToolCall import ToolCall
+except ImportError:  # 独立使用 Memory 包时无 Core 依赖
+    ToolCall = None
 
 
 class WorkingMemory:
-    def __init__(self):
-        self.daily_dir = Path(config.get("memory.daily.dir", "./runtime_memory/daily"))
-        self.retention_days = max(1, int(config.get("memory.daily.retention_days", 7)))
-        self.sqlite_enabled = bool(config.get("memory.sqlite.enabled", True))
-        self.daily_json_enabled = bool(config.get("memory.export.daily_json_enabled", True))
-        self.session_id = str(config.get("memory.session_id", "default"))
-        self.l0_repo = L0Repository() if self.sqlite_enabled else None
+    def __init__(self, cfg=None, l0_repo=None):
+        cfg = resolve_config(cfg)
+        self.daily_dir = Path(cfg.get("memory.daily.dir", "./runtime_memory/daily"))
+        self.retention_days = max(1, int(cfg.get("memory.daily.retention_days", 7)))
+        self.sqlite_enabled = bool(cfg.get("memory.sqlite.enabled", True))
+        self.daily_json_enabled = bool(cfg.get("memory.export.daily_json_enabled", True))
+        self.session_id = str(cfg.get("memory.session_id", "default"))
+        self.l0_repo = l0_repo or (L0Repository() if self.sqlite_enabled else None)
         self.daily_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
@@ -62,13 +67,13 @@ class WorkingMemory:
             return self._sanitize_text(value)
 
     def _coerce_message(self, message):
-        if isinstance(message, ToolCall):
+        if ToolCall is not None and isinstance(message, ToolCall):
             return message.to_record()
 
         if not isinstance(message, dict):
             raise TypeError("WorkingMemory messages must be dict or ToolCall")
 
-        if message.get("message_type") == "tool_call":
+        if message.get("message_type") == "tool_call" and ToolCall is not None:
             tool_call = ToolCall.from_record(message)
             if tool_call is not None:
                 record = tool_call.to_record(timestamp=message.get("timestamp"))

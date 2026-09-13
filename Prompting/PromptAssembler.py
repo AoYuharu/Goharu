@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import logging
 from pathlib import Path
@@ -6,6 +7,7 @@ from Core.ToolCall import ToolCall
 from Core.PromptDocument import PromptDocument
 from Prompting.PromptLoader import PromptLoader
 from Core.PromptSection import PromptSection
+from Tools.git_status_provider import get_git_status_text
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +43,7 @@ def _scan_skills():
 
 
 class PromptAssembler:
-    """提示词组装器 — 金字塔记忆体系（SOUL + L1/L2检索 + L3 persona 摘要）。"""
+    """提示词组装器 — 金字塔记忆体系（L1/L2检索 + L3 persona 摘要）。"""
 
     def __init__(self, prompt_loader=None):
         self.prompt_loader = prompt_loader or PromptLoader()
@@ -60,27 +62,11 @@ class PromptAssembler:
         sections.extend(self.prompt_loader.load_system_sections(agent_key))
         return sections
 
-    def _build_soul_section(self, soul_markdown):
-        soul_text = self._normalize_text(soul_markdown)
-        if not soul_text:
-            return None
-        return PromptSection(
-            kind="system", title="soul",
-            content=_xml("soul_definition", soul_text, priority="high"),
-            metadata={"section_name": "soul"},
-            cache_control={"type": "ephemeral"},
-        )
-
     def _build_l3_profile_summary_section(self, profile_summary):
         summary_text = self._normalize_text(profile_summary)
         if not summary_text:
             return None
-        return PromptSection(
-            kind="system", title="user_profile_compact",
-            content=_xml("persona", summary_text, source="l3_pipeline", priority="highest"),
-            metadata={"section_name": "user_profile_compact"},
-            cache_control={"type": "ephemeral"},
-        )
+        return _xml("persona", summary_text, source="l3_pipeline", priority="highest")
 
     def _build_retrieved_memories_section(self, retrieved_memories):
         if not retrieved_memories:
@@ -95,13 +81,8 @@ class PromptAssembler:
                 id=str(sid),
                 score=f"{score:.4f}" if score is not None else None,
                 title=title))
-        content = _xml("retrieved_memories", "\n".join(items_xml),
+        return _xml("retrieved_memories", "\n".join(items_xml),
             type="l1", count=str(len(retrieved_memories)))
-        return PromptSection(
-            kind="system", title="retrieved_memories",
-            content=content, metadata={"section_name": "retrieved_memories"},
-            cache_control={"type": "ephemeral"},
-        )
 
     def _build_retrieved_scenes_section(self, retrieved_scenes):
         if not retrieved_scenes:
@@ -116,23 +97,63 @@ class PromptAssembler:
                 slug=str(slug),
                 score=f"{score:.4f}" if score is not None else None,
                 keywords=keywords or None))
-        content = _xml("retrieved_scenes", "\n".join(items_xml),
+        return _xml("retrieved_scenes", "\n".join(items_xml),
             type="l2", count=str(len(retrieved_scenes)))
-        return PromptSection(
-            kind="system", title="retrieved_scenes",
-            content=content, metadata={"section_name": "retrieved_scenes"},
-            cache_control={"type": "ephemeral"},
+
+    def _build_memory_context(self, retrieval_pack):
+        """把 per-turn 检索结果拼成一个可贴在最新用户消息上的文本块。
+
+        不再作为 system section 注入前缀中部——检索结果每 turn 都会变，
+        放在前缀里会导致整个 prompt cache 前缀失效（写入 2.7 倍于读取）。
+        贴在最新用户消息上则位于全部缓存断点之后，随 turn 增量累积。
+        """
+        if not retrieval_pack:
+            return None
+        parts = []
+        persona = self._build_l3_profile_summary_section(retrieval_pack.get("profile_summary"))
+        if persona:
+            parts.append(persona)
+        memories = self._build_retrieved_memories_section(retrieval_pack.get("memories") or [])
+        if memories:
+            parts.append(memories)
+        scenes = self._build_retrieved_scenes_section(retrieval_pack.get("scenes") or [])
+        if scenes:
+            parts.append(scenes)
+        if not parts:
+            return None
+        return (
+            "<system-reminder>\n"
+            "Memory context retrieved for the current turn "
+            "(re-injected every turn; older copies in the conversation history are outdated):\n"
+            + "\n".join(parts) + "\n"
+            "</system-reminder>"
         )
 
-    def _build_skills_section(self):
+    def _build_skills_reminder(self):
+        """技能列表的当前轮 system-reminder 文本（对齐 Claude Code：贴在最新用户消息上）。
+
+        不使用静态 system 前缀——技能列表贴近当前轮注入，显著性更高，
+        且不占用 prompt cache 的 system 断点。
+        """
         skills_xml = _scan_skills()
         if not skills_xml:
             return None
+        return (
+            "<system-reminder>\n"
+            "The following skills are available for use with the Skill tool:\n\n"
+            f"{skills_xml}\n\n"
+            "When a skill matches the user's request, this is a BLOCKING REQUIREMENT: "
+            "invoke the Skill tool BEFORE generating any other response about the task.\n"
+            "</system-reminder>"
+        )
+
+    def _build_git_status_section(self):
+        """将当前 Git 状态注入为 system section。"""
+        text = get_git_status_text()
         return PromptSection(
-            kind="system", title="skills",
-            content=_xml("available_skills", skills_xml),
-            metadata={"section_name": "skills"},
-            cache_control={"type": "ephemeral"},
+            kind="system", title="git_status",
+            content=_xml("git_status", text),
+            metadata={"section_name": "git_status"},
         )
 
     # ── 对话记录转 Section ──────────────────────────────────────────
@@ -198,13 +219,18 @@ class PromptAssembler:
     # ── Document builders ───────────────────────────────────────────
 
     def build_actor_document(
-        self, history, soul_markdown="",
+        self, history,
         extra_system_prompt=None, tool_definitions=None, retrieval_pack=None,
+        memory_contexts=None,
     ):
         """构建 actor prompt 文档。
 
-        金字塔体系注入顺序：actor system → SOUL → L3 persona →
-        L1 检索记忆 → L2 检索场景 → skills → 对话历史。
+        金字塔体系注入顺序：actor system（含角色定义）→ git_status →
+        对话历史。L3 persona + L1 检索记忆 + L2 检索场景以 system-reminder
+        形式贴在用户消息上（当前轮结果贴最新消息；历史轮按消息 id 记账
+        贴回原消息，前缀跨 turn 逐字节稳定）；技能列表只贴最新一条。
+
+        memory_contexts: 用户消息 id → 记忆上下文块（调用方跨 turn 持有的记账表）。
         """
         document = PromptDocument()
         for section in self._load_agent_system_sections("actor"):
@@ -215,35 +241,28 @@ class PromptAssembler:
                 cache_control=section.cache_control,
             ))
 
-        soul_section = self._build_soul_section(soul_markdown)
-        if soul_section is not None:
-            document.add_system(soul_section)
+        git_status_section = self._build_git_status_section()
+        if git_status_section is not None:
+            document.add_system(git_status_section)
 
-        # L3 persona summary (from persona.md)
-        if retrieval_pack:
-            profile_summary = retrieval_pack.get("profile_summary")
-            if profile_summary:
-                profile_section = self._build_l3_profile_summary_section(profile_summary)
-                if profile_section is not None:
-                    document.add_system(profile_section)
+        # ── 收敛缓存断点到 ≤4（Anthropic 硬限制）──
+        # 断点语义：一个断点会缓存从会话开头到该块为止的全部内容。
+        # 只需两个断点：
+        #   1) 最后一个 system 块 —— 覆盖整个静态 system 前缀
+        #   2) 最后一个可缓存的历史轮 —— 覆盖所有累积的历史对话
+        # per-turn 检索内容贴在最新用户消息上（两个断点之后），不破坏前缀。
+        if document.system_sections:
+            last_sys = len(document.system_sections) - 1
+            for i in range(last_sys):
+                document.system_sections[i] = dataclasses.replace(
+                    document.system_sections[i], cache_control=None
+                )
+            document.system_sections[last_sys] = dataclasses.replace(
+                document.system_sections[last_sys],
+                cache_control={"type": "ephemeral"},
+            )
 
-            # L1 memories
-            retrieved_mems = retrieval_pack.get("memories") or []
-            mem_section = self._build_retrieved_memories_section(retrieved_mems)
-            if mem_section is not None:
-                document.add_system(mem_section)
-
-            # L2 scenes
-            retrieved_scenes = retrieval_pack.get("scenes") or []
-            scene_section = self._build_retrieved_scenes_section(retrieved_scenes)
-            if scene_section is not None:
-                document.add_system(scene_section)
-
-        skills_section = self._build_skills_section()
-        if skills_section is not None:
-            document.add_system(skills_section)
-
-        # Find the last user message — everything before it gets cached
+        # Find the last user message — everything before it is the cacheable history prefix
         last_user_idx = -1
         if history:
             for i in range(len(history) - 1, -1, -1):
@@ -252,11 +271,58 @@ class PromptAssembler:
                     last_user_idx = i
                     break
 
+        # 只给最后一个可缓存历史轮打断点（覆盖其之前全部历史），不再逐条打点
         for i, record in enumerate(history or []):
-            enable_cache = (last_user_idx >= 0 and i < last_user_idx)
+            enable_cache = (last_user_idx >= 1 and i == last_user_idx - 1)
             section = self.record_to_section(record, enable_cache=enable_cache)
             if section is not None:
                 document.add_conversation(section)
+
+        # ── per-turn 注入（位于全部缓存断点之后，不破坏前缀缓存）──
+        # 记忆上下文 + 技能列表合成一个"本轮上下文块"，记账到当轮最新用户
+        # 消息 id；历史轮按记账表贴回原消息（Claude Code 的 system-reminder
+        # 常驻历史模式），前缀跨 turn 逐字节稳定。没有 id 的消息退化为只贴
+        # 最新一条。工具循环中最后一条是 tool_result，注入在 turn 开始时
+        # 已完成，不受影响。
+        if memory_contexts is None:
+            memory_contexts = {}
+
+        turn_parts = []
+        memory_context = self._build_memory_context(retrieval_pack)
+        if memory_context:
+            turn_parts.append(memory_context)
+        skills_reminder = self._build_skills_reminder()
+        if skills_reminder:
+            turn_parts.append(skills_reminder)
+        turn_context = "\n\n".join(turn_parts)
+
+        if turn_context:
+            last_user_id = None
+            for i in range(len(history) - 1, -1, -1):
+                record = history[i] if isinstance(history[i], dict) else {}
+                if (record.get("role") or "").strip() == "user":
+                    last_user_id = record.get("id")
+                    break
+            if last_user_id:
+                memory_contexts[last_user_id] = turn_context
+            elif document.conversation_sections:
+                last = document.conversation_sections[-1]
+                if last.kind == "user" and isinstance(last.content, str):
+                    document.conversation_sections[-1] = dataclasses.replace(
+                        last, content=turn_context + "\n\n" + last.content
+                    )
+
+        for i, section in enumerate(document.conversation_sections):
+            mid = section.metadata.get("id") if section.metadata else None
+            if (
+                section.kind == "user"
+                and isinstance(section.content, str)
+                and mid in memory_contexts
+            ):
+                document.conversation_sections[i] = dataclasses.replace(
+                    section,
+                    content=memory_contexts[mid] + "\n\n" + section.content,
+                )
 
         extra_prompt = self._normalize_text(extra_system_prompt)
         if extra_prompt:
@@ -269,7 +335,7 @@ class PromptAssembler:
 
     def build_day_summary_document(self, history, old_memory=None, existing_atoms=None):
         document = PromptDocument()
-        document.extend_system(self._load_agent_system_sections("summarizer"))
+        document.extend_system(self._load_agent_system_sections("day_summary"))
 
         sections = [
             PromptSection(kind="user", title="day_history",
@@ -281,14 +347,14 @@ class PromptAssembler:
                           content="以下是已存在的记忆原子（避免输出重复内容）：\n\n" + self._json_text(existing_atoms),
                           metadata={"section_name": "existing_atoms"}))
         sections.append(PromptSection(kind="user", title="summary_task",
-                          content="请根据任务A（日总结）的格式，生成该日的长期记忆摘要 JSON。",
+                          content="请生成该日的长期记忆摘要 JSON。",
                           metadata={"section_name": "summary_task"}))
         document.extend_conversation(sections)
         return document
 
     def build_context_compact_document(self, conversation, system_prompt=None):
         document = PromptDocument()
-        document.extend_system(self._load_agent_system_sections("summarizer"))
+        document.extend_system(self._load_agent_system_sections("context_compact"))
 
         sections = [
             PromptSection(kind="user", title="conversation_history",
@@ -303,7 +369,7 @@ class PromptAssembler:
             ))
         sections.append(PromptSection(
             kind="user", title="compact_task",
-            content="请根据任务C（上下文压缩）的 9 点框架输出结构化摘要，直接作为最终输出。",
+            content="请按照 9 点框架输出结构化摘要，直接作为最终输出。",
             metadata={"section_name": "compact_task"},
         ))
         document.extend_conversation(sections)

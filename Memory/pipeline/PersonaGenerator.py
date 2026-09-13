@@ -10,9 +10,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from Agent.LargeLanguageModel import LargeLanguageModel
+from Memory.memory_config import resolve_config
 from Memory.scene_blocks.SceneFileManager import SceneFileManager
-from configurationLoader import config
 
 logger = logging.getLogger(__name__)
 
@@ -38,17 +37,26 @@ _(to be generated)_
 class PersonaGenerator:
     """LLM-driven persona generation from scene blocks."""
 
-    def __init__(self, scene_file_manager=None, persona_path=None):
-        self.scene_file_mgr = scene_file_manager or SceneFileManager()
-        root = config.get("memory.root_dir", "./runtime_memory")
+    def __init__(self, scene_file_manager=None, persona_path=None, llm=None, cfg=None):
+        cfg = resolve_config(cfg)
+        self._cfg = cfg
+        self.scene_file_mgr = scene_file_manager or SceneFileManager(cfg=cfg)
+        root = cfg.get("memory.root_dir", "./runtime_memory")
         default_path = os.path.join(root, "persona.md")
-        self.persona_path = Path(persona_path or config.get("memory.persona.path", default_path))
+        self.persona_path = Path(persona_path or cfg.get("memory.persona.path", default_path))
         self.persona_path.parent.mkdir(parents=True, exist_ok=True)
-        self._llm = None
+        self._llm = llm
 
     @property
     def llm(self):
         if self._llm is None:
+            try:
+                from Agent.LargeLanguageModel import LargeLanguageModel
+            except ImportError as e:
+                raise RuntimeError(
+                    "PersonaGenerator 需要 LLM：请通过 llm= 参数注入一个 "
+                    "具有 query(messages) 方法的对象（独立使用 Memory 包时）"
+                ) from e
             self._llm = LargeLanguageModel()
         return self._llm
 
@@ -140,7 +148,7 @@ class PersonaGenerator:
 
     def _load_base_prompt(self):
         """从配置文件加载 persona_generator 系统 prompt。"""
-        prompts = config.get("prompt.system.persona_generator", [])
+        prompts = self._cfg.get("prompt.system.persona_generator", [])
         if prompts:
             try:
                 from Prompting.PromptLoader import PromptLoader

@@ -10,25 +10,27 @@ function check(name: string, cond: boolean, extra = "") {
   console.log(`${cond ? "PASS" : "FAIL"} ${name}${extra ? " — " + extra : ""}`);
 }
 
-// 1. Complete click sequence
+// 1. Complete press sequence
 let r = drainMouseSequences("\x1b[<0;35;12M");
-check("click parsed", r.events.length === 1 && r.events[0].kind === "click" && r.events[0].x === 35 && r.events[0].y === 12);
-check("click leaves no rest", r.rest === "" && r.pending === "");
+check("press parsed", r.events.length === 1 && r.events[0].kind === "press" && r.events[0].x === 35 && r.events[0].y === 12);
+check("press leaves no rest", r.rest === "" && r.pending === "");
 
 // 2. Split across two chunks (ConPTY behavior)
 r = drainMouseSequences("\x1b[<0;7");
 check("split chunk 1: held, nothing forwarded", r.rest === "" && r.pending === "\x1b[<0;7" && r.events.length === 0);
 const r2 = drainMouseSequences(r.pending + "6;35M");
-check("split chunk 2: click completed", r2.events.length === 1 && r2.events[0].x === 76);
+check("split chunk 2: press completed", r2.events.length === 1 && r2.events[0].x === 76);
 check("split chunk 2: no leak", r2.rest === "" && r2.pending === "");
 
-// 3. Release event swallowed silently
+// 3. Release event
 r = drainMouseSequences("\x1b[<0;10;5m");
-check("release swallowed", r.events.length === 0 && r.rest === "");
+check("release parsed", r.events.length === 1 && r.events[0].kind === "release" && r.events[0].y === 5);
 
-// 4. Motion (hover) event
+// 4. Motion events: hover vs left-drag
 r = drainMouseSequences("\x1b[<35;20;8M");
-check("move parsed", r.events[0]?.kind === "move" && r.events[0]?.x === 20);
+check("hover move parsed", r.events[0]?.kind === "move" && r.events[0]?.dragging === false);
+r = drainMouseSequences("\x1b[<32;20;8M");
+check("drag move parsed", r.events[0]?.kind === "move" && r.events[0]?.dragging === true);
 
 // 5. Wheel up/down
 r = drainMouseSequences("\x1b[<64;10;3M\x1b[<65;10;3M");

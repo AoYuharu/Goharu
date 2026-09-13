@@ -15,3 +15,25 @@ Qwen2.5-7B-Instruct/
 # TypeScript TUI
 tui-ts/node_modules/
 tui-ts/dist/
+# tsc 原地编译产物（npm run build 生成，源码为同名 .ts）
+tui-ts/src/**/*.js
+tui-ts/src/**/*.js.map
+tui-ts/src/**/*.d.ts
+tui-ts/src/**/*.d.ts.map
+tui-ts/test/**/*.js
+tui-ts/test/**/*.js.map
+tui-ts/test/**/*.d.ts
+tui-ts/test/**/*.d.ts.map
+
+# 本地大目录（不进仓库）
+/voice-wakeup/
+benchmarks/
+
+# 临时文件
+.claude/scheduled_tasks.lock
+lifecycle.txt
+rel.json
+temp_size.ps1
+E盘目录*.md
+goharu_prompts_full.md
+prompt_export.md

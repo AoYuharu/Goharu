@@ -30,7 +30,13 @@ def main():
             print("Error: tui-ts not built and npm not found.", file=sys.stderr)
             sys.exit(1)
         print("tui-ts not built, building...")
-        subprocess.check_call([npm, "run", "build"], cwd=PROJECT_ROOT / "tui-ts", shell=True)
+        # Windows 下 npm 是 .cmd 批处理必须走 shell；POSIX 下 shell=True 会丢弃
+        # list 参数（"run"/"build" 变成 shell 的 $0/$1），必须直接 exec
+        subprocess.check_call(
+            [npm, "run", "build"],
+            cwd=PROJECT_ROOT / "tui-ts",
+            shell=(os.name == "nt"),
+        )
 
     args = [str(DIST_ENTRY), *sys.argv[1:]]
     try:

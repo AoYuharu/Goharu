@@ -62,21 +62,21 @@ The agent uses a simple ReAct loop: the actor calls tools step by step, then gen
 - Tool design philosophy:
   - **Patch-style Edit**: Like git diff, requires exact old_string and new_string
   - **Safety first**: Write refuses to overwrite, Edit requires Read permission
-  - **Hard restrictions on run_cmd**: Actively rejects file operation commands (echo, cat, sed, awk, etc.)
+  - **run_cmd write-side restrictions**: shell file writes are rejected (echo > / >>, sed -i / --in-place) — file changes must go through Write/Edit tools
+  - **Read-side commands allowed**: cat/head/tail/grep/sed-filter/awk/pipes work in run_cmd; the goal is controlling result size, and oversized output is auto-truncated by ToolResultBudget rather than rejected
   - **Enforcement at runtime**: run_cmd validates commands and returns error messages guiding to use dedicated tools
-  - **No workarounds**: Model cannot bypass restrictions; attempting to use echo/cat/sed will fail with instructive error
+  - **No workarounds**: Model cannot bypass restrictions; attempting shell file writes will fail with instructive error
   - **Security checks**: Dangerous commands (shutdown, rm -rf, format, etc.) are blocked to prevent system damage
   - **Command safety**: Multi-layer security system intercepts destructive operations before execution
 
 - Performance optimization:
-  - **Multi-level Prompt Caching**: Implemented Anthropic's Prompt Caching with tiered strategy
-  - **Level 1 (Always cached)**: SOUL.md (role definition), Tool Directory (tool definitions)
-  - **Level 2 (Cached by default)**: User Profile, Memory (MEMORY.md)
-  - **Level 3 (Turn-based caching)**: Historical conversation turns (all except the latest turn)
-  - **Not cached**: Latest conversation turn (current user input and ongoing responses)
-  - Cache TTL: 5 minutes (Anthropic default)
-  - Expected benefits: ~85-90% cost reduction on cached tokens, faster first-token latency
-  - Implementation: `cache_control: {"type": "ephemeral"}` on PromptSection `→` PromptRenderer `→` LLMCore (Anthropic path only)
+  - **Prompt Cache 断点机制（核心机制要素，改动前必读）**：MiniMax（Anthropic 兼容端点）按**前缀**缓存——请求从头逐字节匹配已缓存前缀，命中部分按 cache_read 低价计费，未命中部分全价并触发 cache_write。**前缀中任何一处字节变化，都会使其后的全部缓存失效**。历史上曾因每轮检索记忆插入 system 中部，导致 cache_write 达 cache_read 的 2.7 倍（几乎全部失效）。
+  - **铁律一：断点 ≤4**（Anthropic 硬限制）。当前 Actor 只用 2 个：①最后一个 system 块（覆盖静态前缀：角色定义 + git_status）②最后一个可缓存历史轮（覆盖全部累积历史）。收敛逻辑在 `Prompting/PromptAssembler.py` `build_actor_document`。
+  - **铁律二：静态前缀逐字节稳定**。system 区绝不放每轮变化的内容；per-turn 检索结果（L3 persona / L1 memories / L2 scenes）与技能列表由 `_build_memory_context` 合成"本轮上下文块"，贴在**当轮用户消息**上，并按消息 id 记账（`ActorAgent._memory_contexts`）——历史渲染时贴回各自原消息，旧消息内容永不变化（对齐 Claude Code 的 system-reminder 常驻历史模式）。
+  - **铁律三：多步循环的消息列表必须纯追加**。SubAgent（Explore/Plan/Verify）`execute` 循环用 `_advance_cache_breakpoint` 每步把历史断点推进到最新一条消息（`Agent/SubAgent.py`）；system 断点恒在 messages[0]。
+  - **铁律四：一次性 LLM 调用**（SummarizerAgent、ContextCompactor、SceneExtractor、PersonaGenerator）由 `PromptLoader` 给末位 system section 打 1 个断点即可，无历史增长，无失效风险。
+  - **新增每轮注入内容时的正确姿势**：合成进"本轮上下文块"（`_build_memory_context` / turn_context），不要新开 system section，不要修改已渲染历史，不要在消息列表中部插入。
+  - **改动后必须验证**：`python test_cache_breakpoints.py`（断点收敛 + 前缀跨 turn 逐字节稳定断言）；E2E 实测（2026-09-12）：热身后命中率 91-95%、cache_write=0 即为达标；TUI 状态栏 Cache Hit 显示的是真实 API usage 命中率（`cache_read/(input+read+write)`，来自 `LLMCore._last_usage`），不要再用本地 cache_control 标记估算命中率。
 
 - Retrieval is handled by `Memory/retrieval/HybridRetriever.py` (FTS5 + embedding + BM25 → RRF fusion) and is integrated into the main flow via `MemoryManager.retrieve_prompt_memory()`.
   - The knowledge tools (`Tools/builtin/knowledge_tools.py`) provide the interface to the knowledge management system.
@@ -94,6 +94,13 @@ The agent uses a simple ReAct loop: the actor calls tools step by step, then gen
 - **仔细思考**：当收到用户的需求，对每个需求进行详细思考，如果有不明确的地方应该**主动向用户提问，排除模糊点再修改**，而不是直接进行假设并编写代码
 - **最简开发**：在完成需求的前提下，尽量减少代码量，避免任何过度设计
 - **全面日志**：在添加任何新模块的时候，一定要写详尽的日志，以便后期查日志了解问题
+
+## 透明化原则
+程序内部在执行什么、进行到什么状态，用户必须心知肚明、完全透明。
+
+- **长耗时操作必须反馈进度**：任何会让用户"干等"的操作（LLM 重试、模型加载、后台任务、子代理运行）都必须在左下角状态栏实时显示当前状态（如「正在重试 LLM 第 3/10 次」）。
+- **失败必须优雅降级或优雅报错**：可恢复的失败（LLM 超时重试耗尽、embedding 不可用、依赖缺失）要静默降级或返回明确错误消息，绝不能触发 Gateway 崩溃重启（用户会看到一次突兀的"重启"，体验很差）。
+- **新增后台/异步流程必须配套状态事件**：每新增一个后台或异步流程，都要在 Gateway→TUI 事件协议（`tui-ts/src/gateway/protocol.ts` + `Gateway/gateway_entry.py` 的 `write_json` 事件）中增加对应事件，并在状态栏/面板里可视化，不能只有日志。
 
 ## 用户交互
 - **默认最简回答：**当用户询问问题的时候，默认进行简要的关键点回答，回答尽量简练明确重点，不要长篇大论分点

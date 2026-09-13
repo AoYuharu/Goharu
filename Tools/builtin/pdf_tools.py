@@ -1,32 +1,29 @@
 """
 PDF 工具 - 提供 PDF 解析功能
 
-与 Claude Code Read 工具对齐的 PDF 处理逻辑：
-- 双路径：pages 参数 → 页面提取为 JPEG / 无 pages → 完整学术解析
-- 校验层：魔法字节、文件大小、空文件检查
-- 统一错误分类：empty / too_large / password_protected / corrupted / unavailable
+双路径：
+- pages 参数 → 逐页提取文本层（纯文本模型无法查看图片，不渲染 JPEG）
+- 无 pages → 完整学术解析（元数据、章节、图表、公式、引用）
 
-标准工具注册流程：
-1. 定义工具函数
-2. 使用 registry.register() 注册
-3. 在 core_tools.py 中导入以自动注册
+校验层：魔法字节、文件大小、空文件检查
+统一错误分类：empty / too_large / password_protected / corrupted / unavailable / scanned
+
+注意：仅提取 PDF 文本层，不做 OCR。扫描版 PDF 会返回 scanned 错误。
 
 超时策略：
   本工具不自行管理超时。由 runtime 层的 tools.background_timeout
-  统一控制：超过阈值后自动后台化（asyncio.shield + track_task），
-  PDF 解析线程继续运行，完成后结果注入上下文。
+  统一控制：超过阈值后自动后台化（asyncio.shield + track_task）。
 """
 
 import json
 from pathlib import Path
 from Tools.registry import registry
 from Tools.pdf_utils import (
-    extract_pdf_pages,
+    extract_pdf_page_texts,
     get_pdf_page_count,
     parse_pdf_page_range,
     validate_pdf_magic_bytes,
     PDF_AT_MENTION_INLINE_THRESHOLD,
-    PDF_EXTRACT_SIZE_THRESHOLD,
     PDF_MAX_EXTRACT_SIZE,
     PDF_MAX_PAGES_PER_READ,
 )
@@ -48,23 +45,21 @@ def parse_pdf(
     """解析 PDF 文件
 
     双路径模式：
-    - 提供 pages 参数：提取指定页为 JPEG 图片（用于大 PDF 的分页读取）
+    - 提供 pages 参数：逐页提取文本层（大 PDF 分页阅读）
     - 不提供 pages：执行完整学术解析（元数据、章节、图表、公式、引用）
 
     Args:
         pdf_path: PDF 文件路径（相对或绝对路径）
         pages: 页码范围，支持 "5" / "1-5" / "3-" 格式。最多 {PDF_MAX_PAGES_PER_READ} 页
-        output_dir: 输出目录，用于保存提取的图片
+        output_dir: 输出目录，用于保存提取的图表
 
     Returns:
         JSON 字符串。success 时包含：
-          - type: "full"（完整解析）或 "parts"（页面提取）
+          - type: "full"（完整解析）或 "parts"（逐页文本）
           - 完整解析: result_file, metadata, sections, figures_count, tables_count
-          - 页面提取: images[{page, path, width, height}], page_count, total_pages
+          - 逐页文本: pages[{page, text}], page_count, total_pages
         error 时包含 status="error", reason, error
     """
-    extract_result = None
-
     try:
         # ============================================================
         # 校验层（始终执行）
@@ -95,7 +90,7 @@ def parse_pdf(
             )
 
         # ============================================================
-        # 路径 A: 提供 pages 参数 → 页面提取为 JPEG
+        # 路径 A: 提供 pages 参数 → 逐页提取文本层
         # ============================================================
         if pages is not None and pages.strip():
             page_range = parse_pdf_page_range(pages)
@@ -121,9 +116,7 @@ def parse_pdf(
                     f"{PDF_MAX_PAGES_PER_READ} per request",
                 )
 
-            result = extract_pdf_pages(
-                str(pdf_path_obj), first_page, last_page, output_dir
-            )
+            result = extract_pdf_page_texts(str(pdf_path_obj), first_page, last_page)
             if not result["success"]:
                 return _error_response(
                     result["error"]["reason"],
@@ -131,12 +124,17 @@ def parse_pdf(
                 )
 
             data = result["data"]
+            if not data["has_text"]:
+                return _error_response(
+                    "scanned",
+                    "These pages contain no text layer — the PDF is likely a "
+                    "scanned image document. OCR is not supported by this tool.",
+                )
             return json.dumps(
                 {
                     "status": "success",
                     "type": "parts",
-                    "output_dir": data["output_dir"],
-                    "images": data["images"],
+                    "pages": data["pages"],
                     "page_count": data["page_count"],
                     "total_pages": data["total_pages"],
                 },
@@ -144,7 +142,7 @@ def parse_pdf(
             )
 
         # ============================================================
-        # 路径 B: 无 pages 参数 → 完整学术解析（保留现有行为）
+        # 路径 B: 无 pages 参数 → 完整学术解析
         # ============================================================
         page_count = get_pdf_page_count(str(pdf_path_obj))
 
@@ -159,27 +157,25 @@ def parse_pdf(
                 "first 10 pages.",
             )
 
-        # 超过提取阈值的 PDF 同时渲染页面图片作为附件
-        if (
-            file_size > PDF_EXTRACT_SIZE_THRESHOLD
-            and page_count is not None
-            and page_count <= PDF_AT_MENTION_INLINE_THRESHOLD
-        ):
-            extract_result = extract_pdf_pages(
-                str(pdf_path_obj), 1, page_count, output_dir
-            )
-
         # 学术解析
         from Tools.pdf_parser import PDFParser
 
-        parser = PDFParser(use_ocr=False)
+        parser = PDFParser()
         document = parser.parse(str(pdf_path_obj), output_dir=output_dir)
+        full_dict = document.to_dict()
 
-        # 保存完整结果到文件
+        # 扫描版检测：平均每页文本 <20 字符说明没有文本层，明确报错而不是返回空内容
+        if len(full_dict.get("full_text", "").strip()) < 20 * max(1, page_count or 1):
+            return _error_response(
+                "scanned",
+                "PDF text layer is empty or nearly empty — this is likely a "
+                "scanned image document. OCR is not supported by this tool.",
+            )
+
+        # 保存完整结果到文件（按 PDF 文件名区分，避免并发覆盖）
         temp_dir = Path("runtime_memory/temp")
         temp_dir.mkdir(parents=True, exist_ok=True)
-        result_file = temp_dir / "pdf_parse_result.json"
-        full_dict = document.to_dict()
+        result_file = temp_dir / f"pdf_parse_{pdf_path_obj.stem}.json"
         with open(result_file, "w", encoding="utf-8") as f:
             json.dump(full_dict, f, ensure_ascii=False, indent=2)
 
@@ -189,24 +185,21 @@ def parse_pdf(
             for name, sec in full_dict.get("sections", {}).items()
         }
 
-        response_data = {
-            "status": "success",
-            "type": "full",
-            "result_file": str(result_file),
-            "metadata": metadata,
-            "sections": sections_summary,
-            "figures_count": len(full_dict.get("figures", [])),
-            "tables_count": len(full_dict.get("tables", [])),
-            "full_text_length": len(full_dict.get("full_text", "")),
-            "page_count": page_count,
-            "file_size": file_size,
-        }
-
-        # 附加页面图片引用（如果有提取）
-        if extract_result is not None and extract_result.get("success"):
-            response_data["page_images"] = extract_result["data"]["images"]
-
-        return json.dumps(response_data, ensure_ascii=False)
+        return json.dumps(
+            {
+                "status": "success",
+                "type": "full",
+                "result_file": str(result_file),
+                "metadata": metadata,
+                "sections": sections_summary,
+                "figures_count": len(full_dict.get("figures", [])),
+                "tables_count": len(full_dict.get("tables", [])),
+                "full_text_length": len(full_dict.get("full_text", "")),
+                "page_count": page_count,
+                "file_size": file_size,
+            },
+            ensure_ascii=False,
+        )
 
     except FileNotFoundError:
         return _error_response("unavailable", f"PDF file not found: {pdf_path}")
@@ -230,9 +223,11 @@ registry.register(
         "Parse an academic PDF and extract structured content (title, authors, "
         "sections, figures, tables, formulas, references). For large PDFs "
         f"(more than {PDF_AT_MENTION_INLINE_THRESHOLD} pages), use the 'pages' "
-        f"parameter to read specific page ranges. Page ranges support formats: "
-        f"'5' (single page), '1-5' (range), or '3-' (from page 3 to end). "
-        f"Maximum {PDF_MAX_PAGES_PER_READ} pages per request."
+        f"parameter to read specific page ranges as text. Page ranges support "
+        f"formats: '5' (single page), '1-5' (range), or '3-' (from page 3 to "
+        f"end). Maximum {PDF_MAX_PAGES_PER_READ} pages per request. "
+        "Only the PDF text layer is read — scanned image PDFs (no OCR) will "
+        "return a 'scanned' error."
     ),
     arguments_schema={
         "type": "object",

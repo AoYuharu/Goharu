@@ -1,13 +1,14 @@
 from pathlib import Path
 
-from configurationLoader import config
+from Memory.memory_config import resolve_config
 
 
 class RerankerService:
-    def __init__(self):
-        self.enabled = bool(config.get("memory.retrieval.use_reranker", False))
+    def __init__(self, cfg=None):
+        cfg = resolve_config(cfg)
+        self.enabled = bool(cfg.get("memory.retrieval.use_reranker", False))
         self.model_path = Path(
-            config.get(
+            cfg.get(
                 "memory.retrieval.reranker_model_path",
                 "./models/rerank_model/bge-reranker-v2-m3",
             )
@@ -76,8 +77,16 @@ class RerankerService:
 
     @staticmethod
     def _fallback_score(query, text):
-        query_tokens = {token for token in str(query or "").lower().split() if token}
-        text_tokens = {token for token in str(text or "").lower().split() if token}
+        # 用 jieba 分词做 token 重叠，中文才有意义（空格 split 对中文恒为整句单 token）
+        def tokenize(s):
+            try:
+                import jieba
+                return {t for t in jieba.cut_for_search(str(s or "")) if t.strip()}
+            except Exception:
+                return {t for t in str(s or "").lower().split() if t}
+
+        query_tokens = tokenize(query)
+        text_tokens = tokenize(text)
         if not query_tokens or not text_tokens:
             return 0.0
         overlap = len(query_tokens & text_tokens)

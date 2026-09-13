@@ -1,10 +1,16 @@
 import React from "react";
 import { Box, Text } from "ink";
-import Spinner from "ink-spinner";
+import chalk from "chalk";
+import { highlightLine } from "../format.js";
 
 export interface SubagentActivity {
   level: string;
   message: string;
+  ts?: string;
+  category?: "iteration" | "thinking" | "tool_call" | "tool_result" | "final" | "error" | "info";
+  content?: string;
+  tool?: string;
+  is_error?: boolean;
 }
 
 export interface SubagentInfo {
@@ -16,21 +22,23 @@ export interface SubagentInfo {
   activities: SubagentActivity[];
 }
 
+const TYPE_COLORS: Record<string, string> = {
+  explore: "cyan",
+  plan: "yellow",
+  verify: "magenta",
+};
+
 function truncate(text: string, max: number): string {
   const compact = text.replace(/\s+/g, " ").trim();
   return compact.length <= max ? compact : compact.slice(0, max - 1) + "…";
 }
 
-export function statusIcon(status: SubagentInfo["status"]): React.ReactNode {
+function statusGlyph(status: SubagentInfo["status"]): string {
   switch (status) {
-    case "running":
-      return <Spinner type="dots" />;
-    case "success":
-      return <Text color="green">✓</Text>;
-    case "partial":
-      return <Text color="yellow">⚠</Text>;
-    case "error":
-      return <Text color="red">✗</Text>;
+    case "running": return chalk.cyan("●");
+    case "success": return chalk.green("✓");
+    case "partial": return chalk.yellow("⚠");
+    case "error": return chalk.red("✗");
   }
 }
 
@@ -39,71 +47,59 @@ function typeLabel(agentType: string): string {
   return t.charAt(0).toUpperCase() + t.slice(1);
 }
 
+function typeColorChalk(agentType: string): (s: string) => string {
+  const name = TYPE_COLORS[agentType.toLowerCase()] ?? "white";
+  return name === "cyan" ? chalk.cyan : name === "yellow" ? chalk.yellow : name === "magenta" ? chalk.magenta : chalk.white;
+}
+
+/**
+ * Always-visible agent list rendered BELOW the input bar — one row per agent.
+ * ↓/↑ from an empty input moves the cursor naturally into this list.
+ */
 export function SubagentBar({
   agents,
-  selectMode,
+  browsing,
   selIndex,
+  viewingId = "main",
 }: {
   agents: SubagentInfo[];
-  selectMode: boolean;
+  browsing: boolean;
   selIndex: number;
+  viewingId?: string;
 }) {
-  if (agents.length === 0 && !selectMode) return null;
+  if (agents.length === 0 && !browsing) return null;
 
-  if (!selectMode) {
-    return (
-      <Box>
-        <Text dimColor>Agents: </Text>
-        <Text color="cyan">● Main</Text>
-        {agents.map((a) => (
-          <Text key={a.agentId}>
-            <Text dimColor> | </Text>
-            {statusIcon(a.status)}
-            <Text color="magenta"> {typeLabel(a.agentType)}</Text>
-            <Text dimColor>: {truncate(a.task, 40)}</Text>
-          </Text>
-        ))}
-        <Text dimColor>  (↓ select)</Text>
-      </Box>
-    );
-  }
-
-  // Selection mode: expanded list, Main on first row (index 0)
-  const rows: Array<{ id: string; label: React.ReactNode }> = [
-    {
-      id: "main",
-      label: (
-        <Text>
-          <Text color="cyan">● Main</Text>
-          <Text dimColor> — primary agent (tool history)</Text>
-        </Text>
-      ),
-    },
-    ...agents.map((a) => ({
-      id: a.agentId,
-      label: (
-        <Text>
-          {statusIcon(a.status)}
-          <Text color="magenta"> {typeLabel(a.agentType)}</Text>
-          <Text dimColor> [{a.agentId}]</Text>
-          <Text>: {truncate(a.task, 60)}</Text>
-          {a.status === "running" && (
-            <Text dimColor> ({Math.round((Date.now() - a.startedAtMs) / 1000)}s)</Text>
-          )}
-        </Text>
-      ),
-    })),
+  const rows: Array<{ id: string; label: string }> = [
+    { id: "main", label: chalk.cyan("● Main") + chalk.dim(" — primary agent") },
+    ...agents.map((a) => {
+      const elapsed =
+        a.status === "running"
+          ? chalk.dim(` (${Math.round((Date.now() - a.startedAtMs) / 1000)}s)`)
+          : "";
+      return {
+        id: a.agentId,
+        label:
+          statusGlyph(a.status) + " " +
+          typeColorChalk(a.agentType)(typeLabel(a.agentType)) +
+          ": " + chalk.dim(truncate(a.task, 56)) + elapsed,
+      };
+    }),
   ];
 
   return (
     <Box flexDirection="column">
-      {rows.map((row, i) => (
-        <Text key={row.id} inverse={i === selIndex}>
-          {i === selIndex ? "❯ " : "  "}
-          {row.label}
-        </Text>
-      ))}
-      <Text dimColor>↑↓ Select | Enter View | Esc Back</Text>
+      {rows.map((row, i) => {
+        const cursor = browsing && i === selIndex;
+        const line =
+          `${cursor ? "❯ " : "  "}${row.label}` +
+          (viewingId === row.id ? chalk.cyan("  ◀ viewing") : "");
+        return (
+          <Text key={row.id} wrap="truncate">
+            {cursor ? highlightLine(line) : line}
+          </Text>
+        );
+      })}
+      {browsing && <Text dimColor>↑↓ Select | Enter View | Esc Back</Text>}
     </Box>
   );
 }

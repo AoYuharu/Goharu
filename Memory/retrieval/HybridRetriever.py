@@ -1,33 +1,40 @@
 import json
+import logging
 import time
 
+logger = logging.getLogger(__name__)
+
 from Memory.MemoryDB import MemoryDB
+from Memory.memory_config import resolve_config
 from Memory.repositories.L1Repository import L1Repository
 from Memory.repositories.L2Repository import L2Repository
 from Memory.repositories.L3Repository import L3Repository
 from Memory.retrieval.EmbeddingService import EmbeddingService
 from Memory.retrieval.BM25Encoder import BM25Encoder
 from Memory.retrieval.RerankerService import RerankerService
-from configurationLoader import config
 
 
 class HybridRetriever:
-    def __init__(self, db=None, l1_repo=None, l2_repo=None, l3_repo=None, embedding_service=None, reranker=None, bm25_encoder=None):
-        self.db = db or MemoryDB()
+    def __init__(self, db=None, l1_repo=None, l2_repo=None, l3_repo=None,
+                 embedding_service=None, reranker=None, bm25_encoder=None,
+                 scene_file_manager=None, persona_generator=None, cfg=None):
+        cfg = resolve_config(cfg)
+        self.db = db or MemoryDB(cfg=cfg)
         self.l1_repo = l1_repo or L1Repository(self.db)
         self.l2_repo = l2_repo or L2Repository(self.db)
         self.l3_repo = l3_repo or L3Repository(self.db)
-        self.embedding_service = embedding_service or EmbeddingService(self.db)
+        self.embedding_service = embedding_service or EmbeddingService(self.db, cfg=cfg)
         self.bm25 = bm25_encoder or BM25Encoder()
-        self.reranker = reranker or RerankerService()
-        self.fts_k = int(config.get("memory.retrieval.fts_top_k", 8))
-        self.embedding_k = int(config.get("memory.retrieval.embedding_top_k", 8))
-        self.bm25_k = int(config.get("memory.retrieval.bm25_top_k", 8))
-        self.bm25_enabled = config.get("memory.retrieval.bm25_enabled", True)
-        self.final_k = int(config.get("memory.retrieval.final_top_k", 6))
-        self.default_query_window = int(config.get("memory.retrieval.query_window_messages", 6))
-        self._scene_file_manager = None
-        self._persona_generator = None
+        self.reranker = reranker or RerankerService(cfg=cfg)
+        self.fts_k = int(cfg.get("memory.retrieval.fts_top_k", 8))
+        self.embedding_k = int(cfg.get("memory.retrieval.embedding_top_k", 8))
+        self.bm25_k = int(cfg.get("memory.retrieval.bm25_top_k", 8))
+        self.bm25_enabled = cfg.get("memory.retrieval.bm25_enabled", True)
+        self.final_k = int(cfg.get("memory.retrieval.final_top_k", 6))
+        self.default_query_window = int(cfg.get("memory.retrieval.query_window_messages", 6))
+        self._cfg = cfg
+        self._scene_file_manager = scene_file_manager
+        self._persona_generator = persona_generator
         # BM25 IDF 缓存：条目数变化或超过 60s 才重建
         self._bm25_idf_count = -1
         self._bm25_idf_time = 0.0
@@ -36,14 +43,14 @@ class HybridRetriever:
     def scene_file_manager(self):
         if self._scene_file_manager is None:
             from Memory.scene_blocks.SceneFileManager import SceneFileManager
-            self._scene_file_manager = SceneFileManager()
+            self._scene_file_manager = SceneFileManager(cfg=self._cfg)
         return self._scene_file_manager
 
     @property
     def persona_generator(self):
         if self._persona_generator is None:
             from Memory.pipeline.PersonaGenerator import PersonaGenerator
-            self._persona_generator = PersonaGenerator()
+            self._persona_generator = PersonaGenerator(cfg=self._cfg)
         return self._persona_generator
 
     def retrieve(self, query, top_k=None):
@@ -98,25 +105,45 @@ class HybridRetriever:
                 parts.append(str(content))
         return "\n".join(part for part in parts if part).strip()
 
+    # FTS5 空格分词做隐式 AND，中文功能词（的/是/什么…）会导致全句匹配失败，
+    # 查询侧分词后过滤掉这些停用词，只保留实义 token。
+    _FTS_STOPWORDS = frozenset(
+        "的 了 是 在 有 和 与 及 或 也 就 都 还 很 更 最 被 把 对 从 到 于 之 为 而 且 但 如果 呢 吗 吧 啊 哦 呀 这 那 我 你 他 她 它 我们 你们 他们 什么 怎么 为什么 哪些 哪 谁 一个 一些 有点 一下 这个 那个 这些 那些 可以 应该 需要 请 帮 让 上 下 中 内 外".split()
+    )
+
     def _fts_search(self, query, top_k=8):
         if not self.db.fts_enabled:
             return []
-        rows = self.db.query_all(
-            """
-            SELECT record_type, source_id, content
-            FROM fts_memory
-            WHERE fts_memory MATCH ?
-            LIMIT ?
-            """,
-            (query, int(top_k)),
-        )
+        # 查询侧分词 + 去停用词（与建索引侧 tokenize_for_fts 分词一致，
+        # 但查询丢弃功能词避免隐式 AND 全句失配）
+        tokens = [
+            t for t in self.db.tokenize_for_fts(query).split()
+            if t not in self._FTS_STOPWORDS and len(t.strip()) > 0
+        ]
+        if not tokens:
+            return []
+        # 每个 token 加双引号：FTS5 MATCH 对裸词做语法解析，
+        # 含 "exit_code"、"a: b" 等 token 会被误认为列过滤语法直接报错
+        tokenized_query = " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+        try:
+            rows = self.db.query_all(
+                """
+                SELECT record_type, source_id, content
+                FROM fts_memory
+                WHERE fts_memory MATCH ?
+                LIMIT ?
+                """,
+                (tokenized_query, int(top_k)),
+            )
+        except Exception as e:
+            logger.warning("HybridRetriever: FTS query failed (%s), skipping FTS leg", e)
+            return []
         candidates = []
         for rank, row in enumerate(rows, start=1):
             candidate = self._hydrate_candidate(row["record_type"], row["source_id"])
             if candidate is None:
                 continue
             candidate["fts_rank"] = rank
-            candidate["score"] = candidate.get("score", 0.0) + self._rank_to_score(rank)
             candidates.append(candidate)
         return candidates
 
@@ -148,7 +175,6 @@ class HybridRetriever:
                 continue
             candidate["embedding_similarity"] = similarity
             candidate["embedding_rank"] = rank
-            candidate["score"] = candidate.get("score", 0.0) + self._rank_to_score(rank)
             results.append(candidate)
         return results
 
@@ -200,7 +226,6 @@ class HybridRetriever:
         results = []
         for rank, candidate in enumerate(scored[:int(top_k)], start=1):
             candidate["bm25_rank"] = rank
-            candidate["score"] = candidate.get("score", 0.0) + self._rank_to_score(rank)
             results.append(candidate)
         return results
 
@@ -277,8 +302,5 @@ class HybridRetriever:
             return None
         return None
 
-    @staticmethod
-    def _rank_to_score(rank):
-        if rank <= 0:
-            return 0.0
-        return 1.0 / rank
+    # 排名信号统一由 _rrf_fuse 的 1/(60+rank) 提供，不再叠加 1/rank，
+    # 避免同一排名被双重计分。score 的语义现在是：salience 先验 + 多路 RRF 排名。

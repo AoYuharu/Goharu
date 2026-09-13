@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>坦克大战 - 焕新版</title>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{background:#111;display:flex;justify-content:center;align-items:center;min-height:100vh;font-family:'Courier New',monospace}
+        #c{display:block;image-rendering:pixelated;image-rendering:crisp-edges;background:#000;border:4px solid #333;box-shadow:0 0 40px rgba(0,255,0,0.3)}
+        #o{position:fixed;top:0;left:0;width:100%;height:100%;display:flex;flex-direction:column;justify-content:center;align-items:center;background:rgba(0,0,0,.9);color:#0f0;text-align:center;z-index:10}
+        #o.hidden{display:none}
+        h1{font-size:48px;text-shadow:0 0 20px #0f0;margin:0 0 10px;letter-spacing:4px}
+        h2{font-size:22px;color:#ff0;margin:0 0 30px}
+        p{font-size:16px;margin:8px 0}
+        .blink{animation:blink 1s infinite}
+        @keyframes blink{0%,50%{opacity:1}51%,100%{opacity:0}}
+        .ctrl{margin-top:20px;font-size:14px;color:#888;line-height:1.8}
+        #m{position:fixed;top:10px;right:10px;background:rgba(0,0,0,.7);border:2px solid #0f0;color:#0f0;padding:6px 12px;cursor:pointer;font:14px inherit;z-index:20}
+        #m:hover{background:#0f0;color:#000}
+    </style>
+</head>
+<body>
+    <canvas id="c"></canvas>
+    <button id="m">🔊</button>
+    <div id="o">
+        <h1>🎮 坦克大战</h1>
+        <h2>TANK BATTLE CLASSIC</h2>
+        <p class="blink">按 [空格键] 开始</p>
+        <div class="ctrl">
+            <p>移动: W/A/S/D 或 方向键</p>
+            <p>射击: 空格 | 暂停: P | 静音: M | 重开: R</p>
+        </div>
+    </div>
+    <script src="audio.js"></script>
+    <script src="levels.js"></script>
+    <script src="game.js"></script>
+    <script src="render.js"></script>
+    <script src="main.js"></script>
+</body>
+</html>

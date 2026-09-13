@@ -32,7 +32,6 @@ class PDFParser:
 
     def __init__(
         self,
-        use_ocr: bool = True,
         extract_figures: bool = True,
         extract_tables: bool = True,
         extract_equations: bool = True,
@@ -42,13 +41,11 @@ class PDFParser:
         初始化PDF解析器
 
         Args:
-            use_ocr: 是否使用OCR处理扫描版PDF
             extract_figures: 是否提取图表
             extract_tables: 是否提取表格
             extract_equations: 是否提取公式
             extract_references: 是否提取引用文献
         """
-        self.use_ocr = use_ocr
         self.extract_figures = extract_figures
         self.extract_tables = extract_tables
         self.extract_equations = extract_equations
@@ -56,7 +53,7 @@ class PDFParser:
 
         # 初始化提取器（依赖注入）
         self.metadata_extractor = MetadataExtractor()
-        self.text_extractor = TextExtractor(use_ocr=use_ocr)
+        self.text_extractor = TextExtractor()
         self.table_extractor = TableExtractor() if extract_tables else None
         self.figure_extractor = FigureExtractor() if extract_figures else None
         self.equation_extractor = EquationExtractor() if extract_equations else None
@@ -163,7 +160,6 @@ def parse_pdf_to_json(
     pdf_path: str,
     output_dir: Optional[str] = None,
     save_to: Optional[str] = None,
-    use_ocr: bool = False,
     **kwargs
 ) -> str:
     """
@@ -173,11 +169,10 @@ def parse_pdf_to_json(
         pdf_path: PDF文件路径
         output_dir: 输出目录
         save_to: 保存JSON的路径
-        use_ocr: 是否使用OCR
         **kwargs: 其他参数
 
     Returns:
         JSON字符串
     """
-    parser = PDFParser(use_ocr=use_ocr, **kwargs)
+    parser = PDFParser(**kwargs)
     return parser.parse_to_json(pdf_path, output_dir, save_to)

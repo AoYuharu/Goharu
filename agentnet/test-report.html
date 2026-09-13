@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentNet Registry 测试报告</title>
+<style>
+  :root {
+    --bg: #0d0f17;
+    --panel: #1c1e2b;
+    --panel-2: #232636;
+    --border: #2c3044;
+    --text: #c8ccd8;
+    --text-dim: #8b90a0;
+    --text-bright: #e8eaf2;
+    --add: #4ade80;
+    --update: #60a5fa;
+    --merge: #fbbf24;
+    --ignore: #9ca3af;
+    --retire: #f87171;
+    --bug: #f87171;
+    --mono: "Cascadia Code", "Consolas", "SF Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    line-height: 1.55;
+    padding: 40px 24px 80px;
+  }
+  .wrap { max-width: 1000px; margin: 0 auto; }
+  h1 {
+    color: var(--text-bright);
+    font-size: 26px;
+    margin: 0 0 4px;
+    letter-spacing: .5px;
+  }
+  .subtitle { color: var(--text-dim); font-size: 14px; margin: 0 0 28px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-bottom: 20px;
+  }
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px;
+  }
+  .badge {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 999px;
+    letter-spacing: .4px;
+    border: 1px solid transparent;
+  }
+  .badge-add    { color: var(--add);    background: rgba(74,222,128,.12); border-color: rgba(74,222,128,.35); }
+  .badge-update { color: var(--update); background: rgba(96,165,250,.12); border-color: rgba(96,165,250,.35); }
+  .badge-merge  { color: var(--merge);  background: rgba(251,191,36,.12); border-color: rgba(251,191,36,.35); }
+  .badge-ignore { color: var(--ignore); background: rgba(156,163,175,.12); border-color: rgba(156,163,175,.35); }
+  .badge-retire { color: var(--retire); background: rgba(248,113,113,.12); border-color: rgba(248,113,113,.35); }
+  .badge-bug    { color: #fff;           background: rgba(248,113,113,.85); }
+  .step-title {
+    color: var(--text-bright);
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0 0 10px;
+  }
+  .step-title .num {
+    color: var(--text-dim);
+    font-family: var(--mono);
+    margin-right: 6px;
+  }
+  .decision {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin: 10px 0 14px;
+    font-size: 13px;
+  }
+  .decision .reason { color: var(--text-dim); margin-top: 4px; }
+  .decision .kv { font-family: var(--mono); font-size: 12px; color: var(--text); }
+  .decision .kv b { color: var(--text-bright); font-weight: 600; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    margin-top: 8px;
+  }
+  th, td {
+    text-align: left;
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    color: var(--text-dim);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .5px;
+    background: rgba(255,255,255,.02);
+  }
+  tr:last-child td { border-bottom: none; }
+  td.id { color: var(--text-bright); }
+  td.desc { color: var(--text-dim); }
+  .status-active { color: var(--add); }
+  .status-retired { color: var(--retire); }
+  .ver { color: var(--text-bright); }
+  .bug-box {
+    border: 1px solid rgba(248,113,113,.4);
+    background: rgba(248,113,113,.07);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 16px;
+  }
+  .bug-box h3 { margin: 0 0 6px; color: var(--retire); font-size: 15px; }
+  .bug-box p { margin: 6px 0; font-size: 13.5px; }
+  .fix-box {
+    border: 1px solid rgba(74,222,128,.35);
+    background: rgba(74,222,128,.06);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 16px;
+  }
+  .fix-box h3 { margin: 0 0 6px; color: var(--add); font-size: 15px; }
+  .mono { font-family: var(--mono); }
+  .muted { color: var(--text-dim); }
+  .h2 {
+    color: var(--text-bright);
+    font-size: 18px;
+    font-weight: 700;
+    margin: 36px 0 16px;
+    padding-left: 10px;
+    border-left: 3px solid var(--update);
+  }
+  .h2.bugs { border-left-color: var(--retire); }
+  .h2.fixes { border-left-color: var(--add); }
+  .delta-add { color: var(--add); font-weight: 600; }
+  .delta-nochange { color: var(--ignore); }
+  .arrow { color: var(--text-dim); margin: 0 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>AgentNet Registry 测试报告</h1>
+  <p class="subtitle">159.75.26.204 / home/goharu/agentnet:8000 · curator 小模型去重 · 2026-09-12</p>
+
+  <div class="card">
+    <div class="step-title">Curator 动作说明（本次实测 4 种 + retire）</div>
+    <div class="legend">
+      <span class="badge badge-add">add</span>
+      <span class="badge badge-update">update</span>
+      <span class="badge badge-merge">merge</span>
+      <span class="badge badge-ignore">ignore</span>
+      <span class="badge badge-retire">retire</span>
+    </div>
+    <p class="muted" style="font-size:13px;margin:12px 0 0;">
+      每个动作都由 MiniMax-M2.7 检索同 Agent 相关原子后判断（<span class="mono">_used_llm: true</span>）。
+      能力更新不是"一棒子打死"，而是 add / update / merge / ignore + retire 列表的组合。
+    </p>
+  </div>
+
+  <!-- ===================== 时间线 ===================== -->
+  <div class="h2">完整测试时间线（智能体 explorer-01）</div>
+
+  <!-- 初始 -->
+  <div class="card">
+    <div class="step-title"><span class="num">STEP 0</span>初始数据库状态</div>
+    <table>
+      <thead><tr><th>agent / capability</th><th>名称</th><th>状态</th><th>版本</th><th>描述</th></tr></thead>
+      <tbody>
+        <tr><td class="id">home_bot/file_manage</td><td>文件管理</td><td class="status-active">active</td><td class="ver">v1</td><td class="desc">读写本地文件、整理目录、批量重命名</td></tr>
+        <tr><td class="id">home_bot/speech_recognition</td><td>语音识别</td><td class="status-active">active</td><td class="ver">v2</td><td class="desc">通过麦克风识别语音，支持中英文实时转写</td></tr>
+        <tr><td class="id">test-curator-01/image-gen</td><td>图像生成</td><td class="status-active">active</td><td class="ver">v1</td><td class="desc">能根据文字描述生成图片</td></tr>
+        <tr><td class="id">test-curator-01/speech-recognition</td><td>语音识别</td><td class="status-active">active</td><td class="ver">v2</td><td class="desc">将麦克风音频实时转写，支持多说话人分离</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 测试1 -->
+  <div class="card">
+    <div class="step-title"><span class="num">STEP 1</span>注册新智能体 explorer-01</div>
+    <p class="muted" style="font-size:13px;margin:0;">POST /register → agent_id=explorer-01, name=探索者</p>
+    <table>
+      <thead><tr><th>agent_id</th><th>name</th><th>status</th><th>summary</th></tr></thead>
+      <tbody>
+        <tr><td class="id">explorer-01</td><td>探索者</td><td>registering</td><td class="desc">负责探索新设备并上报自身能力</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 测试2 -->
+  <div class="card">
+    <div class="step-title"><span class="num">STEP 2</span>首次上报能力 tts</div>
+    <div class="decision">
+      <div class="kv">action=<b class="badge badge-add">add</b> &nbsp; target=<b>null</b> &nbsp; retire=<b>[]</b></div>
+      <div class="reason">reason：智能体首次注册能力，语音合成为全新能力，无现有能力可关联</div>
+    </div>
+    <table>
+      <thead><tr><th>capability</th><th>名称</th><th>状态</th><th>版本</th><th>描述</th></tr></thead>
+      <tbody>
+        <tr><td class="id">explorer-01/tts <span class="delta-add">▲ 新增</span></td><td>语音合成</td><td class="status-active">active</td><td class="ver">v1</td><td class="desc">把文字转成自然流畅的语音播报</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 测试3 -->
+  <div class="card">
+    <div class="step-title"><span class="num">STEP 3</span>重复上报完全相同的 tts</div>
+    <div class="decision">
+      <div class="kv">action=<b class="badge badge-ignore">ignore</b> &nbsp; target=<b>tts</b> &nbsp; retire=<b>[]</b></div>
+      <div class="reason">reason：capability_id、名称、描述均相同，无新增信息</div>
+    </div>
+    <p class="muted" style="font-size:13px;margin:0;"><span class="delta-nochange">○ 无变化</span> — tts 仍为 v1，不重复落库</p>
+  </div>
+
+  <!-- 测试4 -->
+  <div class="card">
+    <div class="step-title"><span class="num">STEP 4</span>tts 描述演化</div>
+    <div class="decision">
+      <div class="kv">action=<b class="badge badge-update">update</b> &nbsp; target=<b>tts</b> &nbsp; retire=<b>[]</b></div>
+      <div class="reason">reason：新增了多音色切换和语速调节等具体特性，属对现有能力的细化完善</div>
+    </div>
+    <table>
+      <thead><tr><th>capability</th><th>名称</th><th>状态</th><th>版本</th><th>描述</th></tr></thead>
+      <tbody>
+        <tr><td class="id">explorer-01/tts</td><td>语音合成</td><td class="status-active">active</td><td class="ver">v1 → v2</td><td class="desc">把文字转成语音播报，支持多音色切换和语速调节</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 测试5 -->
+  <div class="card">
+    <div class="step-title"><span class="num">STEP 5</span>上报高度重叠能力 voice-broadcast <span class="badge badge-bug">触发 Bug 1</span></div>
+    <div class="decision">
+      <div class="kv">action=<b class="badge badge-merge">merge</b> &nbsp; target=<b>tts</b> &nbsp; retire=<b>[]</b></div>
+      <div class="reason">reason：语音播报与语音合成核心功能完全重叠，本质都是文本转语音，因此合并</div>
+    </div>
+    <table>
+      <thead><tr><th>capability</th><th>名称</th><th>状态</th><th>版本</th><th>描述</th></tr></thead>
+      <tbody>
+        <tr><td class="id">explorer-01/tts</td><td><s>语音合成</s> → 语音播报</td><td class="status-active">active</td><td class="ver">v2 → v3</td><td class="desc"><s>富描述</s> → 将文本内容朗读出来给人听</td></tr>
+      </tbody>
+    </table>
+    <p class="muted" style="font-size:13px;margin:8px 0 0;">
+      ⚠️ merge 把 target 的 <b>名称</b> 和 <b>富描述</b>（多音色/语速调节）用新上报的稀疏描述覆盖了 —— 信息丢失。
+    </p>
+  </div>
+
+  <!-- 测试6 -->
+  <div class="card">
+    <div class="step-title"><span class="num">STEP 6</span>先报旧版识别，再报新版识别 <span class="badge badge-bug">触发 Bug 2</span></div>
+    <div class="decision">
+      <div class="kv">旧版 → action=<b class="badge badge-add">add</b> &nbsp; target=null &nbsp; retire=[]</div>
+      <div class="kv">新版 → action=<b class="badge badge-update">update</b> &nbsp; target=<b>speech-rec-old</b> &nbsp; retire=<b>["speech-rec-old"]</b></div>
+      <div class="reason">reason：新版是旧版升级版，应作为旧版演化更新，同时将旧版软删除</div>
+    </div>
+    <table>
+      <thead><tr><th>capability</th><th>名称</th><th>状态</th><th>版本</th><th>描述</th></tr></thead>
+      <tbody>
+        <tr><td class="id">explorer-01/speech-rec-old</td><td><s>语音识别旧版</s> → 语音识别新版</td><td class="status-active">active</td><td class="ver">v1 → v2</td><td class="desc">支持中英文实时转写，准确率高，替代旧版</td></tr>
+      </tbody>
+    </table>
+    <p class="muted" style="font-size:13px;margin:8px 0 0;">
+      ⚠️ curator 同时要求 retire 和 update <b>同一个原子</b>：先 retire（置 retired）再 upsert 又把状态改回 active，
+      retire 被静默撤销，日志里还留下一条误导性的 <span class="mono">retire</span> 事件。
+    </p>
+  </div>
+
+  <!-- 测试7 -->
+  <div class="card">
+    <div class="step-title"><span class="num">STEP 7</span>按能力搜索「语音」</div>
+    <table>
+      <thead><tr><th>命中能力</th><th>名称</th><th>score</th></tr></thead>
+      <tbody>
+        <tr><td class="id">explorer-01/speech-rec-old</td><td>语音识别新版</td><td class="mono">0.0323</td></tr>
+        <tr><td class="id">explorer-01/tts</td><td>语音播报</td><td class="mono">0.0323</td></tr>
+        <tr><td class="id">home_bot/speech_recognition</td><td>语音识别</td><td class="mono">0.0320</td></tr>
+        <tr><td class="id">test-curator-01/speech-recognition</td><td>语音识别</td><td class="mono">0.0315</td></tr>
+        <tr class="muted"><td class="id">home_bot/file_manage</td><td>文件管理</td><td class="mono">0.0154</td></tr>
+        <tr class="muted"><td class="id">test-curator-01/image-gen</td><td>图像生成</td><td class="mono">0.0152</td></tr>
+      </tbody>
+    </table>
+    <p class="muted" style="font-size:13px;margin:8px 0 0;">FTS5-BM25 + Qwen3 向量 + RRF(1/(60+rank))；相关项 ~0.032 与无关尾项 ~0.015 有明显分界（库小所以 top_k 返回了全部原子）。</p>
+  </div>
+
+  <!-- 测试8 -->
+  <div class="card">
+    <div class="step-title"><span class="num">STEP 8</span>按名字搜索「管家」</div>
+    <table>
+      <thead><tr><th>agent_id</th><th>name</th><th>summary</th></tr></thead>
+      <tbody>
+        <tr><td class="id">home_bot</td><td>家庭管家</td><td class="desc">负责家里智能设备的管理与调度</td></tr>
+      </tbody>
+    </table>
+    <p class="muted" style="font-size:13px;margin:8px 0 0;">name_matches 命中 home_bot，名字搜索与能力搜索两条路都通。</p>
+  </div>
+
+  <!-- ===================== Bug 汇总 ===================== -->
+  <div class="h2 bugs">发现的两个 Bug</div>
+
+  <div class="bug-box">
+    <h3>Bug 1 — merge 把富内容覆盖成贫内容（信息丢失）</h3>
+    <p>根因：<span class="mono">_execute</span> 里 <span class="mono">update</span> 和 <span class="mono">merge</span> 走同一分支，都用<b>新上报</b>的 name/desc 覆盖 target。</p>
+    <p>后果：merge 时原有原子的富描述（多音色、语速调节）被稀疏重复项覆盖。</p>
+  </div>
+
+  <div class="bug-box">
+    <h3>Bug 2 — retire 和 update 指向同一原子时，retire 被静默撤销</h3>
+    <p>根因：先 <span class="mono">retire_capability</span>（status=retired），随后 <span class="mono">upsert_capability</span> 又把 status 改回 active。</p>
+    <p>后果：retire 白做，日志留下误导性 <span class="mono">retire</span> 事件。</p>
+  </div>
+
+  <!-- ===================== 修复验证 ===================== -->
+  <div class="h2 fixes">修复验证</div>
+
+  <div class="fix-box">
+    <h3>修复 Bug 1 — merge 保留现有富内容，仅记录事件</h3>
+    <p class="muted" style="font-size:13px;margin:0;">确定性注入 merge 决策后，tts 名称/描述/版本均保持不变，且不产生多余的 voice-broadcast 行。</p>
+    <table>
+      <thead><tr><th>capability</th><th>名称</th><th>状态</th><th>版本</th><th>描述</th></tr></thead>
+      <tbody>
+        <tr><td class="id">merge-test-01/tts</td><td>语音合成</td><td class="status-active">active</td><td class="ver">v1</td><td class="desc">把文字转成自然流畅的语音播报，支持多音色切换和语速调节</td></tr>
+      </tbody>
+    </table>
+    <p class="muted" style="font-size:13px;margin:8px 0 0;">事件日志：<span class="mono">tts / add</span> → <span class="mono">tts / merge</span>（merge 落在 target 上，内容未变、版本未 +1）。</p>
+  </div>
+
+  <div class="fix-box">
+    <h3>修复 Bug 2 — retire 过滤掉"正在更新的原子本身"</h3>
+    <p class="muted" style="font-size:13px;margin:0;">新版上报后，旧原子干净地原地演化，事件日志不再有误导性 retire。</p>
+    <table>
+      <thead><tr><th>capability</th><th>名称</th><th>状态</th><th>版本</th><th>描述</th></tr></thead>
+      <tbody>
+        <tr><td class="id">fix-verify-01/speech-rec-old</td><td>语音识别新版</td><td class="status-active">active</td><td class="ver">v2</td><td class="desc">支持中英文实时转写，准确率高，替代旧版方案</td></tr>
+      </tbody>
+    </table>
+    <p class="muted" style="font-size:13px;margin:8px 0 0;">事件日志：<span class="mono">speech-rec-old / add</span> → <span class="mono">speech-rec-old / update</span>（无 retire）。</p>
+  </div>
+
+  <div class="card">
+    <div class="step-title">结论</div>
+    <p class="muted" style="font-size:13.5px;margin:0;">
+      4 个 curator 动作（add / update / merge / ignore）+ 名字/能力双路检索全部跑通；
+      两个边界 bug（merge 信息丢失、retire 与 update 冲突）已修复并验证。
+      唯一需注意：curator 的 LLM 判断<b>非确定性</b>，同一份上报可能时而判 add、时而判 merge，
+      去重是"大概率对"而非"必然对"。
+    </p>
+  </div>
+
+</div>
+</body>
+</html>

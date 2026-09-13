@@ -1,35 +1,23 @@
 pyyaml
 python-dotenv
-torch
-transformers
-bitsandbytes
+# 锁定已验证可用的组合（CPU 加载 embedding 通过）；勿裸依赖，否则 pip 拉到新版易触发 CUDA 加载崩溃
+torch==2.8.0
+transformers==4.57.1
+sentence-transformers==5.4.1
 anthropic
-mcp
-fastmcp
-langchain-community
-langchain-text-splitters
-sentence-transformers
-pymilvus
-tqdm
-nltk
-rich
-nest_asyncio
-
-# ACP HTTP Server 依赖
-aiohttp>=3.9.0
+openai>=1.0.0  # provider=openai_compatible 时需要
+mcp>=1.27.0  # MCP server 热接入（mcp_manage 工具）
 requests>=2.31.0
 
-# PDF解析依赖
+# PDF解析依赖（仅文本层提取，无 OCR）
 PyMuPDF>=1.23.0
 pdfplumber>=0.10.0
-Pillow>=10.0.0
-pytesseract>=0.3.10
+
+# Office/WPS 文档解析（.docx/.xlsx/.pptx 原生，.doc/.xls/.ppt 经本机 WPS/Office COM 转换）
+python-docx>=1.1.0
+python-pptx>=1.0.0
+openpyxl>=3.1.0
+pywin32>=306; sys_platform == "win32"
 
 # BM25 + jieba 中文分词
 jieba>=0.42.1
-
-# 本地 GGUF embedding 模型加载
-llama-cpp-python>=0.3.0
-
-# 从 HuggingFace 下载 GGUF 文件
-huggingface_hub>=0.25.0

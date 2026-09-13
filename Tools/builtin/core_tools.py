@@ -1,15 +1,20 @@
 import subprocess
 import re
 import json
+import threading
 
 from Tools.registry import registry
 from Tools.security import check_command_safety
+from Tools.cmd_translate import translate_command
 from Tools.tool_process_tracker import tool_process_tracker
+from Tools.tool_output_stream import tool_output_bus
+from Tools.process_sandbox import CommandJob
 from Tools.platform_utils import (
     get_subprocess_env,
     get_subprocess_creation_flags,
     is_windows,
     kill_process_tree,
+    resolve_bash_path,
 )
 
 # 导入 file_tools 以注册文件操作工具
@@ -29,18 +34,36 @@ from Tools.builtin.knowledge_tools import (
 )
 
 
-async def run_cmd(cmd: str) -> str:
+# 前台命令硬超时（秒）。已后台化的命令不受此限（见 run_cmd 等待循环）。
+FOREGROUND_CMD_TIMEOUT_S = 480
+
+
+async def run_cmd(cmd: str, description: str = "") -> str:
     """
     Execute shell command with strict file operation restrictions and security checks.
-    Blocks dangerous commands and guides to use dedicated tools.
+    Blocks dangerous commands; require_confirmation 命令弹窗询问用户后才执行。
     """
     import asyncio
+    import time
+    from Tools.security import get_security_checker
+    from Tools.confirmation_manager import confirmation_manager
     cmd_lower = cmd.lower().strip()
 
-    # 🔒 安全检查：拦截危险命令
-    is_safe, error_message = check_command_safety(cmd)
-    if not is_safe:
-        return json.dumps({"error": error_message}, ensure_ascii=False)
+    # 🔒 安全检查：三态分类
+    safety = get_security_checker().classify_command(cmd)
+    if safety == "blocked":
+        is_safe, error_message = check_command_safety(cmd)
+        return json.dumps({"error": error_message or "Command blocked by security policy"}, ensure_ascii=False)
+    if safety == "confirm":
+        # 需要用户确认：阻塞本工具线程，等待 TUI 用户选择 Yes/No
+        desc = description.strip() or f"需要执行可能具有破坏性的命令: {cmd}"
+        approved = confirmation_manager.request(cmd, desc)
+        if not approved:
+            return json.dumps({
+                "error": "用户拒绝了该命令的执行 (user denied confirmation)",
+                "user_denied": True,
+            }, ensure_ascii=False)
+        # 用户批准 → 继续执行
 
     # 检测 echo 命令用于文件操作
     # 匹配: echo ... > file, echo ... >> file
@@ -61,71 +84,134 @@ Please use the dedicated tools instead:
 These tools are safer, provide better error handling, and ensure you know what you're changing.
 DO NOT retry with run_cmd. Use the dedicated tools."""}, ensure_ascii=False)
 
-    # 检测其他被禁止的文件操作命令
+    # 读侧文本流命令（cat/head/tail/sed/awk/type|、管道组合）放行：限制的核心
+    # 目的是控制工具结果体量，超长输出由 ToolResultBudget 截断兜底，短输出
+    # 直接查看无需拒绝。仍保留写侧拦截：shell 改写文件必须走 Edit 工具。
     forbidden_patterns = [
-        (r'\btype\b.*?\|', 'type with pipe'),  # type file.txt | ...
-        (r'\bcat\b', 'cat'),
-        (r'\bhead\b', 'head'),
-        (r'\btail\b', 'tail'),
-        (r'\bsed\b', 'sed'),
-        (r'\bawk\b', 'awk'),
+        (r'\bsed\b[^|;&]*\s(-i[^ \t-]|-i\b|--in-place)', 'sed in-place edit (-i/--in-place)'),
     ]
 
     for pattern, cmd_name in forbidden_patterns:
         if re.search(pattern, cmd_lower):
-            return json.dumps({"error": f"""Using '{cmd_name}' for file operations is not allowed.
+            return json.dumps({"error": f"""Using '{cmd_name}' is not allowed — it modifies files in place.
 
-Please use the dedicated tools instead:
-- To READ a file: Use the Read tool
-- To SEARCH in files: Use the Grep tool
-- To MODIFY a file: Use Read + Edit tools
+File modifications MUST go through the Edit tool (Read then Edit), so changes are
+diffable and permission-checked.
 
-DO NOT retry with run_cmd. Use the dedicated tools."""}, ensure_ascii=False)
+DO NOT retry with run_cmd. Use Read + Edit instead."""}, ensure_ascii=False)
+
+    # 🌐 跨平台转译：异系统命令（如 Windows 上的 ls）自动转为本机等价命令
+    translated_cmd, translated_from = translate_command(cmd)
+    if translated_from:
+        # 转译结果也要过安全检查（如 rm 转译后可能是 del）
+        is_safe, error_message = check_command_safety(translated_cmd)
+        if not is_safe:
+            return json.dumps({"error": error_message}, ensure_ascii=False)
 
     # 执行命令（带超时，默认30s；平台适配的进程组确保超时能杀死子进程树）
     env = get_subprocess_env()
-    # Windows: 统一使用 UTF-8 编码，避免 cp936 与 Python 子进程 UTF-8 输出不一致导致中文乱码
-    # chcp 65001 强制 cmd.exe 使用 UTF-8 代码页；env 中 PYTHONUTF8=1 强制 Python 子进程用 UTF-8
-    actual_cmd = cmd
-    if is_windows() and cmd.strip():
-        actual_cmd = f'chcp 65001 >nul 2>nul && {cmd}'
+    sandbox = CommandJob()
+    # Windows: 统一走 Git Bash——bash 才兼容多行 `python -c`、heredoc 与标准 POSIX 工具；
+    # cmd.exe 会 mangling 引号/换行（多行 python -c 静默空输出）。env 中 PYTHONUTF8=1 强制
+    # Python 子进程用 UTF-8，避免中文乱码。
+    if is_windows():
+        try:
+            bash = resolve_bash_path()
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+        popen_args = [bash, "-c", translated_cmd]
+        use_shell = False
+    else:
+        popen_args = translated_cmd
+        use_shell = True
     try:
         p = subprocess.Popen(
-            actual_cmd,
-            shell=True,
+            popen_args,
+            shell=use_shell,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             encoding='utf-8',
             errors='replace',
+            bufsize=1,  # 行缓冲，实时流式输出
             env=env,
-            creationflags=get_subprocess_creation_flags(),
+            creationflags=get_subprocess_creation_flags() | sandbox.creation_flags,
+            # POSIX 下必须让子进程自立进程组：否则 kill_process_tree 的
+            # killpg(getpgid(pid)) 会把 agent 自己所在的进程组一起杀掉
+            start_new_session=not is_windows(),
         )
         tool_process_tracker.register(p.pid)
+        if not sandbox.attach(p):
+            tool_process_tracker.unregister(p.pid)
+            sandbox.close()
+            return json.dumps({
+                "error": "命令进程未能进入安全沙箱，已终止",
+            }, ensure_ascii=False)
+        translated_meta = {"translated_from": translated_from} if translated_from else {}
+
+        # 逐行读取 stdout/stderr 并实时广播（让 TUI 能看到安装/编译等长命令的实时输出）
+        out_lines, err_lines = [], []
+        def _reader(stream, sink, tag):
+            try:
+                for line in iter(stream.readline, ''):
+                    sink.append(line)
+                    tool_output_bus.publish(line.rstrip('\n'), tag, cmd)
+            except Exception:
+                pass
+        t_out = threading.Thread(target=_reader, args=(p.stdout, out_lines, 'stdout'), daemon=True)
+        t_err = threading.Thread(target=_reader, args=(p.stderr, err_lines, 'stderr'), daemon=True)
+        t_out.start()
+        t_err.start()
+
+        def _collect():
+            out = "".join(out_lines).strip()
+            err = "".join(err_lines).strip()
+            return out, err
+
         try:
-            stdout, stderr = await asyncio.to_thread(p.communicate, timeout=480)
+            # 前台硬超时 FOREGROUND_CMD_TIMEOUT_S；一旦任务被转入后台
+            #（显式 run_background 或超时自动提升），进程豁免该超时——
+            # 服务器/守护进程不应被定时器杀死（否则会出现"宣布启动成功后
+            # 进程悄悄被杀"的事故）。
+            from Agent.BackgroundTaskManager import BackgroundTaskManager
+            deadline = time.monotonic() + FOREGROUND_CMD_TIMEOUT_S
+            while True:
+                tracked = BackgroundTaskManager().is_tracked(asyncio.current_task())
+                slice_s = 30.0 if tracked else max(0.1, min(30.0, deadline - time.monotonic()))
+                try:
+                    await asyncio.to_thread(p.wait, slice_s)
+                    break
+                except subprocess.TimeoutExpired:
+                    if tracked:
+                        continue
+                    if time.monotonic() >= deadline:
+                        raise
+            t_out.join(timeout=5)
+            t_err.join(timeout=5)
+            stdout, stderr = _collect()
             return json.dumps({
                 "exit_code": p.returncode,
-                "stdout": (stdout or "").strip(),
-                "stderr": (stderr or "").strip(),
+                "stdout": stdout,
+                "stderr": stderr,
                 "timed_out": False,
                 "interrupted": False,
+                **translated_meta,
             }, ensure_ascii=False)
         except asyncio.CancelledError:
             kill_process_tree(p.pid)
-            try:
-                stdout, stderr = await asyncio.to_thread(p.communicate, timeout=5)
-            except Exception:
-                stdout, stderr = "", ""
+            t_out.join(timeout=5)
+            t_err.join(timeout=5)
+            stdout, stderr = _collect()
             return json.dumps({
                 "exit_code": -1,
-                "stdout": (stdout or "").strip(),
-                "stderr": (stderr or "").strip(),
+                "stdout": stdout,
+                "stderr": stderr,
                 "timed_out": False,
                 "interrupted": True,
             }, ensure_ascii=False)
         finally:
             tool_process_tracker.unregister(p.pid)
+            sandbox.close()
     except subprocess.TimeoutExpired:
         kill_process_tree(p.pid)
         try:
@@ -153,14 +239,20 @@ registry.register(
     name="run_cmd",
     description=(
         "Execute a shell command. STRICTLY for system-level operations that CANNOT be done with dedicated tools. "
-        "Commands time out after 8m. Returns JSON with exit_code/stdout/stderr/timed_out/interrupted.\n\n"
+        "Foreground commands time out after 8m; backgrounded commands (run_background=true or auto-promoted) are NOT killed by timeout and may run indefinitely. "
+        "Returns JSON with exit_code/stdout/stderr/timed_out/interrupted.\n\n"
         "ALLOWED (examples): 'python script.py' / 'pytest test_xxx.py' / 'pip install pkg' / "
         "'git add file && git commit -m msg' / 'gh pr create ...' / 'mkdir new_dir' / 'ls' / 'dir'.\n\n"
-        "BLOCKED — file reading/writing: echo >, echo >>, cat, head, tail, sed, awk, type | . "
-        "These MUST use dedicated tools instead: Read for reading, Write for creating, Edit for modifying, Grep for searching, Glob for listing files.\n\n"
+        "BLOCKED — shell file writes: echo > / >> (file creation via echo), sed -i / --in-place. "
+        "File changes MUST use dedicated tools: Write for creating, Edit for modifying (requires prior Read).\n\n"
+        "ALLOWED — read-side text commands: cat, head, tail, grep, sed (filter), awk, sort, wc and pipes are fine. "
+        "Prefer Read/Grep/Glob for whole-file reads and searches; oversized command output is auto-truncated.\n\n"
         "BLOCKED — dangerous: shutdown, rm -rf, format, diskpart, del /s, reg delete, sudo, chmod 777, and any destructive system commands. "
         "Also BLOCKED: any command that attempts to bypass the blocked-file-ops restriction (e.g. 'python -c \"open(...).write(...)\"'). "
-        "The security layer will reject these at runtime — do NOT retry with variations."
+        "The security layer will reject these at runtime — do NOT retry with variations.\n\n"
+        "PowerShell is NOT available — do NOT use powershell/pwsh. "
+        "The shell is bash (Git Bash on Windows), NOT cmd.exe — use POSIX syntax: ls/cp/mv/rm/grep/find/... "
+        "Residual Windows cmd commands (dir/copy/del/set/...) are auto-translated to their POSIX equivalents."
     ),
     arguments_schema={
         "type": "object",
@@ -168,20 +260,25 @@ registry.register(
             "cmd": {
                 "type": "string",
                 "description": (
-                    "The shell command to execute. Use the native shell for the current OS (cmd.exe on Windows, bash on Unix).\n\n"
+                    "The shell command to execute. The shell is bash (Git Bash on Windows), NOT cmd.exe — "
+                    "use POSIX syntax (ls/cp/mv/rm/grep/find/...). Windows cmd commands (dir/copy/del/...) are auto-translated. "
+                    "PowerShell is NOT available.\n\n"
                     "ALLOWED: python/pytest/pip/git/gh/mkdir/ls/dir/cd/mv/cp/docker/npm/npx/git-lfs and similar system tools — "
                     "anything that genuinely needs a shell because no dedicated tool exists.\n\n"
-                    "BLOCKED — use dedicated tools instead:\n"
-                    "  echo ... > file  →  Use Write\n"
-                    "  echo ... >> file →  Use Edit\n"
-                    "  cat / head / tail →  Use Read\n"
-                    "  sed / awk         →  Use Edit\n"
-                    "  grep / rg         →  Use Grep\n"
-                    "  find / ls pattern →  Use Glob\n"
-                    "  type file | ...   →  Use Read\n\n"
+                    "BLOCKED — shell file writes (use dedicated tools):\n"
+                    "  echo ... > file    →  Use Write\n"
+                    "  echo ... >> file   →  Use Edit\n"
+                    "  sed -i / --in-place →  Use Read + Edit\n\n"
+                    "ALLOWED — read-side text commands (output auto-truncated when too long):\n"
+                    "  cat / head / tail, grep / rg, sed (filter), awk, sort, wc, pipes (|)\n"
+                    "  For whole-file reads prefer Read; for searches prefer Grep/Glob.\n\n"
                     "BLOCKED — dangerous (no dedicated tool to handle, MUST reject):\n"
                     "  shutdown, reboot, rm -rf, format, diskpart, del /s, reg delete, sudo, chmod 777, "
-                    "dd, mkfs, and any command that could damage the system. Do NOT attempt these."
+                    "dd, mkfs, and any command that could damage the system. Do NOT attempt these.\n\n"
+                    "IMPORTANT — multi-line / complex Python logic:\n"
+                    "  bash now handles multi-line `python -c \"...\"` correctly, but to avoid quoting pitfalls "
+                    "prefer a heredoc (`python <<'EOF' ... EOF`) or Write a temporary .py script "
+                    "(e.g. tmp_xxx.py) and run `python tmp_xxx.py`, then read its output."
                 ),
             },
             "run_background": {
@@ -193,6 +290,15 @@ registry.register(
                     "Results will be injected when the command completes."
                 ),
                 "default": False
+            },
+            "description": {
+                "type": "string",
+                "description": (
+                    "REQUIRED when running a risky/destructive command (del/rmdir/taskkill/reg/rm etc.): "
+                    "one short sentence explaining WHY this command is needed and what it will affect. "
+                    "Shown to the user in the confirmation prompt."
+                ),
+                "default": ""
             },
         },
         "required": ["cmd"],

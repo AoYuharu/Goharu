@@ -1,48 +1,54 @@
-import hashlib
 import json
 import logging
 import math
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 
 from Memory.MemoryDB import MemoryDB
-from configurationLoader import config
+from Memory.memory_config import resolve_config
 
 logger = logging.getLogger(__name__)
-_hash_fallback_warned = False
 
 
 class EmbeddingService:
     """Embedding service with pluggable providers.
 
-    Provider resolution (determined at init-time):
-    1. ``provider == "openai_compatible"`` and valid api_key + base_url → remote HTTP
-    2. Otherwise → local GGUF via llama-cpp-python
-    3. Final fallback → :meth:`_hash_embedding`
+    降级链（init 时确定远程，local 在首次使用时探测）：
+    1. ``provider == "openai_compatible"`` 且 api_key + base_url 有效 → 远程 HTTP
+    2. 本地 sentence_transformers 可用且模型加载成功 → 本地模型
+    3. 都不可用 → 向量腿整体禁用（encode 返回 []，检索退化为 FTS5+BM25），
+       不再写入 hash 假向量污染索引
     """
 
-    def __init__(self, db=None):
-        self.db = db or MemoryDB()
-        self.model_name = config.get(
+    # 类级缓存：所有实例共享同一份本地模型，避免重复加载 1.19GB 权重。
+    # 也避免多实例并发加载（并发加载正是此前 CUDA 原生崩溃的诱因之一）。
+    _model = None
+    _local_failed = False
+    _load_lock = threading.Lock()
+
+    def __init__(self, db=None, cfg=None):
+        cfg = resolve_config(cfg)
+        self.db = db or MemoryDB(cfg=cfg)
+        self.model_name = cfg.get(
             "memory.retrieval.embedding_model_name",
             "Qwen3-Embedding-0.6B",
         )
         self.model_path = Path(
-            config.get(
+            cfg.get(
                 "memory.retrieval.embedding_model_path",
                 "./models/embedding_model/Qwen3-Embedding-0.6B",
             )
         )
-        self.provider = config.get("memory.retrieval.embedding_provider", "local")
-        self.base_url = config.get("memory.retrieval.embedding_base_url", "")
-        self.api_key_env = config.get("memory.retrieval.embedding_api_key_env", "")
-        self.dimensions = int(config.get("memory.retrieval.embedding_dimensions", 768))
-        self.timeout = int(config.get("memory.retrieval.embedding_timeout", 30))
+        self.provider = cfg.get("memory.retrieval.embedding_provider", "local")
+        self.base_url = cfg.get("memory.retrieval.embedding_base_url", "")
+        self.api_key_env = cfg.get("memory.retrieval.embedding_api_key_env", "")
+        self.dimensions = int(cfg.get("memory.retrieval.embedding_dimensions", 768))
+        self.timeout = int(cfg.get("memory.retrieval.embedding_timeout", 30))
 
-        self._model = None          # SentenceTransformer (legacy fallback)
-        self._gguf_model = None     # llama-cpp Llama instance
         self._active_provider = self._resolve_provider()
+        logger.info("EmbeddingService: provider=%s (model=%s)", self._active_provider, self.model_name)
 
     @staticmethod
     def now():
@@ -92,69 +98,54 @@ class EmbeddingService:
         return [[float(v) for v in item["embedding"]] for item in items]
 
     # ------------------------------------------------------------------
-    # Local GGUF embedding (llama-cpp-python)
-    # ------------------------------------------------------------------
-
-    def _load_gguf(self):
-        if self._gguf_model is not None:
-            return self._gguf_model
-
-        from llama_cpp import Llama
-        from huggingface_hub import hf_hub_download
-
-        model_dir = Path("./models/embedding_model")
-        model_dir.mkdir(parents=True, exist_ok=True)
-        gguf_filename = "embeddinggemma-300m-qat-Q8_0.gguf"
-        gguf_path = model_dir / gguf_filename
-
-        if not gguf_path.exists():
-            hf_hub_download(
-                repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF",
-                filename=gguf_filename,
-                local_dir=str(model_dir),
-            )
-
-        self._gguf_model = Llama(
-            model_path=str(gguf_path),
-            embedding=True,
-            verbose=False,
-        )
-        return self._gguf_model
-
-    def _encode_local_gguf(self, text):
-        model = self._load_gguf()
-        result = model.create_embedding(text)
-        emb = result.get("embedding", [])
-        # create_embedding returns either a flat list or list of lists
-        if emb and isinstance(emb[0], list):
-            emb = emb[0]
-        return [float(v) for v in emb]
-
-    # ------------------------------------------------------------------
-    # Legacy SentenceTransformer (backward compat, last local fallback)
+    # Local SentenceTransformer
     # ------------------------------------------------------------------
 
     def _load_sentence_transformer(self):
-        if self._model is not None:
-            return self._model
-        try:
-            from sentence_transformers import SentenceTransformer
+        cls = type(self)
+        if cls._model is not None:
+            return cls._model
+        if cls._local_failed:
+            return None
+        with cls._load_lock:
+            if cls._model is not None:
+                return cls._model
+            if cls._local_failed:
+                return None
+            try:
+                from sentence_transformers import SentenceTransformer
 
-            model_path = str(self.model_path)
-            if Path(model_path).exists():
-                self._model = SentenceTransformer(model_path)
-            else:
-                self._model = SentenceTransformer(self.model_name)
-        except Exception:
-            self._model = None
-        return self._model
+                model_path = str(self.model_path)
+                # 强制 CPU：CUDA 路径在 torch2.8/transformers4.57 下加载该模型会触发原生访问冲突（0xC0000005）
+                if Path(model_path).exists():
+                    cls._model = SentenceTransformer(model_path, device="cpu")
+                else:
+                    cls._model = SentenceTransformer(self.model_name, device="cpu")
+            except Exception as e:
+                cls._local_failed = True
+                cls._model = None
+                logger.warning(
+                    "EmbeddingService: 本地模型不可用 (%s) — 向量检索腿禁用，"
+                    "检索退化为 FTS5+BM25；如需向量检索请配置远程 embedding 或安装模型",
+                    e,
+                )
+        return cls._model
+
+    @property
+    def available(self):
+        """是否存在真实可用的向量后端（远程或本地）。"""
+        if self._active_provider == "openai_compatible":
+            return True
+        return self._load_sentence_transformer() is not None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def encode(self, text, prompt_name=None):
-        """Encode a single text into a float vector."""
+        """Encode a single text into a float vector.
+
+        无可用向量后端时返回 []（调用方据此跳过向量腿）。"""
         text = str(text or "").strip()
         if not text:
             return []
@@ -166,16 +157,11 @@ class EmbeddingService:
                 vectors = self._encode_remote([text])
                 if vectors:
                     return vectors[0]
-            except Exception:
-                pass
+                logger.warning("EmbeddingService: remote returned no vectors, falling back to local")
+            except Exception as e:
+                logger.warning("EmbeddingService: remote embedding failed (%s), falling back to local", e)
 
-        # 2) Local GGUF
-        try:
-            return self._encode_local_gguf(text)
-        except Exception:
-            pass
-
-        # 3) Legacy SentenceTransformer (backward compat)
+        # 2) Local SentenceTransformer
         model = self._load_sentence_transformer()
         if model is not None:
             try:
@@ -186,18 +172,17 @@ class EmbeddingService:
                 if hasattr(vector, "tolist"):
                     vector = vector.tolist()
                 return [float(item) for item in vector]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("EmbeddingService: SentenceTransformer encode failed (%s)", e)
 
-        # 4) Hash fallback
-        return self._hash_embedding(text)
+        # 3) 无可用后端：不写假向量，由调用方跳过向量腿
+        return []
 
     def encode_batch(self, texts):
         """Encode multiple texts into float vectors.
 
         Remote provider sends a single batch request.  Local provider
-        encodes texts one by one.
-        """
+        encodes texts one by one. 无后端的条目返回 [] 占位。"""
         clean = [str(t or "").strip() for t in (texts or [])]
         if not clean:
             return []
@@ -206,43 +191,26 @@ class EmbeddingService:
         if self._active_provider == "openai_compatible":
             try:
                 return self._encode_remote(clean)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("EmbeddingService: remote batch failed (%s), falling back to local", e)
 
-        # 2) Local GGUF (one-by-one, model has small context window)
-        results = []
-        for t in clean:
-            t_short = self._truncate_for_local(t)
-            if not t_short:
-                results.append([])
-                continue
-            try:
-                results.append(self._encode_local_gguf(t_short))
-            except Exception:
-                pass
-
-        if len(results) == len(clean):
-            return results
-
-        # 3) Legacy SentenceTransformer batch
+        # 2) Local SentenceTransformer batch
         model = self._load_sentence_transformer()
         if model is not None:
             try:
-                remaining = [clean[i] for i in range(len(clean)) if i >= len(results)]
-                batch_vectors = model.encode(remaining)
+                batch_vectors = model.encode(clean)
                 if hasattr(batch_vectors, "tolist"):
                     batch_vectors = batch_vectors.tolist()
-                results.extend([float(item) for item in vec] for vec in batch_vectors)
-            except Exception:
-                pass
+                return [[float(item) for item in vec] for vec in batch_vectors]
+            except Exception as e:
+                logger.warning("EmbeddingService: SentenceTransformer batch encode failed (%s)", e)
 
-        # 4) Hash fallback for any remaining
-        while len(results) < len(clean):
-            results.append(self._hash_embedding(clean[len(results)]))
-        return results
+        return [[] for _ in clean]
 
     def store_embedding(self, source_table, source_id, text, prompt_name=None):
         vector = self.encode(text, prompt_name=prompt_name)
+        if not vector:
+            return []  # 无后端：不落库，避免假向量污染索引
         payload = json.dumps(vector).encode("utf-8")
         self.db.execute(
             "DELETE FROM embeddings WHERE source_table = ? AND source_id = ? AND model_name = ?",
@@ -280,7 +248,7 @@ class EmbeddingService:
         if not left or not right:
             return 0.0
         if len(left) != len(right):
-            # 维度不一致说明混入了 hash 兜底向量（64 维），
+            # 维度不一致说明混入了旧版 hash 兜底向量（64 维，已停止写入），
             # 截断比较会产生无意义分数，直接判为不相关
             return 0.0
         size = min(len(left), len(right))
@@ -297,21 +265,3 @@ class EmbeddingService:
     def _truncate_for_local(text, max_chars=512):
         """Truncate input to fit within the embedding model's context window."""
         return str(text)[:max_chars]
-
-    @staticmethod
-    def _hash_embedding(text, dim=64):
-        global _hash_fallback_warned
-        if not _hash_fallback_warned:
-            _hash_fallback_warned = True
-            logger.warning(
-                "EmbeddingService: falling back to hash embedding (64-dim, non-semantic). "
-                "Vector search quality is degraded — check llama_cpp / sentence_transformers / remote provider."
-            )
-        digest = hashlib.sha256(text.encode("utf-8")).digest()
-        numbers = list(digest)
-        vector = []
-        for index in range(dim):
-            value = numbers[index % len(numbers)] / 255.0
-            vector.append((value * 2.0) - 1.0)
-        norm = math.sqrt(sum(item * item for item in vector)) or 1.0
-        return [item / norm for item in vector]

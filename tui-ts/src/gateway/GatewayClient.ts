@@ -95,7 +95,9 @@ export class GatewayClient extends EventEmitter {
     this.readyReceived = false;
     this.stderrRing = [];
 
-    const command = this.mock ? process.execPath : (process.env.PYTHON ?? "python");
+    // Linux/macOS 通常只有 python3；Windows 通常只有 python。PYTHON 环境变量优先。
+    const defaultPython = process.platform === "win32" ? "python" : "python3";
+    const command = this.mock ? process.execPath : (process.env.PYTHON ?? defaultPython);
     const args = this.mock
       ? [path.join(PROJECT_ROOT, "tui-ts", "test", "mock-gateway.mjs"), ...this.mockArgs]
       : ["-u", path.join(PROJECT_ROOT, "Gateway", "gateway_entry.py")];

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from configurationLoader import config
 from Tools.loader import load_builtin_tools
 from Tools.registry import registry
+from Tools.result_formatters import format_tool_result
+from Tools.verify_nudge import verify_nudge
 
 logger = logging.getLogger(__name__)
 
@@ -101,13 +103,13 @@ class InProcessToolRuntime:
         background_timeout = config.get("tools.background_timeout", 120)
         if not isinstance(background_timeout, (int, float)) or background_timeout <= 0:
             result = await dispatch_task
-            return ToolResult(content=result)
+            return ToolResult(content=self._post_process(name, args, result))
 
         try:
             result = await asyncio.wait_for(
                 asyncio.shield(dispatch_task), timeout=background_timeout
             )
-            return ToolResult(content=result)
+            return ToolResult(content=self._post_process(name, args, result))
         except asyncio.TimeoutError:
             task_id = task_mgr.track_task(name, dispatch_task, desc)
             logger.info(
@@ -125,6 +127,19 @@ class InProcessToolRuntime:
                     ensure_ascii=False,
                 )
             )
+
+    @staticmethod
+    def _post_process(name, args, result):
+        """工具结果的后处理工序（map 层）：
+        1. format — JSON → 模型可读的中文结构化文本
+        2. nudge — 行为模式检测，需要时在结果末尾夹带提醒
+        """
+        if config.get("tools.result_format.enabled", True):
+            result = format_tool_result(name, result)
+        nudge = verify_nudge.after_tool_call(name, args or {}, result)
+        if nudge:
+            result = result + "\n\n" + nudge
+        return result
 
     async def close(self):
         return None

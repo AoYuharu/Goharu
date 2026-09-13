@@ -63,13 +63,31 @@ class BackgroundTaskManager:
         self._results_lock = threading.Lock()
         self._active_metadata: Dict[int, dict] = {}  # task_id -> {tool_name, args, submitted_at}
         self._active_lock = threading.Lock()
+        self._tracked_tasks: Dict[int, "asyncio.Task"] = {}  # task_id -> running Task (for cancellation)
         self._executor = ThreadPoolExecutor(
             max_workers=5, thread_name_prefix="bg-task-"
         )
         self._completion_callbacks: List[Callable] = []
         self._callbacks_lock = threading.Lock()
+        self._start_callbacks: List[Callable] = []
         self._watcher_active = False
         self._reactivation_count = 0
+
+    def _fire_start_callbacks(self, task_id: int):
+        meta = self.get_active_metadata(task_id)
+        with self._callbacks_lock:
+            callbacks = list(self._start_callbacks)
+        for cb in callbacks:
+            try:
+                cb(task_id, meta or {})
+            except Exception:
+                logger.debug(
+                    "[bg-task] Start callback error for task #%d", task_id, exc_info=True
+                )
+
+    def get_active_metadata(self, task_id: int) -> Optional[dict]:
+        with self._active_lock:
+            return dict(self._active_metadata.get(task_id) or {}) or None
 
     def _next_id(self) -> int:
         with self._counter_lock:
@@ -155,6 +173,7 @@ class BackgroundTaskManager:
                     )
 
         self._executor.submit(_run)
+        self._fire_start_callbacks(task_id)
         logger.info(
             "[bg-task] Task #%d submitted: %s - %s",
             task_id, tool_name, description[:120],
@@ -164,10 +183,10 @@ class BackgroundTaskManager:
     def track_task(self, tool_name: str, task: "asyncio.Task", description: str = "") -> int:
         """Track a live asyncio.Task that continues running in the background.
 
-        Unlike submit() which starts a new coroutine in a ThreadPoolExecutor,
-        this wraps an already-running Task (protected by asyncio.shield) with
-        a done callback. The subprocess behind the task is NOT killed — it
-        keeps running and its result is collected when it finishes naturally.
+        The task can later be cancelled via :meth:`cancel_task`. For tools that
+        spawn subprocesses (e.g. run_cmd), cancelling the asyncio Task raises
+        :class:`asyncio.CancelledError` inside the handler, which is expected to
+        clean up its own subprocess.
 
         Args:
             tool_name: Name of the tool being executed.
@@ -178,6 +197,7 @@ class BackgroundTaskManager:
             int: Unique task ID.
         """
         task_id = self._next_id()
+        self._tracked_tasks[task_id] = task
 
         # Record active metadata
         args_str = description
@@ -193,6 +213,7 @@ class BackgroundTaskManager:
             }
 
         def _on_done(t: "asyncio.Task"):
+            self._tracked_tasks.pop(task_id, None)
             try:
                 result = t.result()
                 error = None
@@ -243,11 +264,36 @@ class BackgroundTaskManager:
                     )
 
         task.add_done_callback(_on_done)
+        self._fire_start_callbacks(task_id)
         logger.info(
             "[bg-task] Task #%d tracked (shielded): %s - %s",
             task_id, tool_name, description[:120],
         )
         return task_id
+
+    def is_tracked(self, task) -> bool:
+        """判断 asyncio.Task 是否已被纳入后台管理（显式 run_background 或
+        超时自动转后台）。工具 handler 可用它调整行为，例如 run_cmd 对已
+        后台化的子进程豁免硬超时——后台任务不应被定时器杀死。"""
+        return any(t is task for t in list(self._tracked_tasks.values()))
+
+    def cancel_task(self, task_id: int) -> bool:
+        """Request cancellation of a tracked background task.
+
+        Returns True if the task was found and cancellation was requested.
+        The actual stop is cooperative: the asyncio Task receives a cancel
+        request, and tools that spawn subprocesses are expected to clean up
+        in their asyncio.CancelledError handler.
+        """
+        task = self._tracked_tasks.pop(task_id, None)
+        if task is None:
+            logger.info("[bg-task] Cancel requested for unknown task #%d", task_id)
+            return False
+        task.cancel()
+        with self._active_lock:
+            self._active_metadata.pop(task_id, None)
+        logger.info("[bg-task] Cancellation requested for task #%d", task_id)
+        return True
 
     def is_completed(self, task_id: int) -> bool:
         with self._results_lock:
@@ -275,6 +321,14 @@ class BackgroundTaskManager:
         """
         with self._callbacks_lock:
             self._completion_callbacks.append(cb)
+
+    def register_start_callback(self, cb: Callable[[int, dict], None]):
+        """Register a callback invoked when any background task starts.
+
+        Callback signature: callback(task_id: int, metadata: {tool_name, args, submitted_at})
+        """
+        with self._callbacks_lock:
+            self._start_callbacks.append(cb)
 
     def unregister_callback(self, cb: Callable):
         with self._callbacks_lock:
@@ -368,6 +422,7 @@ class BackgroundTaskManager:
         are saved to cache files and replaced with Read-able placeholders.
         """
         from Agent.ToolResultBudget import ToolResultBudget
+        from Core.ToolCall import ToolCall
         from configurationLoader import config
 
         # Collect non-error results for unified token budget processing
@@ -390,6 +445,13 @@ class BackgroundTaskManager:
             ToolResultBudget.apply(budget_inputs, cache_dir, max_single, max_batch)
 
         for i, r in enumerate(results):
+            # r.error 只覆盖 handler 抛异常的情况；run_cmd 等工具正常返回但
+            # 内容为失败（exit_code!=0 / timed_out / interrupted）时，必须用
+            # 统一的分类器识别，否则"服务器被超时杀掉"会以普通成功结果注入，
+            # 模型极易忽略并继续声称服务存活。
+            classified_fail = (not r.error) and ToolCall.classify_is_error(
+                r.tool_name, str(r.result)
+            )
             if r.error:
                 content = (
                     f"[task-background #{r.task_id} completed with error]\n"
@@ -397,6 +459,16 @@ class BackgroundTaskManager:
                     f"Error: {r.error}\n\n"
                     f"Please note this tool failed in the background. "
                     f"Do NOT retry it unless the user explicitly asks."
+                )
+            elif classified_fail:
+                result_str = budget_inputs[budget_idx_by_original[i]]["result_text"]
+                content = (
+                    f"[task-background #{r.task_id} FAILED]\n"
+                    f"Tool: {r.tool_name}\n"
+                    f"Description: {r.description}\n"
+                    f"Result:\n{result_str}\n\n"
+                    f"⚠️ 该后台任务失败或已被终止。如果它是服务器/守护进程，"
+                    f"现在已经停止运行——不要假设它仍然存活；向用户汇报前必须先重启并实测。"
                 )
             else:
                 result_str = budget_inputs[budget_idx_by_original[i]]["result_text"]

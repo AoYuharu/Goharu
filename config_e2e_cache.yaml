@@ -1,0 +1,178 @@
+agent:
+  background_max_reactivations: 3
+  background_watch_window: 1800
+  context_compact:
+    enabled: true
+  maxDepth: 200
+  max_context_messages: 100000
+  micro_compact:
+    age_threshold_hours: 1
+    enabled: true
+    keep_tool_results: 5
+    min_content_chars: 120
+  step_watchdog_seconds: 150
+agent_delegate:
+  explore:
+    max_concurrent: 3
+  max_history_turns: 3
+  max_iterations: 20
+  plan:
+    max_concurrent: 2
+  verify:
+    max_concurrent: 1
+    max_iterations: 50
+logging:
+  agents:
+    enabled: true
+  api:
+    enabled: true
+  backup_count: 3
+  base_dir: ./runtime_memory_e2e_cache/logs
+  level: INFO
+  max_mb: 5
+memory:
+  daily:
+    dir: ./runtime_memory_e2e_cache/daily
+    retention_days: 7
+  export:
+    daily_json_enabled: true
+  migration:
+    marker_path: ./runtime_memory/.migration_v2_done
+  persona:
+    path: ./runtime_memory_e2e_cache/persona.md
+  pipeline:
+    db_enabled: true
+  pipeline_manager:
+    enabled: true
+    l1:
+      idle_timeout_seconds: 600
+      turn_interval: 5
+      warmup_enabled: false
+    l2:
+      delay_after_l1_seconds: 90
+      poll_max_seconds: 3600
+    l3:
+      new_atom_threshold: 50
+  retrieval:
+    bm25_enabled: true
+    bm25_top_k: 8
+    embedding_api_key_env: ''
+    embedding_base_url: ''
+    embedding_dimensions: 1024
+    embedding_model_name: Qwen3-Embedding-0.6B
+    embedding_model_path: ./models/embedding_model/Qwen3-Embedding-0.6B
+    embedding_provider: local
+    embedding_timeout: 30
+    embedding_top_k: 8
+    enabled: false
+    final_top_k: 6
+    fts_top_k: 8
+    query_window_messages: 6
+    reranker_model_path: ./models/rerank_model/bge-reranker-v2-m3
+    use_reranker: false
+  root_dir: ./runtime_memory_e2e_cache
+  scene_blocks:
+    dir: ./runtime_memory_e2e_cache/scene_blocks
+  session_id: e2e_cache
+  sqlite:
+    enabled: true
+    path: ./runtime_memory_e2e_cache/memory.db
+model:
+  large-language-model:
+    api_key_env: ANTHROPIC_API_KEY
+    api_timeout: 120
+    base_url: https://api.minimaxi.com/anthropic
+    max_retries: 10
+    max_tokens: 8192
+    model: MiniMax-M2.7
+    provider: auto
+    temperature: 0.7
+    top_p: 0.9
+prompt:
+  system:
+    actor:
+    - ./prompts/actor/base.md
+    context_compact:
+    - ./prompts/summarizer/context_compact.md
+    day_summary:
+    - ./prompts/summarizer/day_summary.md
+    persona_generator:
+    - ./prompts/memory_pyramid/persona_generator.md
+    scene_extractor:
+    - ./prompts/memory_pyramid/scene_extractor.md
+    shared: []
+    topic_merge:
+    - ./prompts/summarizer/topic_merge.md
+test: {}
+tools:
+  background_timeout: 120
+  builtin_modules:
+  - Tools.builtin.core_tools
+  - Tools.builtin.file_tools
+  - Tools.builtin.glob_tool
+  - Tools.builtin.agent_delegate
+  - Tools.builtin.pdf_tools
+  - Tools.builtin.document_tools
+  - Tools.builtin.system_info_tool
+  - Tools.builtin.skill_tool
+  - Tools.builtin.snip_tool
+  - Tools.builtin.sleep_tool
+  - Tools.builtin.mcp_tools
+  mcp:
+    servers: {}
+  result_budget:
+    cache_dir: ./runtime_memory_e2e_cache/tool_cache
+    max_batch_tokens: 24000
+    max_single_tokens: 8000
+  result_format:
+    enabled: true
+  runtime: in_process
+  security:
+    allow_confirmation: true
+    dangerous_commands:
+    - shutdown
+    - restart
+    - reboot
+    - poweroff
+    - halt
+    - rm -rf
+    - del /s
+    - del /q
+    - rmdir /s
+    - format
+    - diskpart
+    - fdisk
+    - mkfs
+    - dd
+    - sudo
+    - runas
+    - killall
+    - pkill
+    - nmap
+    enabled: true
+    require_confirmation:
+    - del
+    - rmdir
+    - taskkill
+    - reg delete
+    - reg add
+    - 'reg '
+    - hydra
+    - metasploit
+    - bcdedit
+    - bcdboot
+    - powershell -encodedcommand
+    - powershell -enc
+  verify_nudge:
+    enabled: true
+    gate_final_answer: true
+    max_gate_fires: 2
+    mutation_threshold: 3
+ui:
+  see:
+    text: true
+    thinking: true
+voice:
+  asr_enabled: false
+  mic_consent: true
+  wakeup_enabled: false

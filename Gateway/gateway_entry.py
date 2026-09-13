@@ -10,6 +10,8 @@ when changing the protocol.
 """
 
 import asyncio
+import faulthandler
+import http.server
 import json
 import logging
 import os
@@ -45,8 +47,11 @@ from configurationLoader import config
 
 # Logging setup — centralized, per-module file output
 from Core.LogManager import init_logging, get_logger
+from Core.LifecycleLog import lifecycle
+from Core.timing import timeit
 init_logging()
 logger = get_logger(__name__)
+lifecycle("════════ 新会话 ════════", f"Gateway 进程启动 pid={os.getpid()}", level=1)
 
 # Crash log path (独立 crash 文件，同时 LogManager 也会捕获 ERROR+ 到 logs/gateway/crash.log)
 CRASH_LOG = project_root / "runtime_memory" / "logs" / "gateway" / "crash.log"
@@ -72,6 +77,14 @@ def write_json(obj: Dict[str, Any]) -> bool:
         return False
 
 
+def emit_voice_event(ev_type: str, payload: Dict[str, Any]):
+    """推送语音相关事件给 TUI（下载进度 / 转写结果 / 状态）。"""
+    write_json({
+        "jsonrpc": "2.0", "method": "event",
+        "params": {"type": ev_type, "payload": payload},
+    })
+
+
 def log_crash(reason: str, exc_info=None):
     """Log crash information to crash log and stderr.
 
@@ -89,6 +102,40 @@ def log_crash(reason: str, exc_info=None):
                 traceback.print_exception(*exc_info, file=f)
     except Exception:
         pass
+
+
+def _set_dotenv_value(key: str, value: str):
+    """写入/更新 .env 文件中的 key=value（保留其他行与注释）。"""
+    env_path = project_root / ".env"
+    lines = []
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    found = False
+    quoted = value.replace('"', '\\"')
+    for i, line in enumerate(lines):
+        if line.strip().startswith(key + "="):
+            lines[i] = f'{key}="{quoted}"'
+            found = True
+            break
+    if not found:
+        lines.append(f'{key}="{quoted}"')
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _classify_switch_failure(err: str):
+    """把模型切换失败的原始异常串归类成一句用户可读的短消息。
+
+    返回 (error_kind, message)。auto 探测的原始错误里混着 OpenAI 协议探测
+    的预期失败（如对 anthropic 路由的 404），不能原样抛给用户。
+    """
+    low = (err or "").lower()
+    if "authenticationerror" in low or "401" in low or "login fail" in low:
+        return "auth", "API Key 认证失败（401）：key 缺失或无效，请重新输入正确的 key 后重试"
+    if "apitimeouterror" in low or "timeout" in low or "connection error" in low:
+        return "network", "无法连接目标端点（超时或网络错误），请检查 API URL 与网络后重试"
+    if "notfounderror" in low or "404" in low:
+        return "route", "端点路由不存在（404）：请检查 API URL 是否正确"
+    return "unknown", f"切换失败：{(err or '')[:160]}"
 
 
 class GatewaySession:
@@ -116,6 +163,10 @@ class GatewaySession:
         self._bg_reactivation_queued: bool = False
         # PipelineManager: TencentDB-aligned memory pipeline
         self.pipeline_manager = None
+        # 卡死看门狗：step 超时未返回时自动 dump 全部线程栈到此文件
+        self._watchdog_file = None
+        # 生命周期日志轮次计数
+        self._turn_count = 0
 
     def queue_message(self, message: str, req_id):
         """Queue a user message for batching"""
@@ -213,11 +264,13 @@ class GatewaySession:
             # Initialize memory manager
             self.memory_manager = MemoryManager()
             logger.info("MemoryManager initialized")
+            lifecycle("启动: MemoryManager", "初始化完成")
 
             # Initialize PipelineManager (TencentDB-aligned L1/L2/L3 pipeline)
             from Agent.PipelineManager import PipelineManager
             self.pipeline_manager = PipelineManager(memory_manager=self.memory_manager)
             logger.info("PipelineManager initialized")
+            lifecycle("启动: PipelineManager", "初始化完成")
 
             # 一次性迁移：SQLite L2 → scene_blocks/*.md, USER.md → persona.md
             try:
@@ -231,8 +284,21 @@ class GatewaySession:
             # Initialize tool runtime
             self.runtime = create_tool_runtime(config.get("tools.runtime", "in_process"))
             await self.runtime.initialize()
+            lifecycle("启动: 工具运行时", "初始化完成")
+
+            # Start MCP client manager: connect configured servers, bridge their
+            # tools into the registry (mcp__<server>__<tool>), then refresh the
+            # tool table so the actor sees them immediately
+            from Tools.mcp.manager import mcp_manager
+            mcp_manager.attach_runtime(self.runtime)
+            try:
+                await mcp_manager.start()
+            except Exception as e:
+                logger.error("MCP manager startup failed (non-critical): %s", e)
+
             await self.runtime.list_tools()  # populate last_tool_definitions
             logger.info("Tool runtime initialized")
+            lifecycle("启动: 工具加载", f"{len(self.runtime.last_tool_definitions)} 个工具")
 
             # Inject WorkingMemory into snip tool (module loaded during initialize)
             import Tools.builtin.snip_tool as snip_tool
@@ -241,6 +307,7 @@ class GatewaySession:
             # Initialize agents
             self.actor = ActorAgent(self.runtime, self.memory_manager)
             logger.info("Agents initialized")
+            lifecycle("启动: ActorAgent", "初始化完成")
 
             # Register background task completion callback for real-time TUI updates
             def _on_bg_complete(task_id, bg_result):
@@ -251,6 +318,22 @@ class GatewaySession:
                     "params": {
                         "type": "task.background.status",
                         "payload": status,
+                    }
+                })
+                # 1b. Per-task completion event for the TUI background panel
+                from Core.ToolCall import ToolCall
+                failed = bool(bg_result.error) or ToolCall.classify_is_error(
+                    bg_result.tool_name, str(bg_result.result)
+                )
+                write_json({
+                    "jsonrpc": "2.0", "method": "event",
+                    "params": {
+                        "type": "task.background.update",
+                        "payload": {
+                            "task_id": task_id,
+                            "tool": bg_result.tool_name,
+                            "status": "error" if failed else "success",
+                        },
                     }
                 })
                 # 2. If agent is processing, step boundary will drain naturally
@@ -278,6 +361,39 @@ class GatewaySession:
             BackgroundTaskManager().register_callback(_on_bg_complete)
             logger.info("Background task completion callback registered")
 
+            # Warm up the embedding model in the background so the first user
+            # message doesn't block ~60s on SentenceTransformer load during
+            # retrieve_prompt_memory (perceived as "stuck at step 1").
+            def _warmup_embedding():
+                try:
+                    from Memory.retrieval.EmbeddingService import EmbeddingService
+                    EmbeddingService().encode("warmup")
+                    logger.info("Embedding model warmup completed")
+                except Exception as e:
+                    logger.warning("Embedding warmup failed: %s", e)
+
+            threading.Thread(target=_warmup_embedding, daemon=True, name="embedding-warmup").start()
+            lifecycle("启动: embedding 预热", "后台线程")
+
+            # Per-task start events for the TUI background panel
+            def _on_bg_start(task_id, meta):
+                write_json({
+                    "jsonrpc": "2.0", "method": "event",
+                    "params": {
+                        "type": "task.background.update",
+                        "payload": {
+                            "task_id": task_id,
+                            "tool": meta.get("tool_name", "?"),
+                            "args": meta.get("args", ""),
+                            "status": "running",
+                            "started_at": meta.get("submitted_at", 0),
+                        },
+                    }
+                })
+
+            BackgroundTaskManager().register_start_callback(_on_bg_start)
+            logger.info("Background task start callback registered")
+
             # Wire subagent (AgentDelegate) lifecycle/activity events to TUI
             from Tools.builtin import agent_delegate as _agent_delegate
 
@@ -289,6 +405,40 @@ class GatewaySession:
 
             _agent_delegate._manager.set_output_callback(_on_subagent_event)
             logger.info("Subagent output callback registered")
+
+            # Forward live tool (run_cmd) stdout/stderr to TUI as tool.output events
+            from Tools.tool_output_stream import tool_output_bus
+
+            def _on_tool_output(line: str, stream: str, source: str):
+                write_json({
+                    "jsonrpc": "2.0", "method": "event",
+                    "params": {
+                        "type": "tool.output",
+                        "payload": {"line": line, "stream": stream, "cmd": source},
+                    },
+                })
+
+            tool_output_bus.subscribe(_on_tool_output)
+            logger.info("Tool output stream subscribed")
+
+            # Dangerous-command confirmation: run_cmd blocks until user answers
+            from Tools.confirmation_manager import confirmation_manager
+
+            def _on_confirm_request(confirm_id: str, cmd: str, description: str):
+                write_json({
+                    "jsonrpc": "2.0", "method": "event",
+                    "params": {
+                        "type": "tool.confirm_request",
+                        "payload": {
+                            "confirm_id": confirm_id,
+                            "cmd": cmd,
+                            "description": description,
+                        },
+                    },
+                })
+
+            confirmation_manager.set_notifier(_on_confirm_request)
+            logger.info("Confirmation manager notifier registered")
 
             self._initialized = True
             logger.info("Gateway session initialized successfully")
@@ -315,6 +465,15 @@ class GatewaySession:
         self._processing = True
         self._micro_compacted = False  # reset per turn
 
+        # 重置本轮的工具调用历史板与触及文件跟踪（供 Verify 上下文收敛用）
+        try:
+            from Tools.touched_files import reset as reset_touched_files
+            reset_touched_files()
+            from Tools.tool_call_board import reset_main_calls
+            reset_main_calls()
+        except Exception:
+            pass
+
         logger.debug(
             "process_message start: session=%s msg_len=%d",
             session_id, len(message),
@@ -334,7 +493,8 @@ class GatewaySession:
         # PipelineManager: notify activity & check triggers
         if self.pipeline_manager:
             try:
-                self.pipeline_manager.notify_activity()
+                with timeit("gateway.process.notify_activity"):
+                    self.pipeline_manager.notify_activity()
             except Exception as e:
                 logger.warning(f"PipelineManager.notify_activity failed: {e}")
 
@@ -351,7 +511,8 @@ class GatewaySession:
                             "payload": {}
                         }
                     })
-                self.pipeline_manager.on_turn_start(before_l1_callback=_on_l1_start)
+                with timeit("gateway.process.on_turn_start"):
+                    self.pipeline_manager.on_turn_start(before_l1_callback=_on_l1_start)
             except Exception as e:
                 logger.warning(f"PipelineManager.on_turn_start failed: {e}")
 
@@ -369,6 +530,14 @@ class GatewaySession:
 
             # Add ALL user messages to memory
             self.memory_manager.append({"role": "user", "content": combined})
+            self._turn_count += 1
+            # turn 边界：清空记忆检索缓存，本轮首次构建时重新检索一次
+            self.actor.reset_retrieval_cache()
+            lifecycle(
+                "══ 第 {} 轮 ══".format(self._turn_count),
+                f'用户消息: "{combined[:80]}"',
+                level=1,
+            )
 
             # If messages were batched, notify TUI
             if len(all_messages) > 1:
@@ -388,8 +557,12 @@ class GatewaySession:
             step = 0
             max_steps = config.get("agent.maxDepth", 8)
 
-            def emit_token_stats(extra_system_prompt=None):
-                token_stats = self.calculate_token_stats(extra_system_prompt)
+            def emit_token_stats_from_build(build_result):
+                """复用 actor 主构建的结果发 token 统计（不再单独组装一次），
+                面板数值与实际发给 LLM 的 messages 完全一致。"""
+                token_stats = self.calculate_token_stats_from_messages(
+                    build_result["messages"]
+                )
                 write_json({
                     "jsonrpc": "2.0",
                     "method": "event",
@@ -401,6 +574,7 @@ class GatewaySession:
 
             while step < max_steps:
                 step += 1
+                lifecycle(f"第 {step} 步", f"max_steps={max_steps}", level=2)
 
                 # ── 中断检查：用户按下了 ESC ──
                 if self._interrupt_event.is_set():
@@ -418,6 +592,7 @@ class GatewaySession:
                             "payload": {"message": "请求已被用户中断"}
                         }
                     })
+                    lifecycle("轮结束", "被用户中断", level=2)
                     return "请求已被用户中断。"
 
                 # Before each step: check for pending messages and merge
@@ -457,35 +632,42 @@ class GatewaySession:
                 # Drain completed background tasks before each step
                 self._drain_background_results()
 
+                logger.info("step %d: bg drained, entering micro-compact check", step)
+                self._arm_step_watchdog(step)  # 覆盖整个 step（含 token stats），不只 act()
+
                 # Micro-compact: collapse older tool results (once per turn)
                 if (
                     not self._micro_compacted
                     and config.get("agent.micro_compact.enabled", True)
                 ):
-                    messages = self.memory_manager.get_context()
-                    age_h = float(config.get("agent.micro_compact.age_threshold_hours", 1))
-                    keep_n = int(config.get("agent.micro_compact.keep_tool_results", 5))
-                    compacted = MicroCompactor.compact(
-                        messages, age_threshold_hours=age_h, keep_tool_results=keep_n
-                    )
-                    if compacted is not messages:
-                        removed = len(messages) - len(compacted)
-                        self.memory_manager.clear_context()
-                        for msg in compacted:
-                            self.memory_manager.append(msg)
-                        logger.info(
-                            "Micro-compact: removed %d older tool results (threshold=%sh, keep=%d)",
-                            removed, age_h, keep_n,
+                    with timeit("gateway.step.micro_compact"):
+                        messages = self.memory_manager.get_context()
+                        age_h = float(config.get("agent.micro_compact.age_threshold_hours", 1))
+                        keep_n = int(config.get("agent.micro_compact.keep_tool_results", 5))
+                        min_chars = int(config.get("agent.micro_compact.min_content_chars", 120))
+                        compacted, folded = MicroCompactor.compact(
+                            messages,
+                            age_threshold_hours=age_h,
+                            keep_tool_results=keep_n,
+                            min_content_chars=min_chars,
                         )
-                        write_json({
-                            "jsonrpc": "2.0",
-                            "method": "event",
-                            "params": {
-                                "type": "context.micro_compact",
-                                "payload": {"removed_results": removed}
-                            }
-                        })
-                    self._micro_compacted = True
+                        if compacted is not messages:
+                            self.memory_manager.clear_context()
+                            for msg in compacted:
+                                self.memory_manager.append(msg)
+                            logger.info(
+                                "Micro-compact: folded %d older tool results (threshold=%sh, keep=%d, min_chars=%d)",
+                                folded, age_h, keep_n, min_chars,
+                            )
+                            write_json({
+                                "jsonrpc": "2.0",
+                                "method": "event",
+                                "params": {
+                                    "type": "context.micro_compact",
+                                    "payload": {"removed_results": folded}
+                                }
+                            })
+                        self._micro_compacted = True
 
                 # Emit step event
                 write_json({
@@ -496,8 +678,6 @@ class GatewaySession:
                         "payload": {"step": step}
                     }
                 })
-
-                emit_token_stats()
 
                 # Emit LLM requesting event (before actor.act() LLM call)
                 write_json({
@@ -578,14 +758,36 @@ class GatewaySession:
                         }
                     })
 
-                logger.debug("Actor step %d/%d starting...", step, max_steps)
-                actor_response = await self.actor.act(
-                    on_tool_call_start=_on_tool_call,
-                    on_thinking=_on_thinking,
-                    on_tool_result=_on_tool_result,
-                    on_text=_on_text,
-                    _interrupt_check=lambda: self._interrupt_event.is_set()
-                )
+                def _on_retry(attempt, max_retries, backoff, phase="backoff"):
+                    write_json({
+                        "jsonrpc": "2.0",
+                        "method": "event",
+                        "params": {
+                            "type": "agent.retry",
+                            "payload": {
+                                "attempt": attempt,
+                                "max_retries": max_retries,
+                                "backoff": backoff,
+                                "phase": phase,
+                                "step": current_step
+                            }
+                        }
+                    })
+
+                logger.info("Actor step %d/%d starting LLM call...", step, max_steps)
+                try:
+                    with timeit(f"gateway.step{step}.actor_act"):
+                        actor_response = await self.actor.act(
+                            on_tool_call_start=_on_tool_call,
+                            on_thinking=_on_thinking,
+                            on_tool_result=_on_tool_result,
+                            on_text=_on_text,
+                            on_retry=_on_retry,
+                            _interrupt_check=lambda: self._interrupt_event.is_set(),
+                            on_built=emit_token_stats_from_build
+                        )
+                finally:
+                    faulthandler.cancel_dump_traceback_later()
                 logger.debug(
                     "Actor step %d response: type=%s",
                     step, actor_response.get("type"),
@@ -617,6 +819,7 @@ class GatewaySession:
 
                     # Got final answer - return directly without streaming
                     answer = actor_response.get("answer", "")
+                    lifecycle("轮结束", f"answer {len(answer)} 字", level=2)
 
                     # Send complete answer as one event
                     write_json({
@@ -633,7 +836,8 @@ class GatewaySession:
                         ctx = self.memory_manager.get_context()
                         turn_slice = ctx[-24:] if len(ctx) > 24 else ctx
                         try:
-                            self.pipeline_manager.on_turn_end(turn_slice)
+                            with timeit("gateway.process.on_turn_end"):
+                                self.pipeline_manager.on_turn_end(turn_slice)
                         except Exception as e:
                             logger.warning(f"PipelineManager.on_turn_end failed: {e}")
 
@@ -682,12 +886,14 @@ class GatewaySession:
                             "payload": {"message": "请求已被用户中断"}
                         }
                     })
+                    lifecycle("轮结束", "被用户中断（工具执行期间）", level=2)
                     return "请求已被用户中断。"
 
                 elif response_type == "error":
                     # Error occurred
                     error_msg = actor_response.get("error", "Unknown error")
                     logger.error(f"Actor error: {error_msg}")
+                    lifecycle("轮结束", f"错误: {error_msg}", level=2)
                     return f"Error: {error_msg}"
 
                 else:
@@ -698,6 +904,7 @@ class GatewaySession:
 
             # Max steps reached
             logger.warning("Max steps (%d) reached for session %s", max_steps, session_id)
+            lifecycle("轮结束", f"达到最大步数 {max_steps}", level=2)
             return "I apologize, but I've reached the maximum number of steps. Please try rephrasing your question."
 
         except Exception as e:
@@ -823,23 +1030,21 @@ class GatewaySession:
 
     def _estimate_rendered_messages(self, messages):
         if not self.actor:
-            return {"current_tokens": 0, "cached_tokens": 0}
+            return {"current_tokens": 0}
 
         core = getattr(self.actor, "core", None)
         provider = getattr(core, "provider", None)
+        prepare = getattr(provider, "_prepare_messages", None)
 
-        if provider == "anthropic_compatible" and core is not None:
-            system_blocks, remote_messages = core._prepare_anthropic_messages(messages)
+        if core is not None and callable(prepare):
+            system_blocks, remote_messages = prepare(messages)
 
             parts = []
-            cached_tokens = 0
             for block in system_blocks:
                 text = self._stringify_token_content(block.get("text", "")).strip()
                 if not text:
                     continue
                 parts.append(f"system: {text}")
-                if block.get("cache_control"):
-                    cached_tokens += self._estimate_tokens(text)
 
             for message in remote_messages:
                 role = message.get("role", "user")
@@ -848,36 +1053,81 @@ class GatewaySession:
                     parts.append(f"{role}: {content}")
 
             current_tokens = self._estimate_tokens("\n".join(parts)) if parts else 0
-            return {
-                "current_tokens": current_tokens,
-                "cached_tokens": min(cached_tokens, current_tokens),
-            }
+            return {"current_tokens": current_tokens}
 
         current_tokens = self._estimate_tokens(json.dumps(messages, ensure_ascii=False, default=str))
-        return {"current_tokens": current_tokens, "cached_tokens": 0}
+        return {"current_tokens": current_tokens}
 
     def calculate_token_stats(self, extra_system_prompt=None):
-        """Calculate compact token stats for the next assembled request."""
+        """Calculate compact token stats for the next assembled request.
+
+        缓存命中率来自最近一次 API 响应的真实 usage（cache_read 占总输入的
+        比例），而不是本地 cache_control 标记估算——MiniMax 走自动前缀缓存，
+        本地标记与实际命中无对应关系。
+        """
         if not self.actor:
             return {
                 "current_tokens": 0,
                 "prompt_cache_ratio": 0.0,
             }
 
+        logger.debug("token stats: building messages snapshot...")
         snapshot = self.actor.build_messages_with_document(extra_system_prompt)
-        stats = self._estimate_rendered_messages(snapshot["messages"])
+        logger.debug("token stats: snapshot built (%d msgs), estimating...",
+                     len(snapshot["messages"]))
+        return self.calculate_token_stats_from_messages(snapshot["messages"])
+
+    def calculate_token_stats_from_messages(self, messages):
+        """基于已组装好的 messages 估算 token（不重新构建提示词）。"""
+        stats = self._estimate_rendered_messages(messages)
         current_tokens = stats["current_tokens"]
-        cached_tokens = stats["cached_tokens"]
-        prompt_cache_ratio = (cached_tokens / current_tokens) if current_tokens > 0 else 0.0
+
+        usage = getattr(getattr(self.actor, "core", None), "_last_usage", None) or {}
+        uncached_input = int(usage.get("input_tokens") or 0)
+        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        cache_write = int(usage.get("cache_creation_input_tokens") or 0)
+        total_input = uncached_input + cache_read + cache_write
+        prompt_cache_ratio = (cache_read / total_input) if total_input > 0 else 0.0
         return {
             "current_tokens": current_tokens,
             "prompt_cache_ratio": prompt_cache_ratio,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "uncached_input_tokens": uncached_input,
         }
+
+    def _arm_step_watchdog(self, step: int):
+        """卡死看门狗：actor step 超过阈值未返回时，自动 dump 全部线程栈。
+
+        输出到 logs/gateway/watchdog.log。正常返回时由调用方 cancel。
+        """
+        timeout = float(config.get("agent.step_watchdog_seconds", 150) or 150)
+        if timeout <= 0:
+            return
+        try:
+            if self._watchdog_file is None:
+                log_dir = Path(config.get("logging.base_dir", "./runtime_memory/logs")) / "gateway"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                self._watchdog_file = open(log_dir / "watchdog.log", "a", encoding="utf-8")
+            self._watchdog_file.write(
+                f"\n===== step {step} watchdog armed at {datetime.now().isoformat()} "
+                f"(timeout={timeout}s) =====\n"
+            )
+            self._watchdog_file.flush()
+            faulthandler.cancel_dump_traceback_later()
+            faulthandler.dump_traceback_later(timeout, file=self._watchdog_file)
+        except Exception as e:
+            logger.warning("step watchdog arm failed: %s", e)
 
     async def shutdown(self):
         """Shutdown the gateway"""
         if self.pipeline_manager:
             self.pipeline_manager.shutdown()
+        try:
+            from Tools.mcp.manager import mcp_manager
+            await mcp_manager.close()
+        except Exception as e:
+            logger.warning("MCP manager close failed: %s", e)
         if self.runtime:
             await self.runtime.close()
 
@@ -965,7 +1215,11 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
             tool_use 与其后的 tool_result 按 tool_use_id 配对回填，
             使 TUI 能以与实时一致的形态（折叠工具行、thinking 块）重建界面。
+            存储的 assistant 文本可能带有 LLM 模仿的 [ID:msg_xxx] 前缀，
+            回放前统一剥离（与 ActorAgent 实时输出同一规则）。
             """
+            from Agent.ActorAgent import _strip_id_prefixes
+
             history = _session.memory_manager.get_context()
             serialized = []
             pending_tools = {}  # tool_use_id → 已追加的 tool 条目（等待结果回填）
@@ -984,7 +1238,7 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     if content.strip():
                         serialized.append({
                             "role": role, "kind": "text",
-                            "text": content, "timestamp": ts,
+                            "text": _strip_id_prefixes(content), "timestamp": ts,
                         })
                     continue
                 if not isinstance(content, list):
@@ -999,14 +1253,14 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                         if text.strip():
                             serialized.append({
                                 "role": role, "kind": "text",
-                                "text": text, "timestamp": ts,
+                                "text": _strip_id_prefixes(text), "timestamp": ts,
                             })
                     elif block_type == "thinking":
                         thinking = item.get("thinking", "")
                         if thinking.strip():
                             serialized.append({
                                 "role": role, "kind": "thinking",
-                                "text": thinking[:4000], "timestamp": ts,
+                                "text": _strip_id_prefixes(thinking)[:4000], "timestamp": ts,
                             })
                     elif block_type == "tool_use":
                         tool_input = item.get("input", {})
@@ -1058,9 +1312,15 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             for entry in pending_tools.values():
                 entry["result"] = "(no result — session interrupted)"
 
+            # 只发送今天的内容（TUI 也只回放今天）；今天没有则回退最近 20 条。
+            # 避免把 7 天保留窗内的全部历史（可能数 MB 的工具结果）传给前端。
+            today_prefix = datetime.now().strftime("%Y-%m-%d")
+            today_entries = [e for e in serialized if str(e.get("timestamp", "")).startswith(today_prefix)]
+            replay = today_entries if today_entries else serialized[-20:]
+
             return {
                 "jsonrpc": "2.0",
-                "result": {"messages": serialized},
+                "result": {"messages": replay},
                 "id": req_id
             }
 
@@ -1104,15 +1364,195 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     "id": req_id
                 }
 
+        elif method == "agent.cancel_background_task":
+            task_id = params.get("task_id")
+            if task_id is None:
+                return {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32602, "message": "Missing 'task_id' parameter"},
+                    "id": req_id,
+                }
+            try:
+                cancelled = BackgroundTaskManager().cancel_task(int(task_id))
+                return {
+                    "jsonrpc": "2.0",
+                    "result": {"cancelled": cancelled, "task_id": task_id},
+                    "id": req_id,
+                }
+            except Exception as e:
+                logger.error("Cancel background task failed: %s", e, exc_info=True)
+                return {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32603, "message": str(e)},
+                    "id": req_id,
+                }
+
         elif method == "agent.interrupt":
-            # 仅在 agent 正在处理消息时才标记中断
-            if _session._processing:
+            # 仅在 agent 正在处理消息或队列里有待处理消息时才标记中断
+            # （has_pending 覆盖"消息已入队但处理线程还没进入 process_message"的窗口，
+            # 此时不设标志的话，用户想取消的消息会照常跑起来）
+            if _session._processing or _session.has_pending():
                 _session._interrupt_event.set()
                 logger.info("Interrupt requested by user")
+                interrupted = True
+            else:
+                interrupted = False
             return {
                 "jsonrpc": "2.0",
-                "result": {"interrupted": _session._processing},
+                "result": {"interrupted": interrupted},
                 "id": req_id
+            }
+
+        elif method == "agent.confirm_response":
+            # 用户对危险命令确认的回复——立即放行/拒绝等待中的工具线程
+            from Tools.confirmation_manager import confirmation_manager
+            confirm_id = str(params.get("confirm_id", ""))
+            approved = bool(params.get("approved", False))
+            found = confirmation_manager.resolve(confirm_id, approved)
+            logger.info("Confirmation %s resolved: approved=%s found=%s", confirm_id, approved, found)
+            return {
+                "jsonrpc": "2.0",
+                "result": {"ok": found, "approved": approved},
+                "id": req_id
+            }
+
+        elif method == "voice.get_status":
+            from Gateway import voice_service
+            return {
+                "jsonrpc": "2.0",
+                "result": voice_service.get_status(),
+                "id": req_id,
+            }
+
+        elif method == "voice.set_config":
+            from Gateway import voice_service
+            p = {}
+            for k in ("mic_consent", "asr_enabled", "wakeup_enabled"):
+                if k in params:
+                    p[k] = bool(params[k])
+            status = voice_service.set_config(**p)
+            # 根据开关启停唤醒监听（仅唤醒模式需要长驻监听器）
+            if status.get("wakeup_enabled"):
+                ok, msg = voice_service.start_listener(emit_voice_event)
+                status["listener"] = {"ok": ok, "message": msg}
+            else:
+                voice_service.stop_listener()
+                status["listener"] = {"ok": False, "message": "已停止"}
+            return {
+                "jsonrpc": "2.0",
+                "result": status,
+                "id": req_id,
+            }
+
+        elif method == "voice.download_model":
+            from Gateway import voice_service
+            started, msg = voice_service.download_model(emit_voice_event)
+            return {
+                "jsonrpc": "2.0",
+                "result": {"started": started, "message": msg},
+                "id": req_id,
+            }
+
+        elif method == "model.get_status":
+            llm_cfg = config.get("model.large-language-model", {}) or {}
+            api_key_env = llm_cfg.get("api_key_env", "")
+            api_key = os.getenv(api_key_env) if api_key_env else ""
+            masked = ""
+            if api_key:
+                masked = api_key[:6] + "***" + api_key[-4:] if len(api_key) > 12 else "***"
+            return {
+                "jsonrpc": "2.0",
+                "result": {
+                    "model": llm_cfg.get("model", ""),
+                    "base_url": llm_cfg.get("base_url", ""),
+                    "provider": llm_cfg.get("provider", "auto"),
+                    "api_key_env": api_key_env,
+                    "api_key_set": bool(api_key),
+                    "api_key_masked": masked,
+                    "history": config.get("model.model_history", []) or [],
+                },
+                "id": req_id,
+            }
+
+        elif method == "model.set_config":
+            from Agent.LLMCore import LLMCore
+            model = params.get("model")
+            base_url = params.get("base_url")
+            api_key = params.get("api_key")
+            new_api_key_env = params.get("api_key_env")
+            changed = []
+            # 事务性：先记住旧值，热重载失败时整体回滚，避免 config.yaml
+            # 停留在"已切换但实际没生效"的半套状态
+            old_llm_cfg = dict(config.get("model.large-language-model", {}) or {})
+            if model:
+                config.set("model.large-language-model.model", model)
+                changed.append("model")
+            if base_url:
+                config.set("model.large-language-model.base_url", base_url)
+                changed.append("base_url")
+            if new_api_key_env:
+                config.set("model.large-language-model.api_key_env", new_api_key_env)
+                changed.append("api_key_env")
+            api_key_env = config.get("model.large-language-model.api_key_env", "ANTHROPIC_API_KEY")
+            if api_key and not new_api_key_env and (model or base_url):
+                # 手动切换且未显式指定目标 env 时，按目标匹配的历史条目决定
+                # key 写进哪个变量——避免把新厂商的 key 写进当前厂商的变量
+                # 名下，覆盖掉原厂商的密钥
+                for h in (config.get("model.model_history", []) or []):
+                    if not isinstance(h, dict) or not h.get("api_key_env"):
+                        continue
+                    if (h.get("model") == model) and (not base_url or h.get("base_url") == base_url):
+                        api_key_env = h["api_key_env"]
+                        config.set("model.large-language-model.api_key_env", api_key_env)
+                        changed.append("api_key_env")
+                        break
+            if api_key:
+                _set_dotenv_value(api_key_env, api_key)
+                os.environ[api_key_env] = api_key
+                changed.append("api_key")
+            ok, err = LLMCore().reload()
+            if not ok:
+                # 回滚 config（.env 与运行中的 os.environ 不回滚：写掉的 key
+                # 仍是有效密钥，留在新变量名下无害）；LLMCore 保持旧客户端，
+                # 对话不中断——失败即回退到原模型继续工作
+                for key, val in old_llm_cfg.items():
+                    config.set(f"model.large-language-model.{key}", val)
+                config.save()
+                kind, msg = _classify_switch_failure(err)
+                fallback = (old_llm_cfg.get("model") or "")
+                return {
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "success": False,
+                        "error_kind": kind,
+                        "message": msg,
+                        "fallback_model": fallback,
+                    },
+                    "id": req_id,
+                }
+            # 重载成功后才记入最近使用列表（同 model+base_url 去重置顶，
+            # 最多 8 条），并随条目记录 api_key_env——不同厂商的 key 各存
+            # 各的环境变量，回切时自动换用，互不覆盖
+            if model or base_url:
+                llm_cfg = config.get("model.large-language-model", {}) or {}
+                entry = {
+                    "model": llm_cfg.get("model", ""),
+                    "base_url": llm_cfg.get("base_url", ""),
+                    "api_key_env": llm_cfg.get("api_key_env", "ANTHROPIC_API_KEY"),
+                }
+                history = [
+                    h for h in (config.get("model.model_history", []) or [])
+                    if isinstance(h, dict)
+                    and (h.get("model"), h.get("base_url")) != (entry["model"], entry["base_url"])
+                ]
+                history.insert(0, entry)
+                config.set("model.model_history", history[:8])
+                config.save()
+            logger.info("Model config updated: %s", ", ".join(changed) if changed else "(none)")
+            return {
+                "jsonrpc": "2.0",
+                "result": {"success": True, "changed": changed},
+                "id": req_id,
             }
 
         else:
@@ -1407,6 +1847,66 @@ def _start_processing(session_id: str):
         thread.start()
 
 
+def inject_voice_message(transcript: str) -> bool:
+    """把语音识别结果作为带标签的 user 消息注入会话，并触发处理。"""
+    global _session
+    transcript = (transcript or "").strip()
+    if not transcript:
+        logger.warning("voice: empty transcript, skip inject")
+        return False
+    from Core.Message import CoreMessage, MessageSource
+    annotation = (
+        "[voice-recognize] This message originates from the user's voice "
+        "recognition input. It may contain Chinese homophone misrecognitions "
+        "or ASR errors — infer the intended meaning before acting."
+    )
+    _session.memory_manager.append(
+        CoreMessage.context_only(MessageSource.VOICE, annotation).to_dict()
+    )
+    _session.queue_message(f"[voice-recognize] {transcript}", "voice")
+    _start_processing("default")
+    logger.info("voice: injected transcript into agent (%d chars)", len(transcript))
+    return True
+
+
+class _VoiceHTTPHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path.rstrip("/") != "/message":
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            data = json.loads(body or b"{}")
+            transcript = str(data.get("message", "") or "")
+        except Exception as exc:
+            logger.warning("voice: bad HTTP payload: %s", exc)
+            transcript = ""
+        ok = inject_voice_message(transcript)
+        resp = json.dumps({"ok": ok}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
+
+    def log_message(self, *args):
+        pass
+
+
+def start_voice_http_server(port: int = 8999):
+    """本地 HTTP 输入端点：POST /message 接收语音转写。"""
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _VoiceHTTPHandler)
+    except OSError as exc:
+        logger.warning("voice: HTTP endpoint failed to bind %s: %s", port, exc)
+        return None
+    threading.Thread(target=server.serve_forever, daemon=True, name="voice-http").start()
+    logger.info("voice: HTTP endpoint listening on 127.0.0.1:%d", port)
+    return server
+
+
 def main():
     """Main entry point"""
     global _session
@@ -1435,6 +1935,22 @@ def main():
 
         logger.info("Gateway session initialized")
 
+        # 启动本地 HTTP 输入端点（语音转写由此注入 agent）
+        try:
+            voice_port = int(config.get("voice.http_port", 8999))
+            start_voice_http_server(voice_port)
+        except Exception as exc:
+            logger.warning("voice: HTTP endpoint start failed: %s", exc)
+
+        # 若上次会话开启了语音唤醒，启动时自动恢复长驻监听
+        try:
+            from Gateway import voice_service
+            if config.get("voice.wakeup_enabled", False):
+                ok, msg = voice_service.start_listener(emit_voice_event)
+                logger.info("voice: auto-start listener → ok=%s %s", ok, msg)
+        except Exception as exc:
+            logger.warning("voice: auto-start failed: %s", exc)
+
         # Send ready event
         if not write_json({
             "jsonrpc": "2.0",
@@ -1444,23 +1960,33 @@ def main():
             log_crash("Failed to send gateway.ready event")
             sys.exit(1)
 
-        # Emit initial token stats
-        token_stats = _session.calculate_token_stats()
-        write_json({
-            "jsonrpc": "2.0",
-            "method": "event",
-            "params": {
-                "type": "token.stats",
-                "payload": token_stats
-            }
-        })
-
-        logger.info(f"Gateway ready, token stats: current={token_stats['current_tokens']}, "
-                     f"cache_ratio={token_stats['prompt_cache_ratio']:.2%}")
-
-        # Start background stdin reader
-        reader_thread = threading.Thread(target=_stdin_reader, daemon=True)
+        # Start background stdin reader —— 必须先于初始 token 统计：
+        # 首次记忆检索要等 embedding 模型冷加载（实测可达 56s），若先算 token
+        # 统计，TUI 刚发出来的 agent.get_history 等请求会在管道里晾到超时。
+        reader_thread = threading.Thread(target=_stdin_reader, daemon=True, name="stdin-reader")
         reader_thread.start()
+
+        # Emit initial token stats —— 放后台线程，不阻塞请求主循环
+        def _emit_initial_token_stats():
+            try:
+                stats = _session.calculate_token_stats()
+            except Exception as exc:
+                logger.warning("initial token stats failed: %s", exc)
+                return
+            write_json({
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "token.stats",
+                    "payload": stats
+                }
+            })
+            logger.info("Gateway ready, token stats: current=%s, cache_ratio=%.2f%%",
+                        stats["current_tokens"], stats["prompt_cache_ratio"] * 100)
+
+        threading.Thread(
+            target=_emit_initial_token_stats, daemon=True, name="initial-token-stats"
+        ).start()
 
         # Process requests from queue
         while _bg_reader_running:
