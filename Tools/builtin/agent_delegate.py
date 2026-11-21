@@ -13,7 +13,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Any, Optional
 
-from configurationLoader import config
+from Tools.config_proxy import get_config
 from Tools.registry import registry
 
 
@@ -39,6 +39,7 @@ class AgentDelegateManager:
             "explore": 0,
             "plan": 0,
             "verify": 0,
+            "architect": 0,
         }
 
         # 锁，用于保护计数器
@@ -58,7 +59,7 @@ class AgentDelegateManager:
 
     def get_max_concurrent(self, agent_type: str) -> int:
         """获取指定类型agent的最大并发数"""
-        agent_config = config.get(f"agent_delegate.{agent_type.lower()}", {})
+        agent_config = get_config().get(f"agent_delegate.{agent_type.lower()}", {})
         return agent_config.get("max_concurrent", 3)
 
     def can_create_agent(self, agent_type: str) -> tuple[bool, Optional[str]]:
@@ -152,6 +153,12 @@ class AgentDelegateManager:
 _manager = AgentDelegateManager()
 
 
+def set_output_callback(callback):
+    """注册子代理输出回调（payload: dict）——宿主订阅 started/activity/finished
+    事件的唯一入口，禁止外部直接访问 _manager 私有单例。"""
+    _manager.set_output_callback(callback)
+
+
 # 对抗性探测关键词（中英）：verify 报告至少命中一个才算包含 adversarial probe
 _ADVERSARIAL_KEYWORDS = re.compile(
     r"对抗|adversarial|并发|concurren|边界|boundary|幂等|idempoten|孤立|orphan|probe",
@@ -210,14 +217,16 @@ def _execute_subagent_task(agent_type: str, task: str, agent_id: str, tools_regi
         import Tools.builtin.glob_tool
 
         from Agent.SubAgent import SubAgent  # 懒加载，避免循环依赖
+        from Tools.subagent_config import get_subagent_llm
 
-        # 创建子agent
+        # 创建子agent（注入的 llm 优先，None 时 SubAgent 回退 LLMCore 单例）
         subagent = SubAgent(
             agent_type=agent_type,
             task=task,
             agent_id=agent_id,
             tools_registry=tools_registry,
             output_callback=output_callback,
+            llm=get_subagent_llm(),
         )
 
         # 执行任务
@@ -257,7 +266,7 @@ async def AgentDelegate(
     start_time = time.time()
 
     # 验证agent类型
-    valid_types = ["explore", "plan", "verify"]
+    valid_types = ["explore", "plan", "verify", "architect"]
     if agent_type.lower() not in valid_types:
         return json.dumps({
             "error": f"不支持的agent类型: {agent_type}",
@@ -421,24 +430,30 @@ GOOD (split — concurrent):
 BAD (monolithic — slow):
   Explore task="Search entire C:/ and D:/ drives for 'keyword'"  ← DON'T do this
 
-VERIFY — MANDATORY AFTER CODE CHANGES:
-- CRITICAL: If you used Write or Edit to create/modify ANY code or program this turn, you MUST call AgentDelegate with agent_type="verify" BEFORE giving the user your final answer. Do NOT report success without an independent Verify PASS.
-- Passing YOUR OWN test is NOT a substitute — only the Verify subagent's independent report counts.
+VERIFY — REQUIRED FOR SUBSTANTIVE CHANGES:
+- REQUIRED before reporting success for substantive code changes: new features, behavior changes, bug fixes, or edits touching risky areas (Agent / Tools / Gateway / TUI / prompts / config). Do NOT report success without an independent Verify PASS in those cases.
+- SKIP Verify for trivial edits: typos, comments, docs, formatting, single-line user-requested tweaks, or temp files. Self-check and report directly — do NOT run a full acceptance ceremony for trivia.
+- Passing YOUR OWN test is NOT a substitute for substantive changes — only the Verify subagent's independent report counts there.
 - Verify is an adversarial tester, NOT a bug-diagnosis assistant. Its job is to break your implementation, not to help you find the root cause.
 - Provide ONLY a light summary in the task parameter: which files you changed, and the original purpose. The framework auto-prefills git status + full diff into Verify's context. Verify reads the code, writes its own test cases, and runs real tests on its own — do NOT hand it test commands, expected behavior, risk points, test results, or anything that could steer its test direction (no hints about which paths to test or "watch out for X").
 - Verify is independent: it writes test files to a system temp dir (via WriteTestFile) and runs real pytest / repro — never just syntax checks.
 - Do NOT share your test results or claim "it already works" — keep it objective.
-- Also use Verify when the user explicitly asks for verification/testing, or for risky changes in Agent / Tools / Gateway / TUI / config / background / timeout / permission logic.
+- Also use Verify when the user explicitly asks for verification/testing.
 - If Verify returns FAIL: fix, then call Verify again. Repeat until PASS.
 
-Concurrent execution: max 3 Explore, max 2 Plan, max 1 Verify by config. Sub-agents are read-only. Auto-deduplicates identical tasks.""",
+ARCHITECT — GOHARU SELF-MANAGEMENT:
+- Architect manages and upgrades the Goharu codebase ITSELF (this project's own source): refactors, feature implementation, module maintenance, doc upkeep. Do NOT use it for work on other projects — use direct tools for those.
+- It has WRITE tools (Write/Edit/run_cmd) and a private long-term memory of past tasks. Gray-listed destructive commands require human confirmation.
+- Runs serially (max 1 concurrent). Give it a well-scoped task with clear acceptance criteria; it reads module CLAUDE.md invariants and runs contract tests itself.
+
+Concurrent execution: max 3 Explore, max 2 Plan, max 1 Verify, max 1 Architect by config. Explore/Plan/Verify are read-only; Architect can write. Auto-deduplicates identical tasks.""",
     arguments_schema={
         "type": "object",
         "properties": {
             "agent_type": {
                 "type": "string",
-                "enum": ["Explore", "Plan", "Verify", "explore", "plan", "verify"],
-                "description": "Agent type: Explore (search/understand codebase), Plan (design implementation plan), or Verify (adversarial read-only verification)."
+                "enum": ["Explore", "Plan", "Verify", "Architect", "explore", "plan", "verify", "architect"],
+                "description": "Agent type: Explore (search/understand codebase), Plan (design implementation plan), Verify (adversarial read-only verification), or Architect (manage/upgrade the Goharu codebase itself, has write tools and private memory)."
             },
             "task": {
                 "type": "string",

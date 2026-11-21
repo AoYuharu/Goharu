@@ -27,7 +27,7 @@ memory:
     bm25_enabled: true
     bm25_top_k: 8
     final_top_k: 6
-    query_window_messages: 6
+    query_window_messages: 2
     use_reranker: false
     embedding_model_name: Qwen3-Embedding-0.6B
     embedding_model_path: ./models/embedding_model/Qwen3-Embedding-0.6B
@@ -45,6 +45,32 @@ memory:
   daily:
     dir: ./runtime_memory/daily
     retention_days: 7
+checkpoint:
+  enabled: true
+  dir: ./runtime_memory/checkpoints
+  max_count: 200
+  retention_days: 30
+  max_total_mb: 500
+  max_blob_mb: 20
+  git_baseline_enabled: true
+  rollback_on_conflict: warn   # warn | abort
+  # repo_root: 默认 cwd；仅当 Gateway 不从仓库根启动时才需要覆盖
+  exclude:
+  - runtime_memory/**
+  - .goharu/**
+  - "**/__pycache__/**"
+  - "*.pyc"
+  - .git/**
+agentnet:
+  enabled: true                # 智能体组网（hub: 159.75.26.204:6000，白名单制）
+  url: ws://159.75.26.204:6000
+  http_base: http://159.75.26.204:6001   # 附件上传/下载端点
+  name: goharu               # 可用环境变量 AGENTNET_NAME 覆盖（多机部署用）
+  owner_ids: [agt_43346c6e4ef29069]   # 主人身份（观察台 owner），其消息标记为可信
+  focus: 编程与自动化（代码编辑、调试、系统操作）   # 观察台展示的侧重方向
+  tags: [coding, automation, windows]
+  identity_dir: ./runtime_memory/agentnet/identity
+  messagebox_path: ./runtime_memory/agentnet/messagebox.db
 prompt:
   system:
     shared: []
@@ -63,24 +89,40 @@ prompt:
 model:
   large-language-model:
     provider: auto
-    model: MiniMax-M2.7
-    api_key_env: ANTHROPIC_API_KEY
-    base_url: https://api.minimaxi.com/anthropic
+    model: deepseek-flash
+    api_key_env: ZHIPU_API_KEY
+    base_url: https://api.deepseek.com/anthropic
     max_tokens: 8192
     temperature: 0.7
     top_p: 0.9
     api_timeout: 120
     max_retries: 10
   model_history:
-  - model: MiniMax-M2.7
-    base_url: https://api.minimaxi.com/anthropic
-    api_key_env: ANTHROPIC_API_KEY
+  - model: deepseek-flash
+    base_url: https://api.deepseek.com/anthropic
+    api_key_env: ZHIPU_API_KEY
+  - model: kimi-k3
+    base_url: https://api.kimi.com/coding/
+    api_key_env: ZHIPU_API_KEY
   - model: glm-5.3-Flash
     base_url: https://open.bigmodel.cn/api/anthropic
     api_key_env: ZHIPU_API_KEY
+  - model: MiniMax-M2.7
+    base_url: https://api.minimaxi.com/anthropic
+    api_key_env: ANTHROPIC_API_KEY
 tools:
   runtime: in_process
-  background_timeout: 120
+  background_timeout: 25
+  background_timeout_by_tool:
+    AgentDelegate: 240
+    mcp__*: 120
+  background_max_duration_seconds: 150
+  background_exempt_tools:
+  - AskUser
+  - ExitPlanMode
+  - Sleep
+  background_no_cancel_tools:
+  - AgentDelegate
   result_format:
     enabled: true
   verify_nudge:
@@ -88,6 +130,9 @@ tools:
     mutation_threshold: 3
     gate_final_answer: true
     max_gate_fires: 2
+  loop_guard:
+    enabled: true
+    repeat_threshold: 3
   result_budget:
     cache_dir: ./runtime_memory/tool_cache
     max_single_tokens: 8000
@@ -98,15 +143,49 @@ tools:
   - Tools.builtin.glob_tool
   - Tools.builtin.agent_delegate
   - Tools.builtin.pdf_tools
+  - Tools.builtin.pdf_annotate_tools
   - Tools.builtin.document_tools
   - Tools.builtin.system_info_tool
   - Tools.builtin.skill_tool
-  - Tools.builtin.snip_tool
   - Tools.builtin.sleep_tool
+  - Tools.builtin.memory_tools
+  - Tools.builtin.task_tools
+  - Tools.builtin.ask_user_tools
+  - Tools.builtin.reload_tools
   - Tools.builtin.mcp_tools
+  - Tools.builtin.architect_tools
+  - Tools.builtin.time_tool
+  - Tools.builtin.reminder_tools
+  - Tools.builtin.music_tools
+  - Tools.builtin.rea_tools
+  - Tools.builtin.channel_tools
+  - Tools.builtin.plan_mode_tools
+  - Tools.builtin.checkpoint_tools
+  - Tools.builtin.agentnet_tools
+  ask_user:
+    timeout_seconds: 300
   mcp:
-    servers: {}
+    call_timeout_seconds: 60
+    servers:
+      browser-use:
+        command: D:\MyProject\Programming\AgentDevelop\browser-use\.venv\Scripts\python.exe
+        args:
+        - -m
+        - browser_use.mcp
+        env:
+          ANONYMIZED_TELEMETRY: 'False'
+      netease-music:
+        command: D:\MyAnaconda\python.exe
+        args:
+        - D:\MyProject\Programming\python\pythonsome\pythonsome\newbroker\netmusic_mcp.py
+        call_timeout_seconds: 30   # 正常 <3s；超时即僵尸，快速失败+重连
+        env:
+          PYTHONIOENCODING: utf-8
+      tavily:
+        transport: http
+        url: https://mcp.tavily.com/mcp/?tavilyApiKey=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
   security:
+    allow_confirmation: true    # 灰名单命令走确认（TUI 弹窗 / QQ 按钮），而非硬拦
     dangerous_commands:
     - shutdown
     - restart
@@ -141,7 +220,6 @@ tools:
     - powershell -encodedcommand
     - powershell -enc
     enabled: true
-    allow_confirmation: true
 agent:
   maxDepth: 200
   step_watchdog_seconds: 150
@@ -155,6 +233,9 @@ agent:
     min_content_chars: 120
   context_compact:
     enabled: true
+    auto_enabled: true
+    auto_threshold_tokens: 800000
+    keep_recent_turns: 4     # compact 时保留最近 N 个用户 turn 原文，更早的压成摘要
 logging:
   base_dir: ./runtime_memory/logs
   level: INFO
@@ -171,15 +252,87 @@ agent_delegate:
     max_concurrent: 2
   verify:
     max_concurrent: 1
-    max_iterations: 50
+    max_iterations: 30
+  architect:
+    max_concurrent: 1
+    max_iterations: 40
+    memory_root: runtime_memory/architect
   max_iterations: 20
   max_history_turns: 3
+architect_hub:
+  digest_window: 200               # 遥测事件滚动窗口
+  guardian:
+    not_ready_seconds: 600         # 触发器①：step 持续卡死超过此值 → 唤醒守护
+  upgrade:
+    enabled: true                  # 定期检查远端新提交（GitUpdateSource）
+    check_interval_seconds: 1800   # 30 分钟一次 git fetch
+    min_commits: 3                 # 门控：落后 ≥N 个提交才启动更新流
+    quiet_seconds: 300             # 门控：用户安静期（最近 N 秒无消息才算好时机）
+    confirm_timeout_seconds: 1800  # 更新计划确认超时（超时自动取消）
+    repo_dir: .                    # 生产仓库目录
+    staging_dir: runtime_memory/upgrade_staging
+    remote: origin                 # 升级拉取的远端与分支（github.com/AoYuharu/Goharu）
+    branch: master
+  wake:
+    scheduler_interval_seconds: 60  # 拉式唤醒源的调度 tick（源自身有节流）
+    cooldown_seconds:              # 唤醒冷却（reason 级）
+      fatal: 1800
+      soft_failure: 1800
+      code_update: 300
+  audit:
+    test_timeout: 600
+    contract_tests:                # staging 审计必跑的契约测试
+      - tests/test_tools_standalone.py
+      - tests/test_memory_standalone.py
+      - tests/test_prompting_standalone.py
+      - tests/test_agent_loop_standalone.py
+      - tests/test_llm_standalone.py
+      - tests/test_cache_breakpoints.py
 ui:
   see:
     thinking: true
     text: true
 test: {}
 voice:
-  wakeup_enabled: true
-  asr_enabled: true
+  wakeup_enabled: false
+  asr_enabled: false
   mic_consent: true
+
+# ── 多 session 与 channel（可选；不配则等价单会话 default+TUI）──
+# sessions:
+#   - id: default                  # session id（L0 会话记忆按此隔离）
+#     max_messages: 10             # FIFO 窗口（显式配置默认 10；0=不限）
+#     channels:
+#       - type: tui                # 内置：tui（stdio JSON-RPC）
+#         channel_id: tui_main
+#   - id: qq_group_a               # 示例：第二个 session，挂 http channel
+#     max_messages: 10
+#     channels:
+#       - type: http
+#         channel_id: voice_http
+#         params: {port: 8999}
+# channels:
+#   plugins: []                    # 外部 channel 插件模块路径（import 即注册）
+
+# ── 多 session 与 channel（已启用 QQBot）──
+sessions:
+  - id: default
+    max_messages: 0               # default 保持旧行为（不限窗口）
+    channels:
+      - type: tui
+        channel_id: tui_main
+      - type: architect_telemetry # 幕后助手遥测（哑 channel，只收事件）
+        channel_id: arch_telemetry
+      - type: qqbot               # QQ 机器人（凭据走 .env QQBOT_APP_ID/QQBOT_CLIENT_SECRET）
+        channel_id: qq_main
+        params:
+          require_mention: true   # 群聊只在 @机器人 时上送；C2C 私聊全收
+          priority: high          # QQ 消息插队+打断当前步骤（TUI 保持默认 normal）
+channels:
+  plugins:
+    - Architect.channel            # 遥测采集 channel（注册 architect_telemetry type）
+
+# ── TUI attach：常驻守护的本地 RPC 端点 ──
+gateway:
+  rpc_port: 8791              # TUI 启动时探测此端口，有守护则对接（0=关闭 attach）
+  tui_attach_shutdown: true   # 对接的 TUI 关闭时顺带关掉整个守护（含 QQ）

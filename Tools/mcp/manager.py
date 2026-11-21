@@ -19,12 +19,30 @@ import logging
 import re
 from contextlib import AsyncExitStack
 
-from configurationLoader import config
+from Tools.config_proxy import get_config
 from Tools.registry import registry
 
 logger = logging.getLogger(__name__)
 
 _NAME_SAFE_RE = re.compile(r"[^a-zA-Z0-9_]")
+
+# 视觉链路：待投递的 Anthropic image 块（截图经 _serialize_result 暂存，
+# ActorAgent 组装 tool_result 时取走）。封顶 4 张防积压。
+_pending_images_MAX = 4
+_pending_images = []
+
+
+def _stash_image_block(block):
+    _pending_images.append(block)
+    del _pending_images[:-_pending_images_MAX]
+
+
+def pop_pending_images():
+    """取出并清空待投递的图像块（ActorAgent 在组装 tool_result 时调用）。"""
+    global _pending_images
+    imgs = _pending_images
+    _pending_images = []
+    return imgs
 
 
 def _safe(part):
@@ -37,6 +55,29 @@ def _serialize_result(result):
     for block in getattr(result, "content", None) or []:
         if getattr(block, "type", None) == "text":
             parts.append(getattr(block, "text", ""))
+        elif getattr(block, "type", None) == "image":
+            from Tools.config_proxy import get_config
+            vision = bool(get_config().get("model.large-language-model.vision", False))
+            mime = getattr(block, "mimeType", None) or "image"
+            data = getattr(block, "data", "") or ""
+            if vision and data:
+                # 视觉链路：图像块暂存，ActorAgent 组装 tool_result 时取出并附加，
+                # 模型在下一次 LLM 调用中真实可见；之后被清扫回文本占位符
+                _stash_image_block({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mime, "data": data},
+                })
+                parts.append(
+                    f"[截图已捕获（{len(data) * 3 // 4 // 1024} KB），图像已附加到本结果中，你可以直接查看。]"
+                )
+            else:
+                # base64 图像直接 JSON-dump 会把几百 KB 塞进上下文，用占位符替代；
+                # 同时给模型明确引导：截图不可见，不要反复请求，用元素列表操作
+                parts.append(
+                    f"[image: {mime}, {len(data) * 3 // 4 // 1024} KB — 截图已被丢弃，当前链路不支持图像输入。"
+                    f"不要依赖截图做判断，也不要再重复请求截图；"
+                    f"请根据 interactive_elements 列表的 index/tag/text/href 选择元素进行操作。]"
+                )
         else:
             try:
                 parts.append(json.dumps(block.model_dump(), ensure_ascii=False))
@@ -127,18 +168,28 @@ class MCPClientManager:
         try:
             if transport == "stdio":
                 from mcp import StdioServerParameters
-                from mcp.client.stdio import stdio_client
+                from mcp.client.stdio import stdio_client, get_default_environment
 
-                env = spec.get("env") or None
-                if env:
-                    from mcp.client.stdio import get_default_environment
-                    env = {**get_default_environment(), **env}
+                # stdio 子进程默认 NO_PROXY=*：requests/urllib 在 Windows 会读
+                # 注册表系统代理（Clash），代理半死时子进程全部请求挂到超时
+                # （2026-10-31 事故：netease music_search 25s+ 全军覆没）。
+                # 需要代理的 stdio server 在其 env 里显式覆盖 NO_PROXY。
+                env = {**get_default_environment(), "NO_PROXY": "*"}
+                env.update(spec.get("env") or {})
                 params = StdioServerParameters(
                     command=spec["command"],
                     args=[str(a) for a in (spec.get("args") or [])],
                     env=env,
                 )
-                read, write = await stack.enter_async_context(stdio_client(params))
+
+                # 子进程 stderr 落文件 + 尾随线程转 logger（anyio 需要真实 fd，
+                # 不能用纯 Python 对象）——否则 MCP server 崩溃无迹可寻
+                err_file, err_path = self._open_stderr_sink(conn.name)
+                stack.callback(err_file.close)
+                self._tail_stderr(err_path, conn.name)
+
+                read, write = await stack.enter_async_context(
+                    stdio_client(params, errlog=err_file))
             elif transport in ("http", "streamable_http", "streamable-http"):
                 from mcp.client.streamable_http import streamable_http_client
 
@@ -193,7 +244,7 @@ class MCPClientManager:
     async def start(self):
         """启动时连接所有 server（config.yaml 静态配置 + 运行期持久化文件，后者覆盖前者）。"""
         servers = {}
-        static = config.get("tools.mcp.servers", None)
+        static = get_config().get("tools.mcp.servers", None)
         if isinstance(static, dict):
             servers.update(static)
         servers.update(self._load_persisted())
@@ -248,7 +299,7 @@ class MCPClientManager:
         persisted = self._load_persisted()
         if name in persisted:
             return persisted[name]
-        static = config.get("tools.mcp.servers", None)
+        static = get_config().get("tools.mcp.servers", None)
         if isinstance(static, dict):
             return static.get(name)
         return None
@@ -264,6 +315,44 @@ class MCPClientManager:
             for name, conn in self._servers.items()
         }
 
+    # ── stdio 子进程 stderr 观测 ─────────────────────────────
+
+    @staticmethod
+    def _open_stderr_sink(server_name):
+        """打开（追加）该 server 的 stderr 日志文件，返回 (file, path)。"""
+        from pathlib import Path
+        base = Path(get_config().get("logging.base_dir",
+                                     "./runtime_memory/logs")) / "mcp"
+        base.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^\w.-]", "_", str(server_name))
+        path = base / f"{safe}.stderr.log"
+        return open(path, "ab", buffering=0), path
+
+    @staticmethod
+    def _tail_stderr(path, server_name):
+        """尾随 stderr 文件 → logger.warning（守护线程，文件关闭即退出）。"""
+        import threading
+        import time as _time
+
+        def _run():
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(0, 2)   # 从末尾开始，只跟新内容
+                    while True:
+                        line = f.readline()
+                        if not line:
+                            if f.closed:
+                                return
+                            _time.sleep(0.5)
+                            continue
+                        logger.warning("[mcp:%s:stderr] %s",
+                                       server_name, line.rstrip())
+            except Exception:
+                return
+
+        threading.Thread(target=_run, daemon=True,
+                         name=f"mcp-stderr-{server_name}").start()
+
     # ── 工具调用路由 ────────────────────────────────────────
 
     def _make_handler(self, server_name, tool_name):
@@ -276,8 +365,48 @@ class MCPClientManager:
         conn = self._servers.get(server_name)
         if conn is None or conn.session is None:
             return json.dumps({"error": f"MCP server not connected: {server_name}"}, ensure_ascii=False)
+
+        # 每次调用自带超时：远程 HTTP MCP（tavily 等）可能无限挂起——
+        # 没有这层超时，调用会卡满 runtime 的 background_timeout 才转后台，
+        # 转后台后又豁免一切超时，永远不返回结果（2026-10-16 tavily 事故：
+        # 挂 120s 转后台后任务永不完成，结果永不注入）
+        # 超时允许按 server 覆盖：下载类工具（如 netease music_download）在慢速
+        # 网络下可能超过全局 60s，超时会把"已成功下载的文件"误报为失败（红叉）。
+        call_timeout = float(
+            conn.spec.get("call_timeout_seconds")
+            or get_config().get("tools.mcp.call_timeout_seconds", 60)
+            or 60
+        )
+
         try:
-            result = await conn.session.call_tool(tool_name, arguments)
+            result = await asyncio.wait_for(
+                conn.session.call_tool(tool_name, arguments), timeout=call_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MCP call %s::%s timed out after %.0fs", server_name, tool_name, call_timeout,
+            )
+            # 超时后 session 很可能已僵尸（子进程死了/管道半开）——必须重连，
+            # 否则后续每次调用都挂到超时（2026-10-31 netease 僵尸事故：
+            # 首调 120s 挂 → 之后全超时，直到进程退出才暴露）
+            try:
+                async with self._lock:
+                    await self._teardown(conn)
+                    await self._open_session(conn)
+                    conn.status = "connected"
+                logger.info("MCP server '%s' reconnected after timeout", server_name)
+            except Exception as re_err:
+                logger.warning(
+                    "MCP server '%s' reconnect after timeout failed: %s",
+                    server_name, re_err,
+                )
+            return json.dumps(
+                {
+                    "error": f"MCP 工具调用超时（{call_timeout:.0f}s 无响应，已重连 server）",
+                    "hint": "server 可能过载或网络不通。可换更精简的参数重试一次；仍超时就改用其他工具/方法，不要原地反复调用。",
+                },
+                ensure_ascii=False,
+            )
         except Exception as exc:
             # 惰性重连一次后重试
             logger.warning(
@@ -291,7 +420,14 @@ class MCPClientManager:
                     conn.status = "connected"
                     conn.error = None
                 await self._refresh_tool_defs()
-                result = await conn.session.call_tool(tool_name, arguments)
+                result = await asyncio.wait_for(
+                    conn.session.call_tool(tool_name, arguments), timeout=call_timeout
+                )
+            except asyncio.TimeoutError:
+                return json.dumps(
+                    {"error": f"MCP 工具调用在重连后仍然超时（{call_timeout:.0f}s）"},
+                    ensure_ascii=False,
+                )
             except Exception as exc2:
                 conn.status = "failed"
                 conn.error = f"{type(exc2).__name__}: {exc2}"

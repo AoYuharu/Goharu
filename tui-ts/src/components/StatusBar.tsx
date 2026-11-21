@@ -33,7 +33,7 @@ export interface TokenStats {
 
 export function StatusBar({ status, stats, model }: { status: StatusState; stats: TokenStats | null; model?: string }) {
   return (
-    <Box>
+    <Box height={1} overflow="hidden">
       {model ? (
         <Text bold color="magenta">[{model}] </Text>
       ) : null}

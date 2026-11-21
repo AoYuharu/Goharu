@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>语音唤醒与记录</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1a1a2e;min-height:100vh;display:flex;justify-content:center;align-items:center;font-family:Segoe UI,sans-serif;color:#fff}
+.container{background:rgba(255,255,255,0.05);border-radius:20px;padding:30px;max-width:500px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.4)}
+h1{text-align:center;margin-bottom:20px;font-size:24px}
+.status{text-align:center;padding:15px;border-radius:10px;margin-bottom:15px;font-size:16px;transition:all 0.3s}
+.status.active{background:#00ff88;color:#000;animation:pulse 1.5s infinite}
+.status.waiting{background:rgba(255,200,0,0.2);border:2px solid #ffcc00}
+.status.idle{background:rgba(100,100,100,0.2);border:2px solid #666}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.02)}}
+.mic{font-size:48px;text-align:center;margin:15px 0;animation:bounce 2s infinite}
+@keyframes bounce{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}
+.records{background:rgba(0,0,0,0.3);border-radius:10px;padding:15px;max-height:250px;overflow-y:auto}
+.records h3{margin-bottom:10px;color:#00ff88}
+.record{margin-bottom:8px;padding:10px;background:rgba(255,255,255,0.05);border-radius:6px;border-left:3px solid #0f0}
+.record-time{font-size:11px;color:#888}
+.record-text{font-size:14px;margin-top:3px}
+.btn{width:100%;padding:12px;border:none;border-radius:8px;font-size:15px;cursor:pointer;margin-top:10px;transition:all 0.3s}
+.btn:hover{transform:translateY(-2px)}
+.btn-start{background:#0f0;color:#000}
+.btn-stop{background:#f66;color:#fff}
+.btn:disabled{opacity:0.5;cursor:not-allowed;transform:none}
+.info{text-align:center;font-size:12px;color:#888;margin-top:10px}
+</style>
+</head>
+<body>
+<div class="container">
+    <h1>🎤 语音唤醒与记录</h1>
+    <div class="status idle" id="s">点击开始监听</div>
+    <div class="mic" id="m">🎙️</div>
+    <button class="btn btn-start" id="b1" onclick="start()">开始监听</button>
+    <button class="btn btn-stop" id="b2" onclick="stop()" disabled>停止</button>
+    <p class="info">说 "你好助手" 唤醒，然后说话记录</p>
+    <div class="records"><h3>📝 记录</h3><div id="r"><p style="color:#666;text-align:center">暂无</p></div></div>
+</div>
+<script>
+var S={listening:false,rec:null,wr:null,records:[]};
+const WORDS=['你好助手','你好','嘿','在吗'];
+
+function $(id){return document.getElementById(id)}
+function setS(t,c){$('s').textContent=t;$('s').className='status '+c}
+
+function add(t){
+    S.records.unshift({t:new Date().toLocaleString('zh-CN'),v:t});
+    var d=$('r');
+    if(S.records.length===1)d.innerHTML='';
+    d.innerHTML='<div class="record"><div class="record-time">'+S.records[0].t+'</div><div class="record-text">'+t+'</div></div>'+d.innerHTML;
+}
+
+function beep(){
+    try{
+        var a=new (window.AudioContext||window.webkitAudioContext)();
+        var o=a.createOscillator();
+        var g=a.createGain();
+        o.connect(g);g.connect(a.destination);
+        o.frequency.value=800;g.gain.setValueAtTime(0.3,a.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.01,a.currentTime+0.2);
+        o.start(a.currentTime);o.stop(a.currentTime+0.2);
+    }catch(e){}
+}
+
+function wake(){
+    if(!S.wr){
+        var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+        if(!SR){setS('浏览器不支持语音','');return;}
+        S.wr=new SR();
+        S.wr.continuous=true;S.wr.interimResults=true;S.wr.lang='zh-CN';
+        S.wr.onresult=function(e){
+            var t=e.results[e.results.length-1][0].transcript.trim();
+            console.log('识别:',t);
+            for(var w of WORDS)if(t.includes(w)){onWake();break;}
+        };
+        S.wr.onerror=function(e){if(e.error!=='no-speech'&&S.listening)setTimeout(()=>{try{S.wr.start()}catch(x){}},1000)};
+        S.wr.onend=function(){if(S.listening)try{S.wr.start()}catch(x){}};
+    }
+    try{S.wr.start()}catch(e){}
+}
+
+function onWake(){
+    beep();setS('🎤 唤醒！正在记录...','active');$('m').textContent='🎤';
+    if(!S.rec){
+        var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+        S.rec=new SR();S.rec.continuous=true;S.rec.interimResults=true;S.rec.lang='zh-CN';
+        var txt='';
+        S.rec.onresult=function(e){
+            for(var i=e.resultIndex;i<e.results.length;i++){
+                var t=e.results[i][0].transcript;
+                if(e.results[i].isFinal){txt+=t;}else{txt+=t;}
+            }
+            if(txt){add(txt);txt='';}
+        };
+    }
+    try{S.rec.start()}catch(e){}
+    add('--- 开始记录 ---');
+    setTimeout(()=>{if(S.rec)try{S.rec.stop()}catch(e){}add('--- 结束 ---');setS('继续等待唤醒','waiting');$('m').textContent='👂';},5000);
+}
+
+function start(){
+    S.listening=true;$('b1').disabled=true;$('b2').disabled=false;
+    setS('🔍 监听唤醒词...','waiting');$('m').textContent='👂';
+    wake();
+}
+
+function stop(){
+    S.listening=false;$('b1').disabled=false;$('b2').disabled=true;
+    setS('已停止','idle');$('m').textContent='🎙️';$('m').style.animation='none';
+    if(S.wr)try{S.wr.stop()}catch(e){}
+    if(S.rec)try{S.rec.stop()}catch(e){}
+}
+
+if(!('SpeechRecognition' in window)&&!('webkitSpeechRecognition' in window)){
+    setS('⚠️ 浏览器不支持，请用Chrome/Edge','');
+}
+</script>
+</body>
+</html>

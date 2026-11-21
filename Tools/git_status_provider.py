@@ -43,6 +43,22 @@ class GitStatusProvider:
         return cls._cache or "Git status unavailable: refreshing"
 
     @classmethod
+    def get_status_sync(cls, repo_path: Optional[str] = None) -> str:
+        """同步取一次 git 状态并更新缓存。
+
+        仅供会话启动时的"git_status 快照"用（PromptAssembler 构造时取一次、
+        全程冻结进静态前缀）——启动多等零点几秒可接受；每轮路径仍走非阻塞
+        的 get_status。
+        """
+        try:
+            text = cls._fetch_uncached(repo_path)
+        except Exception as exc:
+            text = f"Git status unavailable: {exc}"
+        cls._cache = text
+        cls._cache_time = time.time()
+        return text
+
+    @classmethod
     def _start_refresh(cls, repo_path: Optional[str]) -> None:
         """后台刷新缓存（非阻塞）。并发刷新合并，同一时刻只跑一个取数线程。"""
         if cls._fetching:

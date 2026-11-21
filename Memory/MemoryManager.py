@@ -59,13 +59,19 @@ class MemoryManager:
 
     # ── Pyramid: L0-L3 retrieval ────────────────────────────────────
 
-    def retrieve_prompt_memory(self):
-        """Query-time hybrid retrieval: L1 atoms + L2 scenes + L3 persona summary."""
-        messages = self.get_context()
+    def retrieve_prompt_memory(self, messages=None):
+        """Query-time hybrid retrieval: L1 atoms + L2 scenes + L3 persona summary.
+
+        messages: 可选，用于构建查询的上下文消息（默认取本管理器的工作记忆）。
+        多 session 场景下由 SessionMemoryView 传入本 session 的上下文。
+        """
+        if messages is None:
+            messages = self.get_context()
         retriever = self.hybrid_retriever
         query = retriever.build_query_from_messages(messages)
         pack = retriever.retrieve(query)
         pack["query_text"] = query
+        pack["memory_stats"] = self._collect_memory_stats()
         self._dump_retrieval_log(query, pack)
 
         # 可读检索日志：每轮一条，含 query 摘要 + 各层命中数 + 命中标题
@@ -89,6 +95,70 @@ class MemoryManager:
     def get_persona_markdown(self):
         try:
             return self.persona_generator.read_persona()
+        except Exception:
+            return None
+
+    def add_atom(self, atom_type, subject, canonical_text, slot="", salience=0.6):
+        """模型主动写入 L1 记忆原子（memory_add 工具路径）。
+
+        含 n-gram 去重 + FTS/BM25/embedding 索引；去重命中返回 None。
+        不改动 turn 的 pipeline_state，不干扰 PipelineManager 自动提取。
+        """
+        from Memory.pipeline.MemoryIngestionService import MemoryIngestionService
+        from Memory.repositories.L0Repository import L0Repository
+        # 必须用 hybrid_retriever 的同一条 db 通路（cfg overrides 指向独立目录时，
+        # working.l0_repo 可能按全局配置落了另一个库——Memory/CLAUDE.md 不变量 2）
+        db = self.hybrid_retriever.db
+        l0_repo = L0Repository(db)
+        turn = l0_repo.get_or_create_turn(
+            session_id=self.working.session_id,
+            day_key=datetime.now().strftime("%Y-%m-%d"),
+        )
+        if not turn:
+            return None
+        ingestion = MemoryIngestionService(
+            l0_repo=l0_repo,
+            embedding_service=self.hybrid_retriever.embedding_service,
+        )
+        return ingestion.store_manual_atom(
+            {
+                "atom_type": atom_type,
+                "subject": subject,
+                "slot": slot,
+                "canonical_text": canonical_text,
+                "salience": salience,
+            },
+            source_turn_id=turn["id"],
+        )
+
+    def _collect_memory_stats(self):
+        """记忆库规模 + persona 新鲜度（每轮检索时顺带算，COUNT(*) + 文件 mtime，开销可忽略）。
+
+        供 Prompting 便利贴渲染"有多少记忆可查 / persona 是否可能过期"，降低记忆幻觉。
+        失败返回 None（便利贴静默跳过，不影响检索主链路）。
+        """
+        try:
+            db = self.hybrid_retriever.db
+            l1 = db.scalar(
+                "SELECT COUNT(*) FROM l1_memory_atoms WHERE status='active'", default=0
+            ) or 0
+            l2 = db.scalar(
+                "SELECT COUNT(*) FROM l2_scenes WHERE status='active'", default=0
+            ) or 0
+            age = None
+            try:
+                path = self.persona_generator.persona_path
+                if path.exists():
+                    age = (
+                        datetime.now().timestamp() - path.stat().st_mtime
+                    ) / 86400.0
+            except Exception:
+                pass
+            return {
+                "l1_atoms": int(l1),
+                "l2_scenes": int(l2),
+                "persona_age_days": age,
+            }
         except Exception:
             return None
 

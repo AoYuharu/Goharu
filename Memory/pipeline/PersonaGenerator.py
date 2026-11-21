@@ -12,6 +12,7 @@ from pathlib import Path
 
 from Memory.memory_config import resolve_config
 from Memory.scene_blocks.SceneFileManager import SceneFileManager
+from Memory import change_events
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,12 @@ class PersonaGenerator:
 
     def write_persona(self, content):
         """写入 persona.md 文件。"""
+        # 审计缝：覆盖前快照旧字节（persona.md 在 runtime_memory 下，git 对账看不到）
+        old_bytes = self.persona_path.read_bytes() if self.persona_path.exists() else None
         self.persona_path.write_text(content, encoding="utf-8")
+        change_events.emit_memory_file_change(
+            str(self.persona_path), "modify" if old_bytes is not None else "create",
+            old_bytes, content.encode("utf-8"), "hook:persona")
         logger.info("PersonaGenerator: wrote persona.md (%d chars)", len(content))
 
     def get_persona_summary(self):

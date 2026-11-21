@@ -45,6 +45,10 @@ def _normalize_content_blocks(role, content):
                 normalized.append({**block, "thinking": thinking})
         elif block_type in ("tool_use", "tool_result"):
             normalized.append(dict(block))
+        elif block_type == "image":
+            # 视觉链路：截图等图像块原样透传（仅 vision 模型；上游在
+            # model.large-language-model.vision=false 时不会产出 image 块）
+            normalized.append(dict(block))
         else:
             raise ValueError(f"Unsupported native block type: {block_type}")
 
@@ -80,7 +84,14 @@ class AnthropicProvider(LLMProvider):
 
         api_timeout = llm_config.get("api_timeout", 120)
         if api_timeout:
-            client_kwargs["timeout"] = float(api_timeout)
+            import httpx
+
+            client_kwargs["timeout"] = httpx.Timeout(
+                timeout=float(api_timeout),
+                connect=float(llm_config.get("connect_timeout", 15)),
+                write=float(llm_config.get("write_timeout", 30)),
+                pool=float(llm_config.get("pool_timeout", 10)),
+            )
 
         return Anthropic(**client_kwargs)
 

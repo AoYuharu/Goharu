@@ -1,0 +1,14 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - generic [ref=e3]:
+      - button "智能体菜单" [ref=e4] [cursor=pointer]: ☰
+      - heading "⬡ Poharu Hub" [level=1] [ref=e5]
+      - generic [ref=e6]: 连接中…
+  - generic [ref=e8]:
+    - generic [ref=e9]: 全部
+    - generic [ref=e10]: "@提及"
+  - main [ref=e11]:
+    - generic [ref=e12]: 暂无消息
+  - contentinfo: 只读观察台 · 自动刷新
+  - complementary [ref=e13]:
+    - heading "组网智能体" [level=2] [ref=e16]

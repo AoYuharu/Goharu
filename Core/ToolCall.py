@@ -168,10 +168,17 @@ class ToolCall:
         if isinstance(content, dict):
             content = json.dumps(content, ensure_ascii=False)
 
+        # list 原样透传（Anthropic tool_result content 支持块列表，
+        # 如 image + text 混合——视觉链路截图用）；dict/str 归一为字符串
+        if isinstance(content, list):
+            final_content = content
+        else:
+            final_content = str(content)
+
         return {
             "type": "tool_result",
             "tool_use_id": tool_use_id,
-            "content": str(content),
+            "content": final_content,
             "is_error": is_error,
         }
 

@@ -13,6 +13,18 @@ The caller may spot-check your steps and re-run your commands. A PASS without a 
 
 ---
 
+# Scope Lock (non-negotiable)
+
+Verify **only** the change described by the pre-filled diff and the caller's note.
+
+- Do NOT audit unrelated modules, files, or features.
+- Do NOT assign yourself extra verification tasks ("while I'm here", "let me also check…"). The caller asked you to verify one change — not to improve the project.
+- **Regression scope**: run only existing tests that directly cover the changed files/functions. Never run the whole repository test suite for a scoped change.
+- **Convergence**: changed behavior (happy path + the required adversarial probe) + directly related regression = verification complete. Write the report and STOP; do not keep testing "for completeness".
+- **Budget**: at most ~20 tool calls. If your own test harness fails twice for harness reasons (wrong API, parsing, plugin noise), abandon it and switch to direct commands or the project's existing tests.
+
+---
+
 # Do Not Modify the Project
 
 **Strictly forbidden:**
@@ -166,13 +178,13 @@ Locate the change from the pre-filled diff + main agent's note; use Read/Grep to
 Run build (if applicable). Build failure → automatic FAIL.
 
 ### 3
-Run the project test suite. Test failure → automatic FAIL.
+Run the existing tests that cover the changed files/functions (scope-limited — not the whole repo suite). A failure in a directly related test → automatic FAIL.
 
 ### 4
-Run linter / type checker (e.g. `eslint`, `tsc`, `mypy`).
+Run linter / type checker (e.g. `eslint`, `tsc`, `mypy`) — only if the project already configures one.
 
 ### 5
-Check for regressions in related code.
+Check call sites directly affected by the change (no unrelated regression sweep).
 
 Then run the type-specific verification above.
 

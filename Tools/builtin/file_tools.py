@@ -1,14 +1,85 @@
 import asyncio
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from Tools.registry import registry
 from Tools.touched_files import record as record_touched_file
+from Tools.file_change_hook import emit_file_change
 
 
 SKIPPED_DIRS = {".git", ".cache", "__pycache__", ".venv", "venv", "node_modules"}
+
+
+def _discover_test_files(source_path: Path) -> list[dict]:
+    """Discover test files corresponding to a source file.
+
+    Searches for test files in common patterns:
+    - tests/test_<module_name>.py
+    - tests/<package>_tests/test_<module_name>.py
+    - tests/<package>/test_<module_name>.py
+
+    Returns a list of dicts with 'path' and 'pattern' keys.
+    """
+    test_files = []
+
+    if source_path.suffix != ".py":
+        return test_files
+
+    # Get the module name from the source file
+    module_name = source_path.stem
+    source_dir = source_path.parent
+
+    # Common test directory patterns
+    test_dir_candidates = []
+    for parent in source_path.parents:
+        test_dir = parent / "tests"
+        if test_dir.is_dir():
+            test_dir_candidates.append(test_dir)
+
+    # Also check sibling directories
+    parent = source_path.parent.parent
+    if parent and parent.name == "tests":
+        test_dir_candidates.append(parent)
+
+    for test_dir in test_dir_candidates:
+        # Pattern 1: tests/test_<module_name>.py
+        test_file = test_dir / f"test_{module_name}.py"
+        if test_file.is_file():
+            test_files.append({
+                "path": str(test_file),
+                "pattern": f"test_{module_name}.py",
+                "type": "direct"
+            })
+
+        # Pattern 2: tests/<package>_tests/test_<module_name>.py
+        for subdir in test_dir.iterdir():
+            if subdir.is_dir() and (subdir.name.endswith("_tests") or subdir.name == module_name):
+                test_file = subdir / f"test_{module_name}.py"
+                if test_file.is_file():
+                    test_files.append({
+                        "path": str(test_file),
+                        "pattern": f"{subdir.name}/test_{module_name}.py",
+                        "type": "package"
+                    })
+
+    return test_files
+
+
+def _get_test_file_context(test_files: list[dict]) -> str:
+    """Generate context text for discovered test files."""
+    if not test_files:
+        return ""
+
+    lines = ["\n<system-reminder>", "<test_file_awareness>", "Discovered corresponding test files for the file you are editing:"]
+    for tf in test_files:
+        lines.append(f'  - {tf["path"]} (matched via pattern: {tf["pattern"]})')
+    lines.append("Consider reading these test files to understand expected behavior before making changes.")
+    lines.append("</test_file_awareness>")
+    lines.append("</system-reminder>")
+    return "\n".join(lines)
 
 # 单次 Write 内容上限（字符数）。超过此值会让模型改用 Edit 分段追加，
 # 避免一次性输出过大导致 max_tokens 截断、伪工具调用解析失败。
@@ -274,7 +345,7 @@ async def Read(path: str, start_line: int = 1, end_line: int | None = None, acto
         return _error("end_line 必须大于等于 start_line")
 
     # 限制单次最多读取 200 行
-    MAX_READ_LINES = 200
+    MAX_READ_LINES = 500
     if end_line is None:
         end_line = start_line + MAX_READ_LINES - 1
     elif end_line - start_line + 1 > MAX_READ_LINES:
@@ -366,6 +437,11 @@ async def Write(
         has_trailing_newline = True
         _write_file_text(path_obj, lines, newline, has_trailing_newline)
         record_touched_file(str(path_obj))
+        # 审计缝：create（new_bytes 从盘重读，保证与落盘字节一致）
+        try:
+            emit_file_change(str(path_obj), "create", None, path_obj.read_bytes(), "hook:Write")
+        except OSError:
+            pass
     finally:
         await _file_state.release_write(file_key, actor_id)
 
@@ -403,6 +479,9 @@ async def Edit(
         return _json(blocked)
 
     try:
+        # 审计缝：写前快照原始字节（read_bytes 不走文本模式的换行符转换，
+        # CRLF 文件也能逐字节保真）
+        old_raw_bytes = path_obj.read_bytes()
         lines, newline, has_trailing_newline = _read_file_text(path_obj)
         original_text = newline.join(lines)
         if has_trailing_newline and lines:
@@ -436,17 +515,39 @@ async def Edit(
 
         _write_file_text(path_obj, new_lines, newline, new_has_trailing)
         record_touched_file(str(path_obj))
-    finally:
-        await _file_state.release_write(file_key, actor_id)
+        # 审计缝：modify（old=写前原始字节，new=落盘后盘字节）
+        try:
+            emit_file_change(
+                str(path_obj), "modify",
+                old_raw_bytes, path_obj.read_bytes(),
+                "hook:Edit",
+            )
+        except OSError:
+            pass
 
-    return _json(
-        {
+        # Discover and include test file awareness for Python files
+        test_files = _discover_test_files(path_obj)
+        test_context = _get_test_file_context(test_files)
+
+        result_data = {
             "ok": True,
             "file": str(path_obj),
             "old_length": len(old_string),
             "new_length": len(new_string),
         }
-    )
+        if test_files:
+            result_data["discovered_test_files"] = [tf["path"] for tf in test_files]
+            result_data["test_file_notice"] = (
+                f"Discovered {len(test_files)} corresponding test file(s). "
+                "Consider reading them to verify expected behavior."
+            )
+
+        result_json = _json(result_data)
+        if test_context:
+            result_json += test_context
+        return result_json
+    finally:
+        await _file_state.release_write(file_key, actor_id)
 
 
 async def WriteTestFile(
@@ -509,13 +610,13 @@ registry.register(
 
 registry.register(
     name="Read",
-    description="Read a file from the local filesystem. Returns line-by-line content with 1-based line numbers. After reading, grants Edit permission for that file. Cannot read directories (use run_cmd dir instead). MAX 200 lines per call: if end_line is omitted, defaults to start_line+199; if range exceeds 200 lines, returns an error. Use multiple calls with different start_line/end_line to read large files.",
+    description="Read a file from the local filesystem. Returns line-by-line content with 1-based line numbers. After reading, grants Edit permission for that file. Cannot read directories (use run_cmd dir instead). MAX 500 lines per call: if end_line is omitted, defaults to start_line+499; if range exceeds 500 lines, returns an error. Use multiple calls with different start_line/end_line to read large files.",
     arguments_schema={
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Absolute file path to read (e.g. 'C:/project/main.py')."},
             "start_line": {"type": "integer", "description": "Start line number (1-based). Default: 1 (beginning)."},
-            "end_line": {"type": "integer", "description": "End line number (1-based, inclusive). Default: start_line+199 (max 200 lines total). Range cannot exceed 200 lines."},
+            "end_line": {"type": "integer", "description": "End line number (1-based, inclusive). Default: start_line+499 (max 500 lines total). Range cannot exceed 500 lines."},
         },
         "required": ["path"],
     },

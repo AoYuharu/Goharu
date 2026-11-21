@@ -69,6 +69,20 @@ class MemoryDB:
             connection.rollback()
             raise
 
+    def close(self):
+        """关闭当前线程的 SQLite 连接并释放文件锁。
+
+        连接是线程本地的；本方法只关调用线程的连接（其他线程的连接随各自
+        线程结束释放）。独立部署/测试退出前调用，否则 Windows 上数据库文件
+        会被占用。
+        """
+        connection = getattr(self._local, "connection", None)
+        if connection is not None:
+            try:
+                connection.close()
+            finally:
+                self._local.connection = None
+
     def execute(self, sql, params=()):
         connection = self.connect()
         cursor = connection.execute(sql, params)
@@ -177,23 +191,6 @@ class MemoryDB:
                     FOREIGN KEY(scene_id) REFERENCES l2_scenes(id) ON DELETE CASCADE,
                     FOREIGN KEY(atom_id) REFERENCES l1_memory_atoms(id) ON DELETE CASCADE
                 );
-
-                CREATE TABLE IF NOT EXISTS l3_profiles (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    profile_type TEXT NOT NULL,
-                    section TEXT NOT NULL,
-                    field TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    source_atom_id INTEGER,
-                    source_scene_id INTEGER,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_l3_profile_identity
-                ON l3_profiles(profile_type, section, field, value, status);
-
-                CREATE INDEX IF NOT EXISTS idx_l3_section ON l3_profiles(section);
 
                 CREATE TABLE IF NOT EXISTS embeddings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>语音唤醒与记录</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);min-height:100vh;display:flex;justify-content:center;align-items:center;font-family:'Segoe UI',sans-serif;color:#fff}
+.container{background:rgba(255,255,255,0.05);border-radius:20px;padding:30px;max-width:500px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.1)}
+h1{text-align:center;margin-bottom:20px;font-size:24px;text-shadow:0 0 20px rgba(0,255,136,0.5)}
+.status{text-align:center;padding:15px;border-radius:10px;margin-bottom:15px;font-size:16px;transition:all 0.3s}
+.status.active{background:linear-gradient(135deg,#00ff88 0%,#00cc6a 100%);color:#000;animation:pulse 1s infinite}
+.status.waiting{background:rgba(255,200,0,0.2);border:2px solid #ffcc00}
+.status.error{background:rgba(255,100,100,0.2);border:2px solid #f66}
+.status.idle{background:rgba(100,100,100,0.2);border:2px solid #666}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.02)}}
+.mic{font-size:56px;text-align:center;margin:15px 0;transition:all 0.3s}
+.btn{width:48%;padding:12px;border:none;border-radius:8px;font-size:15px;cursor:pointer;transition:all 0.3s}
+.btn:hover{transform:translateY(-2px);box-shadow:0 5px 15px rgba(0,0,0,0.3)}
+.btn-start{background:linear-gradient(135deg,#00ff88,#00cc6a);color:#000}
+.btn-stop{background:linear-gradient(135deg,#ff6b6b,#ee5a5a);color:#fff}
+.btn:disabled{opacity:0.5;cursor:not-allowed;transform:none}
+.btns{display:flex;justify-content:space-between;gap:10px;margin-top:15px}
+.info{text-align:center;font-size:12px;color:#888;margin-top:12px}
+.records{background:rgba(0,0,0,0.3);border-radius:10px;padding:15px;max-height:280px;overflow-y:auto;margin-top:15px}
+.records h3{color:#00ff88;margin-bottom:10px;font-size:14px}
+.record{margin-bottom:8px;padding:10px;background:rgba(255,255,255,0.05);border-radius:6px;border-left:3px solid #00ff88}
+.record-time{font-size:11px;color:#666}
+.record-text{font-size:14px;margin-top:3px;word-break:break-all}
+.record.wake{border-left-color:#ffcc00}
+.record.system{border-left-color:#66ccff}
+.empty{color:#666;text-align:center;padding:30px}
+.server-status{display:flex;justify-content:center;align-items:center;gap:8px;font-size:12px;margin-bottom:10px}
+.dot{width:8px;height:8px;border-radius:50%;background:#f66}
+.dot.online{background:#0f0}
+</style>
+</head>
+<body>
+<div class="container">
+    <h1>🎤 语音唤醒与记录</h1>
+    
+    <div class="server-status">
+        <div class="dot" id="dot"></div>
+        <span id="serverStatus">服务器: 检测中...</span>
+    </div>
+    
+    <div class="status idle" id="status">点击启动监听</div>
+    <div class="mic" id="mic">🎙️</div>
+    
+    <div class="btns">
+        <button class="btn btn-start" id="btnStart" onclick="startListening()">启动</button>
+        <button class="btn btn-stop" id="btnStop" onclick="stopListening()" disabled>停止</button>
+    </div>
+    
+    <p class="info">唤醒词: 你好助手 / 开始记录 / 停止记录</p>
+    
+    <div class="records">
+        <h3>📝 语音记录</h3>
+        <div id="records"><div class="empty">暂无记录</div></div>
+    </div>
+</div>
+
+<script>
+const API = 'http://localhost:8765/api';
+var isOn = false, pollTimer = null;
+
+function $(id){return document.getElementById(id)}
+
+function setStatus(txt, cls){
+    $('status').textContent = txt;
+    $('status').className = 'status ' + cls;
+}
+
+function setMic(emoji){
+    $('mic').textContent = emoji;
+}
+
+function showRecords(records){
+    if(!records || records.length === 0){
+        $('records').innerHTML = '<div class="empty">暂无记录</div>';
+        return;
+    }
+    $('records').innerHTML = records.map(r => {
+        var cls = 'record';
+        if(r.text.includes('唤醒')) cls += ' wake';
+        if(r.text.includes('系统')) cls += ' system';
+        return `<div class="${cls}"><div class="record-time">${r.time}</div><div class="record-text">${r.text}</div></div>`;
+    }).join('');
+}
+
+async function checkServer(){
+    try{
+        var res = await fetch(API + '/status');
+        var data = await res.json();
+        $('dot').className = 'dot online';
+        $('serverStatus').textContent = '服务器: 在线';
+        return true;
+    }catch(e){
+        $('dot').className = 'dot';
+        $('serverStatus').textContent = '服务器: 离线 (请运行 voice_server.py)';
+        return false;
+    }
+}
+
+async function startListening(){
+    if(isOn) return;
+    var ok = await checkServer();
+    if(!ok){
+        setStatus('服务器未启动!', 'error');
+        return;
+    }
+    try{
+        var res = await fetch(API + '/start', {method:'POST'});
+        var data = await res.json();
+        if(data.status === 'started'){
+            isOn = true;
+            $('btnStart').disabled = true;
+            $('btnStop').disabled = false;
+            setStatus('🔍 监听唤醒词中...', 'waiting');
+            setMic('👂');
+            startPoll();
+        }
+    }catch(e){
+        setStatus('启动失败: ' + e.message, 'error');
+    }
+}
+
+async function stopListening(){
+    if(!isOn) return;
+    try{
+        await fetch(API + '/stop', {method:'POST'});
+        isOn = false;
+        $('btnStart').disabled = false;
+        $('btnStop').disabled = true;
+        setStatus('已停止', 'idle');
+        setMic('🎙️');
+        stopPoll();
+    }catch(e){
+        console.error(e);
+    }
+}
+
+function startPoll(){
+    if(pollTimer) clearInterval(pollTimer);
+    loadRecords();
+    pollTimer = setInterval(loadRecords, 500);
+}
+
+function stopPoll(){
+    if(pollTimer){
+        clearInterval(pollTimer);
+        pollTimer = null;
+    }
+}
+
+async function loadRecords(){
+    try{
+        var res = await fetch(API + '/records');
+        var records = await res.json();
+        showRecords(records);
+    }catch(e){}
+}
+
+async function init(){
+    var ok = await checkServer();
+    if(ok){
+        setStatus('服务器已就绪，点击启动', 'idle');
+    }
+}
+
+init();
+setInterval(checkServer, 3000);
+</script>
+</body>
+</html>

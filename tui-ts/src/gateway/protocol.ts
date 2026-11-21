@@ -22,6 +22,8 @@ export interface UpdateConfigResult { success: boolean; key: string; old_value: 
 export interface CancelBackgroundTaskParams { task_id: number }
 export interface CancelBackgroundTaskResult { cancelled: boolean; task_id: number }
 export interface ConfirmResponseResult { ok: boolean; approved: boolean }
+export interface UserQuestionOption { label: string; description?: string }
+export interface UserQuestionResponseResult { ok: boolean; request_id: string }
 
 export interface HistoryMessage {
   role: string;
@@ -38,6 +40,7 @@ export interface GetHistoryResult { messages: HistoryMessage[] }
 
 export interface VoiceStatus {
   installed: boolean;
+  sdk_available?: boolean;
   mic_available: boolean;
   mic_consent: boolean;
   asr_enabled: boolean;
@@ -61,6 +64,16 @@ export interface ModelStatus {
   history: ModelHistoryEntry[];
 }
 export interface ModelSetConfigParams { model?: string; base_url?: string; api_key?: string; api_key_env?: string }
+export interface BrowserLlmStatus {
+  enabled: boolean;
+  model?: string | null;
+  base_url?: string | null;
+}
+export interface BrowserLlmSetResult extends BrowserLlmStatus {
+  success: boolean;
+  message: string;
+}
+
 export interface ModelSetConfigResult {
   success: boolean;
   changed: string[];
@@ -70,18 +83,32 @@ export interface ModelSetConfigResult {
   fallback_model?: string;
 }
 
+export interface ToolInfo {
+  name: string;
+  description: string;
+  source: "builtin" | "mcp";
+  server?: string | null;
+  schema?: Record<string, unknown>;
+}
+export interface ListToolsResult { count: number; tools: ToolInfo[] }
+
 export interface RpcMethods {
   "agent.send_message": { params: SendMessageParams; result: QueuedResult };
   "agent.clear_session": { params: SessionParams; result: QueuedResult };
   "agent.compact": { params: SessionParams; result: QueuedResult };
+  "agent.upgrade": { params: SessionParams; result: QueuedResult };
   "agent.get_history": { params: Record<string, never>; result: GetHistoryResult };
+  "tools.list": { params: Record<string, never>; result: ListToolsResult };
   "agent.update_config": { params: UpdateConfigParams; result: UpdateConfigResult };
   "agent.interrupt": { params: Record<string, never>; result: InterruptResult };
   "agent.confirm_response": { params: { confirm_id: string; approved: boolean }; result: ConfirmResponseResult };
+  "agent.user_question_response": { params: { request_id: string; answer: string }; result: UserQuestionResponseResult };
   "agent.cancel_background_task": { params: CancelBackgroundTaskParams; result: CancelBackgroundTaskResult };
   "voice.get_status": { params: Record<string, never>; result: VoiceStatus };
   "voice.set_config": { params: { mic_consent?: boolean; asr_enabled?: boolean; wakeup_enabled?: boolean }; result: VoiceStatus };
   "voice.download_model": { params: Record<string, never>; result: { started: boolean; message: string } };
+  "browser_llm.get_status": { params: Record<string, never>; result: BrowserLlmStatus };
+  "browser_llm.set_config": { params: { enabled: boolean }; result: BrowserLlmSetResult };
   "model.get_status": { params: Record<string, never>; result: ModelStatus };
   "model.set_config": { params: ModelSetConfigParams; result: ModelSetConfigResult };
 }
@@ -122,6 +149,30 @@ export interface BgTaskUpdatePayload {
   args?: string;
   status: "running" | "success" | "error";
   started_at?: number;
+  timed_out?: boolean;
+  error?: string;
+}
+
+export interface CheckpointSummaryPayload {
+  seq: number;
+  checkpoint_id?: string;
+  kind?: "turn" | "rollback";
+  outcome?: string;
+  ended_at?: string;
+  files: number;
+  l1_ops: number;
+  git_caught?: number;
+  degraded?: boolean;
+  warnings?: string[];
+}
+
+export interface CheckpointRollbackResult {
+  ok: boolean;
+  rollback_seq?: number;
+  undone?: number;
+  applied?: number;
+  failed?: Array<Record<string, unknown>>;
+  conflicts?: Array<{ path: string; reason: string }>;
 }
 
 export type GatewayEvent =
@@ -143,9 +194,11 @@ export type GatewayEvent =
   | { type: "tool.result"; payload: { tool: string; call_id: string; result: string } }
   | { type: "token.stats"; payload: { current_tokens?: number; prompt_cache_ratio?: number; cache_read_tokens?: number; cache_write_tokens?: number; uncached_input_tokens?: number } & Record<string, unknown> }
   | { type: "user.batch"; payload: { count: number; combined: string } }
+  | { type: "user.message"; payload: { text: string; channel: string } }
   | { type: "user.merge"; payload: { count: number; merged: string } }
   | { type: "message.complete"; payload: { answer: string } }
   | { type: "context.micro_compact"; payload: { removed_results: number } }
+  | { type: "tasks.updated"; payload: { tasks: Array<{ id: number; subject: string; status: string }> } }
   | { type: "task.background.started"; payload: { tool_calls: ToolCallSummary[] } }
   | { type: "task.background.completed"; payload: { count: number; task_ids: number[] } }
   | { type: "task.background.status"; payload: { pending_results: number } & Record<string, unknown> }
@@ -153,7 +206,12 @@ export type GatewayEvent =
   | { type: "subagent.update"; payload: SubagentUpdatePayload }
   | { type: "tool.output"; payload: { line: string; stream: string; cmd: string } }
   | { type: "tool.confirm_request"; payload: { confirm_id: string; cmd: string; description: string } }
+  | { type: "tool.user_question_request"; payload: { request_id: string; questions: Array<{ question: string; options: UserQuestionOption[]; multi_select?: boolean }> } }
   | { type: "task.background.update"; payload: BgTaskUpdatePayload }
+  | { type: "checkpoint.created"; payload: CheckpointSummaryPayload }
+  | { type: "checkpoint.rollback.started"; payload: { target: number; undone: number } }
+  | { type: "checkpoint.rollback.completed"; payload: CheckpointRollbackResult }
+  | { type: "checkpoint.degraded"; payload: { seq: number; reason: string | null } }
   | { type: "voice.download_progress"; payload: { downloaded_bytes: number; total_bytes: number; percent: number } }
   | { type: "voice.download_complete"; payload: { ok: boolean; error?: string; status?: VoiceStatus } }
   | { type: "voice.transcript"; payload: { text: string } }

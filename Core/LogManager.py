@@ -35,13 +35,18 @@ class LogManager:
         # Agent
         "Agent.ActorAgent": "agent",
         "Agent.SummarizerAgent": "agent",
-        "Agent.BackgroundTaskManager": "agent",
+        "Tools.background_tasks": "agent",
         "Agent.LargeLanguageModel": "agent",
         "Agent.LLMCore": "api",  # LLMCore 主要做 API 调用
         "Agent.LLMResponseLogger": "api",
         "Agent.MicroCompactor": "agent",
         "Agent.ToolResultBudget": "agent",
         "Agent.TokenEstimator": "agent",
+        "Prompting.MicroCompactor": "agent",
+        "Prompting.ContextCompactor": "agent",
+        "Prompting.loop_messages": "agent",
+        "Core.ToolResultBudget": "agent",
+        "Core.TokenEstimator": "agent",
         # Memory
         "Memory.MemoryManager": "memory",
         "Memory.WorkingMemory": "memory",

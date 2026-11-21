@@ -84,7 +84,14 @@ class OpenAIProvider(LLMProvider):
 
         api_timeout = llm_config.get("api_timeout", 120)
         if api_timeout:
-            client_kwargs["timeout"] = float(api_timeout)
+            import httpx
+
+            client_kwargs["timeout"] = httpx.Timeout(
+                timeout=float(api_timeout),
+                connect=float(llm_config.get("connect_timeout", 15)),
+                write=float(llm_config.get("write_timeout", 30)),
+                pool=float(llm_config.get("pool_timeout", 10)),
+            )
 
         return OpenAI(**client_kwargs)
 

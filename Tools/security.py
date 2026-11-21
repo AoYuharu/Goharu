@@ -4,14 +4,14 @@
 """
 import re
 from typing import Tuple, Optional
-from configurationLoader import config
+from Tools.config_proxy import get_config
 
 
 class CommandSecurityChecker:
     """命令安全检查器"""
 
     def __init__(self):
-        self.security_config = config.get("tools.security", {})
+        self.security_config = get_config().get("tools.security", {})
         self.enabled = self.security_config.get("enabled", True)
         self.allow_confirmation = self.security_config.get("allow_confirmation", False)
         self.dangerous_commands = self.security_config.get("dangerous_commands", [])

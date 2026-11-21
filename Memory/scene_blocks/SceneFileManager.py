@@ -14,6 +14,7 @@ from pathlib import Path
 import yaml
 
 from Memory.memory_config import resolve_config
+from Memory import change_events
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,12 @@ class SceneFileManager:
         meta.setdefault("keywords", [])
 
         content = self._format_scene_file(meta, body or DEFAULT_SCENE_BODY)
+        # 审计缝：覆盖前快照旧字节（场景文件在 runtime_memory 下，git 对账看不到）
+        old_bytes = path.read_bytes() if path.exists() else None
         path.write_text(content, encoding="utf-8")
+        change_events.emit_memory_file_change(
+            str(path), "modify" if old_bytes is not None else "create",
+            old_bytes, content.encode("utf-8"), "hook:scene")
         logger.info("SceneFileManager: wrote scene slug=%s path=%s", slug, path)
         return slug
 
@@ -110,7 +116,9 @@ class SceneFileManager:
         path = self._path_for(slug)
         if not path.exists():
             return False
+        old_bytes = path.read_bytes()  # 审计缝：删前快照
         path.unlink()
+        change_events.emit_memory_file_change(str(path), "delete", old_bytes, None, "hook:scene")
         logger.info("SceneFileManager: deleted scene slug=%s", slug)
         return True
 

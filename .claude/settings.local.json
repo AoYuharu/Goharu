@@ -23,7 +23,9 @@
     ],
     "additionalDirectories": [
       "D:\\MyProject\\Programming\\AgentDevelop\\TencentDB-Agent-Memory",
-      "D:\\MyProject\\Programming\\AgentDevelop\\claude-code"
+      "D:\\MyProject\\Programming\\AgentDevelop\\claude-code",
+      "D:\\MyProject\\Programming\\AgentDevelop\\browser-use",
+      "D:\\MyProject\\Programming\\AgentDevelop\\rea"
     ]
   }
 }

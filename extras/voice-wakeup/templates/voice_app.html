@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>语音唤醒与记录</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:linear-gradient(135deg,#1a1a2e,#16213e);min-height:100vh;display:flex;justify-content:center;align-items:center;font-family:'Segoe UI',sans-serif;color:#fff}
+.container{background:rgba(255,255,255,0.05);border-radius:20px;padding:30px;max-width:500px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.4)}
+h1{text-align:center;margin-bottom:20px;font-size:24px;text-shadow:0 0 20px rgba(0,255,136,0.5)}
+.status{text-align:center;padding:15px;border-radius:10px;margin-bottom:15px;font-size:16px;transition:all 0.3s}
+.status.listening{background:linear-gradient(135deg,#00ff88,#00cc6a);color:#000;animation:pulse 1s infinite}
+.status.waiting{background:rgba(255,200,0,0.2);border:2px solid #ffcc00}
+.status.idle{background:rgba(100,100,100,0.2);border:2px solid #666}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.02)}}
+.mic{font-size:56px;text-align:center;margin:15px 0;transition:all 0.3s}
+.mic.active{animation:bounce 0.5s infinite}
+@keyframes bounce{0%,100%{transform:scale(1)}50%{transform:scale(1.1)}}
+.btn{width:100%;padding:12px;border:none;border-radius:8px;font-size:15px;cursor:pointer;transition:all 0.3s}
+.btn:hover{transform:translateY(-2px)}
+.btn-start{background:linear-gradient(135deg,#00ff88,#00cc6a);color:#000}
+.btn-stop{background:linear-gradient(135deg,#ff6b6b,#ee5a5a);color:#fff}
+.btn:disabled{opacity:0.5;cursor:not-allowed;transform:none}
+.records{background:rgba(0,0,0,0.3);border-radius:10px;padding:15px;max-height:300px;overflow-y:auto;margin-top:15px}
+.records h3{color:#00ff88;margin-bottom:10px;font-size:14px}
+.record{margin-bottom:8px;padding:10px;background:rgba(255,255,255,0.05);border-radius:6px;border-left:3px solid #00ff88;animation:slideIn 0.3s}
+@keyframes slideIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
+.record-time{font-size:11px;color:#666}
+.record-text{font-size:14px;margin-top:3px;word-break:break-all}
+.empty{color:#666;text-align:center;padding:30px}
+.info{text-align:center;font-size:12px;color:#888;margin-top:12px}
+</style>
+</head>
+<body>
+<div class="container">
+    <h1>🎤 语音唤醒与记录</h1>
+    <div class="status idle" id="status">点击下方按钮启动</div>
+    <div class="mic" id="mic">🎙️</div>
+    <button class="btn btn-start" id="btn" onclick="toggle()">启动</button>
+    <p class="info">说「你好助手」唤醒 → 说话自动记录 → 静默自动停止</p>
+    <div class="records"><h3>📝 语音记录</h3><div id="records"><div class="empty">暂无记录</div></div></div>
+</div>
+
+<script>
+const API = 'http://localhost:8765/api';
+var isOn = false, pollTimer = null;
+
+function setUI(state, text, emoji) {
+    document.getElementById('status').textContent = text;
+    document.getElementById('status').className = 'status ' + state;
+    document.getElementById('mic').textContent = emoji;
+    document.getElementById('mic').className = state === 'listening' ? 'mic active' : 'mic';
+    var btn = document.getElementById('btn');
+    if (state === 'idle') {
+        btn.textContent = '启动';
+        btn.className = 'btn btn-start';
+    } else {
+        btn.textContent = '停止';
+        btn.className = 'btn btn-stop';
+    }
+}
+
+function showRecords(records) {
+    var container = document.getElementById('records');
+    if (!records || records.length === 0) {
+        container.innerHTML = '<div class="empty">暂无记录</div>';
+        return;
+    }
+    container.innerHTML = records.map(r => 
+        '<div class="record"><div class="record-time">' + r.time + '</div><div class="record-text">' + r.text + '</div></div>'
+    ).join('');
+}
+
+async function toggle() {
+    if (isOn) {
+        await fetch(API + '/stop', {method:'POST'});
+        isOn = false;
+        clearInterval(pollTimer);
+        setUI('idle', '已停止', '🎙️');
+    } else {
+        var res = await fetch(API + '/start', {method:'POST'});
+        var data = await res.json();
+        if (data.status === 'started') {
+            isOn = true;
+            setUI('waiting', '监听中... 说「你好助手」唤醒', '👂');
+            loadRecords();
+            pollTimer = setInterval(loadRecords, 500);
+        }
+    }
+}
+
+async function loadRecords() {
+    try {
+        var res = await fetch(API + '/records');
+        var records = await res.json();
+        showRecords(records);
+        var status = await fetch(API + '/status').then(r => r.json());
+        if (status.recording) {
+            setUI('listening', '正在录音...', '🎤');
+        }
+    } catch(e) {}
+}
+
+async function init() {
+    try {
+        var res = await fetch(API + '/status');
+        var data = await res.json();
+        if (data.running) {
+            isOn = true;
+            setUI('waiting', '系统运行中', '👂');
+            loadRecords();
+            pollTimer = setInterval(loadRecords, 500);
+        } else {
+            setUI('idle', '点击启动', '🎙️');
+        }
+    } catch(e) {
+        setUI('idle', '服务器未连接', '🎙️');
+    }
+}
+
+init();
+</script>
+</body>
+</html>

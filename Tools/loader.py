@@ -1,6 +1,6 @@
 import importlib
 
-from configurationLoader import config
+from Tools.config_proxy import get_config
 
 DEFAULT_BUILTIN_MODULES = ["Tools.builtin.core_tools"]
 
@@ -20,7 +20,7 @@ def _coerce_module_names(raw_value):
 def get_builtin_module_names(modules=None):
     if modules is not None:
         return _coerce_module_names(modules)
-    return _coerce_module_names(config.get("tools.builtin_modules", DEFAULT_BUILTIN_MODULES))
+    return _coerce_module_names(get_config().get("tools.builtin_modules", DEFAULT_BUILTIN_MODULES))
 
 
 def load_builtin_tools(modules=None):

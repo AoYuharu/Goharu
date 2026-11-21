@@ -22,7 +22,7 @@ export function BgTaskBar({ tasks, onCancel }: { tasks: BgTask[]; onCancel?: (ta
   return (
     <Box flexDirection="column">
       {tasks.map((t) => (
-        <Text key={t.taskId}>
+        <Text key={t.taskId} wrap="truncate">
           <Text color="yellow">
             <Spinner type="dots" /> BG #{t.taskId} {t.tool}
           </Text>

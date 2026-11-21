@@ -6,7 +6,7 @@ import clipboardy from "clipboardy";
 import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { GatewayClient, PROJECT_ROOT } from "../gateway/GatewayClient.js";
-import type { HistoryMessage, VoiceStatus, ModelStatus } from "../gateway/protocol.js";
+import type { HistoryMessage, VoiceStatus, ModelStatus, BrowserLlmStatus, UserQuestionOption } from "../gateway/protocol.js";
 import { formatTokens, formatTokensCompact, nowHHMMSS, highlightLine, hoverLine } from "../format.js";
 import { wrappedMessageLines, buildMessageLines, type ChatMessage } from "./MessageItem.js";
 import { StatusBar, type StatusState, type StatusType, type TokenStats } from "./StatusBar.js";
@@ -25,7 +25,17 @@ import {
 } from "./ToolDetailPanel.js";
 import { SubagentBar, type SubagentInfo } from "./SubagentBar.js";
 import { ConfirmDialog, CONFIRM_PANEL_ROWS, type ConfirmRequest } from "./ConfirmDialog.js";
+import {
+  QuestionDialog,
+  QUESTION_PANEL_ROWS,
+  customIndex,
+  isBatchQuestion,
+  type QuestionAnswers,
+  type UserQuestionRequest,
+} from "./QuestionDialog.js";
 import { BgTaskBar, KILL_BUTTON_WIDTH, type BgTask } from "./BgTaskBar.js";
+import { CheckpointBar, type CheckpointStatus } from "./CheckpointBar.js";
+import { TaskBar, type TaskItem } from "./TaskBar.js";
 import { VoiceSettingsPanel, VOICE_PANEL_ROWS } from "./VoiceSettingsPanel.js";
 import { ModelSettingsPanel, modelPanelRows, type ModelDraft } from "./ModelSettingsPanel.js";
 import { setMouseEnabled } from "../mouse.js";
@@ -38,8 +48,11 @@ import { TextViewerScreen } from "../screens/TextViewer.js";
 import { PromptCacheScreen } from "../screens/PromptCacheScreen.js";
 import { PromptEditorScreen } from "../screens/PromptEditorScreen.js";
 import { ConfigEditorScreen } from "../screens/ConfigEditorScreen.js";
+import { ChannelsEditorScreen } from "../screens/ChannelsEditorScreen.js";
+import { ToolsScreen } from "../screens/ToolsScreen.js";
+import type { ToolInfo } from "../gateway/protocol.js";
 
-type ScreenName = "textviewer" | "promptcache" | "prompteditor" | "config";
+type ScreenName = "textviewer" | "promptcache" | "prompteditor" | "config" | "tools" | "channels";
 type BrowseMode = "none" | "agents";
 
 let nextId = 1;
@@ -132,6 +145,10 @@ export function App({ mock = false }: { mock?: boolean }) {
   const [inputValue, setInputValue] = useState("");
   const [selIndex, setSelIndex] = useState(0);
   const [screen, setScreen] = useState<ScreenName | null>(null);
+  // /tools 面板数据
+  const [toolList, setToolList] = useState<ToolInfo[]>([]);
+  const [toolsLoading, setToolsLoading] = useState(false);
+  const [toolsError, setToolsError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
   const [browseMode, setBrowseMode] = useState<BrowseMode>("none");
   const [toolHistory, setToolHistory] = useState<ToolHistoryEntry[]>([]);
@@ -143,8 +160,17 @@ export function App({ mock = false }: { mock?: boolean }) {
   // 危险命令确认队列
   const [confirmQueue, setConfirmQueue] = useState<ConfirmRequest[]>([]);
   const [confirmSel, setConfirmSel] = useState(0); // 0=拒绝, 1=允许
-  const [settingsOpen, setSettingsOpen] = useState(false); // 设置菜单：0=模型, 1=语音
+  // AskUser 交互提问队列（选项面板，含"自己填写"项）
+  const [questionQueue, setQuestionQueue] = useState<UserQuestionRequest[]>([]);
+  const [questionSel, setQuestionSel] = useState(0);
+  const [questionInputMode, setQuestionInputMode] = useState(false);
+  const [questionDraft, setQuestionDraft] = useState("");
+  const [questionAnswers, setQuestionAnswers] = useState<QuestionAnswers>({});
+  const [questionPage, setQuestionPage] = useState(0);
+  const [settingsOpen, setSettingsOpen] = useState(false); // 设置菜单：0=模型, 1=语音, 2=浏览器LLM
   const [settingsSel, setSettingsSel] = useState(0);
+  const [browserLlm, setBrowserLlm] = useState<BrowserLlmStatus | null>(null); // 浏览器 LLM 抽取开关状态
+  const [browserLlmBusy, setBrowserLlmBusy] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [currentModel, setCurrentModel] = useState("");
@@ -161,6 +187,8 @@ export function App({ mock = false }: { mock?: boolean }) {
   // 各子代理的最新 Token/Cache 统计（agent_id → 状态栏数据），子代理视图右下角显示
   const [subagentStats, setSubagentStats] = useState<Record<string, TokenStats>>({});
   const [bgTasks, setBgTasks] = useState<BgTask[]>([]);
+  const [checkpoint, setCheckpoint] = useState<CheckpointStatus | null>(null);
+  const [taskList, setTaskList] = useState<TaskItem[]>([]);
   const [agentSel, setAgentSel] = useState(0);
   // Which agent's context owns the chat viewport ("main" or an agent_id)
   const [viewAgentId, setViewAgentId] = useState<string>("main");
@@ -388,6 +416,31 @@ export function App({ mock = false }: { mock?: boolean }) {
       }]);
       setConfirmSel(0); // 默认拒绝，需用户主动右移选择允许
     });
+    // AskUser 交互提问：进入队列，弹选项面板（questions 数组，支持批量多问/多选）
+    gw.on("tool.user_question_request", (p) => {
+      const raw = (Array.isArray(p.questions) ? p.questions : []) as Array<{
+        question?: unknown;
+        options?: unknown;
+        multi_select?: unknown;
+      }>;
+      const questions = raw
+        .filter((q) => q && Array.isArray(q.options) && q.options.length > 0)
+        .map((q) => ({
+          question: String(q.question ?? ""),
+          options: q.options as UserQuestionOption[],
+          multi_select: Boolean(q.multi_select),
+        }));
+      if (questions.length === 0) return;
+      setQuestionQueue((prev) => [...prev, {
+        request_id: String(p.request_id ?? ""),
+        questions,
+      }]);
+      setQuestionSel(0);
+      setQuestionInputMode(false);
+      setQuestionDraft("");
+      setQuestionAnswers({});
+      setQuestionPage(0);
+    });
     // 实时输出流：缓存到滚动缓冲（仅展开时显示，未展开不刷屏）
     gw.on("tool.output", (p) => {
       const line = String(p.line ?? "");
@@ -447,6 +500,8 @@ export function App({ mock = false }: { mock?: boolean }) {
     gw.on("token.stats", (p) => {
       setStats(buildTokenStats(p));
     });
+    gw.on("user.message", (p) =>
+      add({ kind: "user", text: p.text }));
     gw.on("user.batch", (p) =>
       add({ kind: "system", text: `Batched ${p.count} messages into one context` }));
     gw.on("user.merge", (p) =>
@@ -480,6 +535,12 @@ export function App({ mock = false }: { mock?: boolean }) {
         });
       } else {
         setBgTasks((prev) => prev.filter((t) => t.taskId !== p.task_id));
+        // 显式反馈结束原因：超时被杀不能静默消失（透明化原则）
+        if (p.timed_out) {
+          showStatic(`BG #${p.task_id} ${p.tool} 超时被终止`, "error");
+        } else if (p.status === "error") {
+          showStatic(`BG #${p.task_id} ${p.tool} 失败${p.error ? `：${p.error}` : ""}`, "error");
+        }
       }
     });
     gw.on("task.background.completed", (p) =>
@@ -487,6 +548,33 @@ export function App({ mock = false }: { mock?: boolean }) {
     gw.on("task.background.status", (p) => {
       // 静态而非 spinner：这可能是最后一个事件，spinner 会永远转圈误导用户
       if (Number(p.pending_results) > 0) showStatic(`BG: ${p.pending_results} pending`, "info");
+    });
+    gw.on("tasks.updated", (p) => {
+      setTaskList(Array.isArray(p.tasks) ? p.tasks : []);
+    });
+    gw.on("checkpoint.created", (p) => {
+      setCheckpoint({
+        seq: p.seq, files: p.files, l1Ops: p.l1_ops,
+        gitCaught: p.git_caught ?? 0, degraded: p.degraded ?? false,
+        kind: p.kind, rollingBackTo: null,
+      });
+    });
+    gw.on("checkpoint.rollback.started", (p) => {
+      setCheckpoint((prev) => ({
+        seq: prev?.seq ?? p.target, files: prev?.files ?? 0, l1Ops: prev?.l1Ops ?? 0,
+        rollingBackTo: p.target,
+      }));
+    });
+    gw.on("checkpoint.rollback.completed", (p) => {
+      setCheckpoint((prev) => (prev ? { ...prev, rollingBackTo: null } : prev));
+      if (p.ok) {
+        showStatic(`回退完成 → cp#${p.rollback_seq}（撤销 ${p.undone} 个 checkpoint）`, "success");
+      } else {
+        showStatic(`回退部分失败：${(p.failed ?? []).length} 项未应用`, "error");
+      }
+    });
+    gw.on("checkpoint.degraded", (p) => {
+      showStatic(`checkpoint git 降级：${p.reason ?? "未知原因"}（本轮回退仅覆盖工具写）`, "error");
     });
     gw.on("voice.download_progress", (p) => setVoiceDownloadPct(p.percent ?? 0));
     gw.on("voice.transcript", (p) => {
@@ -549,6 +637,15 @@ export function App({ mock = false }: { mock?: boolean }) {
     };
   }, []);
 
+  // 打开设置菜单时刷新浏览器 LLM 开关状态
+  useEffect(() => {
+    if (!settingsOpen) return;
+    gatewayRef.current
+      ?.call("browser_llm.get_status", {})
+      .then(setBrowserLlm)
+      .catch(() => setBrowserLlm(null));
+  }, [settingsOpen]);
+
   const quit = () => {
     setMouseEnabled(false);
     gatewayRef.current?.stop();
@@ -562,6 +659,31 @@ export function App({ mock = false }: { mock?: boolean }) {
       .catch(() => { /* best effort */ });
     setConfirmQueue((prev) => prev.slice(1));
     setConfirmSel(0);
+  };
+
+  // AskUser 提问应答：单问=选中的 label 或自填；向导=JSON({answers:[...]})
+  const answerQuestion = (req: UserQuestionRequest, answer: string) => {
+    gatewayRef.current
+      ?.call("agent.user_question_response", { request_id: req.request_id, answer })
+      .catch(() => { /* best effort */ });
+    setQuestionQueue((prev) => prev.slice(1));
+    setQuestionSel(0);
+    setQuestionInputMode(false);
+    setQuestionDraft("");
+    setQuestionAnswers({});
+    setQuestionPage(0);
+  };
+
+  // 向导问卷：按当前勾选状态组装答案并提交（未作答单选=null，多选=[]）
+  const submitBatchAnswers = (req: UserQuestionRequest) => {
+    const answers = req.questions.map((q, qi) => {
+      const ans = questionAnswers[qi];
+      if (q.multi_select) {
+        return { question: q.question, answer: Array.isArray(ans) ? ans : [] };
+      }
+      return { question: q.question, answer: typeof ans === "string" ? ans : null };
+    });
+    answerQuestion(req, JSON.stringify({ answers }));
   };
 
   const clearAll = () => {
@@ -626,6 +748,22 @@ export function App({ mock = false }: { mock?: boolean }) {
         }));
       })
       .catch(() => setModelStatus(null));
+  };
+
+  // 浏览器 LLM 抽取开关：切换后 Gateway 会重连 browser-use MCP server
+  const toggleBrowserLlm = () => {
+    if (browserLlmBusy) return;
+    const next = !(browserLlm?.enabled ?? false);
+    setBrowserLlmBusy(true);
+    showStatic(next ? "正在开启浏览器 LLM 抽取…" : "正在关闭…", "info");
+    gatewayRef.current
+      ?.call("browser_llm.set_config", { enabled: next })
+      .then((r) => {
+        setBrowserLlm({ enabled: r.enabled, model: r.model, base_url: r.base_url });
+        showStatic(r.message || (r.success ? "已切换" : "切换失败"), r.success ? "success" : "error");
+      })
+      .catch((e) => showStatic(`浏览器 LLM 切换失败: ${String(e)}`, "error"))
+      .finally(() => setBrowserLlmBusy(false));
   };
 
   const saveModelConfig = () => {
@@ -757,6 +895,70 @@ export function App({ mock = false }: { mock?: boolean }) {
       if (key.escape) { answerConfirm(cur, false); return; }
       return; // 其余按键吞掉
     }
+    // ── AskUser 提问面板（同级模态）──
+    if (questionQueue.length > 0) {
+      const cur = questionQueue[0];
+      if (isBatchQuestion(cur)) {
+        // 向导问卷：一页一题。←→ 切题；↑↓ 选项；单选 Enter/空格=选中并下一题；
+        // 多选 空格=勾选（停留）、Enter=下一题；末题 Enter=提交全部
+        const pageQ = cur.questions[questionPage];
+        const optCount = pageQ ? pageQ.options.length : 0;
+        const isLast = questionPage === cur.questions.length - 1;
+
+        const advance = () => {
+          if (isLast) { submitBatchAnswers(cur); return; }
+          setQuestionPage((p) => Math.min(cur.questions.length - 1, p + 1));
+          setQuestionSel(0);
+        };
+
+        if (key.leftArrow) {
+          if (questionPage > 0) { setQuestionPage((p) => p - 1); setQuestionSel(0); }
+          return;
+        }
+        if (key.rightArrow) { advance(); return; }
+        if (key.upArrow) { setQuestionSel((v) => Math.max(0, v - 1)); return; }
+        if (key.downArrow) { setQuestionSel((v) => Math.min(optCount - 1, v + 1)); return; }
+        if (key.return || (input === " " && !key.ctrl && !key.meta)) {
+          const label = pageQ?.options[questionSel]?.label ?? "";
+          if (!label) return;
+          if (pageQ.multi_select) {
+            if (key.return) { advance(); return; } // Enter=下一题（空格继续走勾选）
+            setQuestionAnswers((prev) => {
+              const arr = Array.isArray(prev[questionPage]) ? [...(prev[questionPage] as string[])] : [];
+              const i = arr.indexOf(label);
+              if (i >= 0) arr.splice(i, 1); else arr.push(label);
+              return { ...prev, [questionPage]: arr };
+            });
+            return;
+          }
+          // 单选：选中并前进
+          setQuestionAnswers((prev) => ({ ...prev, [questionPage]: label }));
+          advance();
+          return;
+        }
+        if (key.escape) {
+          // 取消全部：所有题作答为 null 提交，模型按默认方案继续
+          const answers = cur.questions.map((q) => ({ question: q.question, answer: null }));
+          answerQuestion(cur, JSON.stringify({ answers }));
+          return;
+        }
+        return; // 其余按键吞掉
+      }
+      if (questionInputMode) {
+        // 输入模式：字符/Enter 由 TextInput 处理，Esc 返回选项
+        if (key.escape) { setQuestionInputMode(false); return; }
+        return;
+      }
+      if (key.upArrow) { setQuestionSel((v) => Math.max(0, v - 1)); return; }
+      if (key.downArrow) { setQuestionSel((v) => Math.min(customIndex(cur), v + 1)); return; }
+      if (key.return) {
+        if (questionSel === customIndex(cur)) { setQuestionInputMode(true); return; }
+        answerQuestion(cur, cur.questions[0]?.options[questionSel]?.label ?? "");
+        return;
+      }
+      if (key.escape) { answerQuestion(cur, "（用户取消了本次选择，请按最合理的默认方案继续）"); return; }
+      return; // 其余按键吞掉
+    }
     // ── 模型设置面板 ──
     if (modelOpen) {
       const histLen = modelStatus?.history?.length ?? 0;
@@ -775,11 +977,15 @@ export function App({ mock = false }: { mock?: boolean }) {
       return; // 字符/Enter 由选中字段的 TextInput 处理
     }
     // ── 设置菜单 ──
+
     if (settingsOpen) {
-      if (key.upArrow || key.downArrow) { setSettingsSel((v) => (v === 0 ? 1 : 0)); return; }
+      if (key.upArrow) { setSettingsSel((v) => Math.max(0, v - 1)); return; }
+      if (key.downArrow) { setSettingsSel((v) => Math.min(3, v + 1)); return; }
       if (key.return) {
         if (settingsSel === 0) openModelPanel();
-        else openVoicePanel();
+        else if (settingsSel === 1) openVoicePanel();
+        else if (settingsSel === 2) toggleBrowserLlm();
+        else { setSettingsOpen(false); setScreen("channels"); }
         return;
       }
       if (key.escape) { setSettingsOpen(false); return; }
@@ -949,6 +1155,13 @@ export function App({ mock = false }: { mock?: boolean }) {
           })
           .catch((e) => add({ kind: "error", text: `Compact failed: ${e}` }));
         return true;
+      case "/upgrade":
+        gw?.call("agent.upgrade", { session_id: SESSION_ID })
+          .then((r) => {
+            if (r?.queued) add({ kind: "system", text: "Upgrade flow started — gathering info, will ask for confirmation" });
+          })
+          .catch((e) => add({ kind: "error", text: `Upgrade failed: ${e}` }));
+        return true;
       case "/copy": {
         const last = lastAssistantRef.current;
         if (!last) {
@@ -988,6 +1201,16 @@ export function App({ mock = false }: { mock?: boolean }) {
       case "/prompt-cache":
         setScreen("promptcache");
         return true;
+      case "/tools": {
+        setScreen("tools");
+        setToolsError(null);
+        setToolsLoading(true);
+        gw?.call("tools.list", {})
+          .then((r) => setToolList(Array.isArray(r?.tools) ? r.tools : []))
+          .catch((e) => setToolsError(String(e)))
+          .finally(() => setToolsLoading(false));
+        return true;
+      }
       case "/config":
         setScreen("config");
         return true;
@@ -1076,12 +1299,18 @@ export function App({ mock = false }: { mock?: boolean }) {
   const pinnedRows = screen === null && scroll.pinned ? 1 : 0;
   const panelRows = screen === null && detailData ? TOOL_PANEL_ROWS : 0;
   const bgRows = screen === null ? bgTasks.length : 0;
+  const taskRows = screen === null && taskList.length > 0 ? taskList.length + 1 : 0; // +1 标题行
   const livePanelRows = screen === null && liveOutputToolId ? LIVE_PANEL_ROWS : 0;
   const confirmRows = screen === null && confirmQueue.length > 0 ? CONFIRM_PANEL_ROWS : 0;
+  const questionRows = screen === null && questionQueue.length > 0 ? QUESTION_PANEL_ROWS : 0;
   const voiceRows = screen === null && voiceOpen ? VOICE_PANEL_ROWS : 0;
   const modelRows = screen === null && modelOpen ? modelPanelRows(modelStatus?.history?.length ?? 0) : 0;
-  const settingsRows = screen === null && settingsOpen ? 5 : 0; // 设置菜单：标题 + 2 选项 + 空行 + footer
-  const bottomRows = liveRows + subBarRows + suggRows + panelRows + pinnedRows + bgRows + livePanelRows + confirmRows + voiceRows + modelRows + settingsRows + 5; // +5: StatusBar + InputBar(3行) + Settings 行
+  const settingsRows = screen === null && settingsOpen ? 7 : 0; // 设置菜单：标题 + 4 选项 + 空行 + footer
+  // 输入框纵向展开：内容宽 = 总宽 - 边框2 - paddingX2 - 提示符"❯ "2；行数随折行增长
+  const inputContentW = Math.max(1, width - 6);
+  const inputLines = wrapAnsi(inputValue || " ", inputContentW, { hard: true, trim: false }).split("\n").length;
+  const inputBarRows = inputLines + 2; // +2 上下边框
+  const bottomRows = liveRows + subBarRows + suggRows + panelRows + pinnedRows + bgRows + taskRows + livePanelRows + confirmRows + questionRows + voiceRows + modelRows + settingsRows + 1 + inputBarRows + 1; // StatusBar(1) + InputBar(动态) + Settings 行(1)
   const topOffset = screen === null && voiceIndicator ? 1 : 0;
   const viewH = Math.max(3, termRows - bottomRows - topOffset);
 
@@ -1281,8 +1510,8 @@ export function App({ mock = false }: { mock?: boolean }) {
   return (
     <Box flexDirection="column">
       {screen === null && voiceIndicator && (
-        <Box justifyContent="flex-end" paddingX={1}>
-          <Text color="magenta" bold>{voiceIndicator}</Text>
+        <Box justifyContent="flex-end" paddingX={1} height={1} overflow="hidden">
+          <Text color="magenta" bold wrap="truncate">{voiceIndicator}</Text>
         </Box>
       )}
       {screen === null && (
@@ -1309,7 +1538,7 @@ export function App({ mock = false }: { mock?: boolean }) {
       {screen === null && liveTools.length > 0 && (
         <Box flexDirection="column">
           {liveTools.map((t) => (
-            <Text key={t.callId} color="magenta">
+            <Text key={t.callId} color="magenta" wrap="truncate">
               <Spinner type="dots" /> {t.tool}<Text dimColor>({t.args})</Text>
               {liveOutputToolId === t.callId
                 ? <Text color="cyan">  ▼ 实时输出</Text>
@@ -1365,13 +1594,30 @@ export function App({ mock = false }: { mock?: boolean }) {
         );
       })()}
       {screen === null && <BgTaskBar tasks={bgTasks} onCancel={cancelBgTask} />}
+      {screen === null && <CheckpointBar status={checkpoint} />}
+      {screen === null && <TaskBar tasks={taskList} />}
       {screen === null && confirmQueue.length > 0 && (
         <ConfirmDialog req={confirmQueue[0]} selIndex={confirmSel} />
+      )}
+      {screen === null && questionQueue.length > 0 && (
+        <QuestionDialog
+          req={questionQueue[0]}
+          selIndex={questionSel}
+          inputMode={questionInputMode}
+          draft={questionDraft}
+          onDraftChange={setQuestionDraft}
+          answers={questionAnswers}
+          page={questionPage}
+          onDraftSubmit={(v) => {
+            const cur = questionQueue[0];
+            if (cur && v.trim()) answerQuestion(cur, v.trim());
+          }}
+        />
       )}
       {screen === null && settingsOpen && (
         <Box
           flexDirection="column"
-          height={5}
+          height={7}
           borderStyle="round"
           borderColor="cyan"
           backgroundColor="#1c1e2b"
@@ -1386,8 +1632,16 @@ export function App({ mock = false }: { mock?: boolean }) {
           <Text backgroundColor="#1c1e2b">
             <Text color={settingsSel === 1 ? "cyan" : "white"} bold={settingsSel === 1}>{settingsSel === 1 ? "› " : "  "}🎤 语音识别</Text>
           </Text>
+          <Text backgroundColor="#1c1e2b">
+            <Text color={settingsSel === 2 ? "cyan" : "white"} bold={settingsSel === 2}>{settingsSel === 2 ? "› " : "  "}🌐 浏览器 LLM 抽取</Text>
+            <Text dimColor>{browserLlmBusy ? "  切换中…" : browserLlm?.enabled ? "  [已开启]" : "  [已关闭]"}</Text>
+          </Text>
+          <Text backgroundColor="#1c1e2b">
+            <Text color={settingsSel === 3 ? "cyan" : "white"} bold={settingsSel === 3}>{settingsSel === 3 ? "› " : "  "}📡 通道管理</Text>
+            <Text dimColor>  sessions[].channels</Text>
+          </Text>
           <Text backgroundColor="#1c1e2b"> </Text>
-          <Text dimColor backgroundColor="#1c1e2b">↑↓ 选择 · Enter 进入 · Esc 关闭</Text>
+          <Text dimColor backgroundColor="#1c1e2b">↑↓ 选择 · Enter 进入/切换 · Esc 关闭</Text>
         </Box>
       )}
       {screen === null && modelOpen && (
@@ -1459,6 +1713,19 @@ export function App({ mock = false }: { mock?: boolean }) {
         onClose={() => setScreen(null)}
         onSave={saveConfig}
         onResult={(msg) => addRef.current({ kind: "system", text: msg })}
+      />
+      <ChannelsEditorScreen
+        active={screen === "channels"}
+        onClose={() => setScreen(null)}
+        onSave={saveConfig}
+        onResult={(msg) => addRef.current({ kind: "system", text: msg })}
+      />
+      <ToolsScreen
+        active={screen === "tools"}
+        tools={toolList}
+        loading={toolsLoading}
+        error={toolsError}
+        onClose={() => setScreen(null)}
       />
     </Box>
   );

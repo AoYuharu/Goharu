@@ -1,0 +1,32 @@
+# Goharu agent 的 SWE/DGM 容器镜像(瘦身版:裁掉 embedding/torch/pywin32/文档解析)
+# 构建(在 Goharu 仓库根目录):docker build -f Dockerfile.swe -t goharu-swe .
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /goharu
+
+# 最小运行依赖:Agent Loop + Tools + anthropic/openai 端点
+# 容器无法访问 pypi 镜像(网络限制),轮子由宿主预下载后离线安装
+COPY docker_wheels/ /tmp/wheels/
+RUN pip install --no-cache-dir --no-index --find-links=/tmp/wheels \
+    pyyaml python-dotenv "anthropic==0.95.0" "openai==2.30.0" "requests>=2.31.0" pytest \
+    && rm -rf /tmp/wheels
+
+# 只拷贝无头 agent 必需的目录(Memory/Gateway/tui-ts/Skills 等一律不带)
+COPY Agent/ Agent/
+COPY Core/ Core/
+COPY Tools/ Tools/
+COPY Prompting/ Prompting/
+COPY prompts/ prompts/
+COPY config.yaml configurationLoader.py swe_headless_agent.py ./
+
+# 让 /goharu 自身成为 git 仓库:自我改进时 base_commit 即此 commit,
+# agent 对自己的修改以 git diff 形式产出(对齐 DGM patch 基因型语义)
+RUN git init -q \
+    && git -c user.name='goharu' -c user.email='goharu@local' add --all \
+    && git -c user.name='goharu' -c user.email='goharu@local' commit -qm 'goharu baseline' \
+    && git config --global --add safe.directory /goharu
+
+CMD ["tail", "-f", "/dev/null"]

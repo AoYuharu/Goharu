@@ -1,0 +1,6 @@
+sherpa-onnx
+pypinyin
+numpy
+# 麦克风采集：Linux 用系统 arecord（无需安装）；
+# Windows/macOS 需要 sounddevice（取消下行注释）
+# sounddevice

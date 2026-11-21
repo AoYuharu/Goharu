@@ -11,7 +11,9 @@ function readConfig(): Record<string, unknown> {
   const p = path.join(PROJECT_ROOT, "config.yaml");
   if (!existsSync(p)) return {};
   try {
-    return (YAML.parse(readFileSync(p, "utf8")) as Record<string, unknown>) ?? {};
+    // uniqueKeys:false 与 Python yaml 的容忍行为对齐（重复键后者生效）
+    const parsed = YAML.parse(readFileSync(p, "utf8"), { uniqueKeys: false });
+    return (parsed as Record<string, unknown>) ?? {};
   } catch {
     return {};
   }

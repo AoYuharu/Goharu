@@ -94,7 +94,6 @@ Goharu/
 │   │   ├── pdf_tools.py      #   PDF 解析（含 OCR）
 │   │   ├── agent_delegate.py #   子 Agent 委托
 │   │   ├── skill_tool.py     #   预制技能 SOP 加载
-│   │   ├── snip_tool.py      #   按 ID 引用历史消息
 │   │   └── glob_tool.py      #   Glob 文件搜索
 │   ├── security.py           #   命令安全检查器
 │   └── registry.py           #   工具注册表单例
@@ -276,7 +275,6 @@ Goharu/
 │   │   ├── pdf_tools.py      #   PDF parsing with OCR
 │   │   ├── agent_delegate.py #   Sub-agent delegation
 │   │   ├── skill_tool.py     #   Pre-built skill SOPs
-│   │   ├── snip_tool.py      #   Reference past messages by ID
 │   │   └── glob_tool.py      #   Glob file search
 │   ├── security.py           #   Command safety checker
 │   └── registry.py           #   Tool registry singleton

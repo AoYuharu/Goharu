@@ -1,12 +1,25 @@
 from pathlib import Path
 
-from configurationLoader import config
 from Core.PromptSection import PromptSection
+
+try:
+    from configurationLoader import config as _global_config
+except Exception:  # 独立使用 Prompting 包时宿主没有 configurationLoader
+    _global_config = None
+
+
+class _EmptyConfig:
+    """无配置文件时的空配置：一切取值走默认值，路径基准为当前目录。"""
+
+    path = "./config.yaml"
+
+    def get(self, key, default=None):
+        return default
 
 
 class PromptLoader:
     def __init__(self, config_obj=None):
-        self.config = config_obj or config
+        self.config = config_obj or _global_config or _EmptyConfig()
         self.base_dir = Path(getattr(self.config, "path", "./config.yaml")).resolve().parent
 
     @staticmethod
@@ -36,8 +49,12 @@ class PromptLoader:
             # 主 Actor 提示词附加当前运行环境（OS/Shell/可用命令），
             # 避免模型生成错配系统的 shell 命令
             if key == "actor" and i == len(paths) - 1:
-                from Tools.platform_utils import get_environment_hint
-                content = content + "\n\n" + get_environment_hint()
+                try:
+                    from Tools.platform_utils import get_environment_hint
+                    content = content + "\n\n" + get_environment_hint()
+                except ImportError:
+                    # 独立使用 Prompting 包时无 Tools 依赖：跳过环境便利贴
+                    pass
             kwargs = dict(
                 kind="system",
                 title=path.stem,

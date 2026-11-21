@@ -14,16 +14,22 @@ class LLMCore:
     _instance = None
     _initialized = False
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+    def __new__(cls, llm_config=None):
+        # 无参：进程级单例（Goharu 全局配置）；传入 llm_config dict：独立实例
+        if llm_config is None:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
+        return super().__new__(cls)
 
-    def __init__(self):
-        if self.__class__._initialized:
-            return
-
-        self.llm_config = config.get("model.large-language-model", {}) or {}
+    def __init__(self, llm_config=None):
+        if llm_config is None:
+            if self.__class__._initialized:
+                return
+            self.llm_config = config.get("model.large-language-model", {}) or {}
+        else:
+            # 独立实例：直接使用注入配置，不读全局 config，不碰单例状态
+            self.llm_config = dict(llm_config)
         configured_provider = self.llm_config.get("provider", "auto")
         self._last_thinking = None
         self._last_usage = None
@@ -32,20 +38,27 @@ class LLMCore:
             self.provider, self.client = resolve_provider(configured_provider, self.llm_config)
             self.provider_name = self.provider.name
         except Exception:
-            self.__class__._instance = None
+            if llm_config is None:
+                self.__class__._instance = None
             raise
 
-        self.__class__._initialized = True
+        if llm_config is None:
+            self.__class__._initialized = True
         logger.info("LLM provider resolved: %s (configured: %s)", self.provider_name, configured_provider)
 
-    def reload(self):
+    def reload(self, new_llm_config=None):
         """热重载 provider/client（模型切换后立即生效，无需重启）。
 
-        重新读取 config.yaml 的 model.large-language-model 配置并重建 provider 与 client。
-        失败时保留旧配置，返回 (False, 错误信息)，不影响正在运行的服务。
+        默认重新读取 config.yaml 的 model.large-language-model 配置；独立实例
+        （create_llm 创建）可传入新配置 dict。失败时保留旧配置，返回
+        (False, 错误信息)，不影响正在运行的服务。
         """
         try:
-            new_config = config.get("model.large-language-model", {}) or {}
+            new_config = (
+                dict(new_llm_config)
+                if new_llm_config is not None
+                else (config.get("model.large-language-model", {}) or {})
+            )
             configured_provider = new_config.get("provider", "auto")
             provider, client = resolve_provider(configured_provider, new_config)
         except Exception as e:
@@ -87,7 +100,7 @@ class LLMCore:
         return stripped
 
     def get_token_size(self, text):
-        from Agent.TokenEstimator import TokenEstimator
+        from Core.TokenEstimator import TokenEstimator
         return TokenEstimator().estimate(text)
 
     @staticmethod
@@ -165,6 +178,7 @@ class LLMCore:
         )
         try:
             max_api_retries = int(self.llm_config.get("max_retries", 10))
+            max_total_seconds = float(self.llm_config.get("max_total_seconds", 300))
             max_empty_retries = 1
             api_attempt = 0
             empty_retries = 0
@@ -191,6 +205,12 @@ class LLMCore:
                             f"{api_attempt}/{max_api_retries} 退避 {backoff}s 错误={type(api_error).__name__}",
                             level=2,
                         )
+                        if _time_module.time() - t_start > max_total_seconds:
+                            logger.warning(
+                                "API retry aborted: total budget %.0fs exceeded, giving up after %d attempts: %s",
+                                max_total_seconds, api_attempt, type(api_error).__name__,
+                            )
+                            raise api_error
                         _time_module.sleep(backoff)
                         if on_retry is not None:
                             try:

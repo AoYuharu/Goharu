@@ -22,6 +22,77 @@ def _pretty_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
+# ── 通用自然语言渲染（所有未登记模板的工具的统一兜底） ─────────────────────
+
+# 这些键通常承载"主正文"，优先直出，其余字段作为补充说明
+_BODY_KEYS = ("message", "result", "content", "text", "summary", "output", "answer")
+
+
+def _scalar_text(value: Any) -> str:
+    """标量值 → 自然语言片段（布尔转中文，避免 True/False 的刻板感）。"""
+    if value is None:
+        return "无"
+    if value is True:
+        return "是"
+    if value is False:
+        return "否"
+    return str(value)
+
+
+def _render_block(value: Any, depth: int = 0) -> str:
+    """把 dict/list 递归渲染成缩进的自然语言行，不用 JSON 括号和引号。"""
+    pad = "  " * depth
+    if isinstance(value, dict):
+        lines = []
+        for key, val in value.items():
+            if val is None or val == "" or val == [] or val == {}:
+                continue
+            if isinstance(val, (dict, list)):
+                lines.append(f"{pad}{key}：")
+                lines.append(_render_block(val, depth + 1))
+            else:
+                lines.append(f"{pad}{key}：{_scalar_text(val)}")
+        return "\n".join(lines)
+    if isinstance(value, list):
+        lines = []
+        for item in value:
+            if isinstance(item, (dict, list)):
+                lines.append(f"{pad}-")
+                lines.append(_render_block(item, depth + 1))
+            else:
+                lines.append(f"{pad}- {_scalar_text(item)}")
+        return "\n".join(lines)
+    return f"{pad}{_scalar_text(value)}"
+
+
+def _fmt_generic(tool_name: str, data: dict) -> str:
+    """通用模板：任意工具返回的 JSON → 模型易读的自然语言文本。
+
+    规则：
+    1. 有主正文字段（message/result/content/text/...）→ 直出正文，
+       其余字段作为补充说明
+    2. 否则逐字段渲染，嵌套结构缩进展开，列表用「-」分点
+    3. 全空 → 明确说"执行完成，无返回内容"
+    """
+    body_key = next((k for k in _BODY_KEYS if k in data and data[k] not in (None, "", [], {})), None)
+    parts = []
+    if body_key:
+        body = data[body_key]
+        parts.append(body if isinstance(body, str) else _render_block(body))
+        rest = {k: v for k, v in data.items() if k != body_key}
+    else:
+        rest = data
+
+    if rest:
+        rendered = _render_block(rest)
+        if rendered:
+            parts.append(rendered)
+
+    if not parts:
+        return f"{tool_name} 执行完成，没有返回内容。"
+    return "\n".join(parts)
+
+
 def _error_text(data: dict) -> str:
     """统一错误渲染：❌ + 错误信息 + 可选 hint/path 等附加字段"""
     lines = [f"❌ 错误：{data.get('error')}"]
@@ -133,10 +204,10 @@ _FORMATTERS: dict[str, Callable[[dict], str]] = {
 def format_tool_result(tool_name: str, raw: Any) -> str:
     """map 工序：handler 返回值 → 模型可读文本。
 
-    - 非 JSON 字符串（Sleep、background_status 等本身就是人话）→ 原样放行
+    - 非 JSON 字符串（Sleep、inspect 等本身就是人话/标签语言）→ 原样放行
     - JSON 含 error 字段 → 统一错误渲染
     - 有专属模板 → 用模板
-    - 其余 → 美化 JSON（兜底，不丢数据）
+    - 其余 → 通用自然语言模板（不丢数据，嵌套结构缩进展开）
     """
     if not isinstance(raw, str):
         raw = str(raw)
@@ -154,7 +225,7 @@ def format_tool_result(tool_name: str, raw: Any) -> str:
 
     formatter = _FORMATTERS.get(tool_name)
     if formatter is None:
-        return _pretty_json(data)
+        return _fmt_generic(tool_name, data)
 
     try:
         return formatter(data)

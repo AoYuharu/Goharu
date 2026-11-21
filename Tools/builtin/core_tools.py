@@ -65,9 +65,14 @@ async def run_cmd(cmd: str, description: str = "") -> str:
             }, ensure_ascii=False)
         # 用户批准 → 继续执行
 
-    # 检测 echo 命令用于文件操作
-    # 匹配: echo ... > file, echo ... >> file
-    if re.search(r'\becho\b.*?(?:>>?)\s*\S+', cmd_lower):
+    # 检测 echo 命令用于文件操作：echo ... > file / >> file
+    # 三个精度要求（2026-10-16 误拦事故：echo 当分隔符 + 2>/dev/null 被误判成写文件）：
+    # 1) echo 与重定向必须同属一个简单命令（不跨 ; | && 边界）——
+    #    `ls 2>/dev/null; echo "---"; find 2>/dev/null` 里 echo 只是输出分隔符
+    # 2) > /dev/null 是丢弃输出不是写文件，放行
+    # 3) 先剥掉引号段，防止引号内的 "echo >" 字样误报
+    _cmd_stripped = re.sub(r'"[^"]*"|\'[^\']*\'', '', cmd_lower)
+    if re.search(r'\becho\b[^;|&]*(?:>>?)\s*(?!/dev/null\b)\S+', _cmd_stripped):
         return json.dumps({"error": """File operation with 'echo' is not allowed.
 
 You attempted to use 'echo' for file operations, which is prohibited.
@@ -80,6 +85,8 @@ Please use the dedicated tools instead:
   Example:
   1. {"tool": "Read", "arguments": {"path": "file.txt"}}
   2. {"tool": "Edit", "arguments": {"path": "file.txt", "old_string": "old text", "new_string": "new text"}}
+
+(Note: `echo ... > /dev/null`, and echo used as an output separator between sub-commands, are allowed.)
 
 These tools are safer, provide better error handling, and ensure you know what you're changing.
 DO NOT retry with run_cmd. Use the dedicated tools."""}, ensure_ascii=False)
@@ -140,7 +147,17 @@ DO NOT retry with run_cmd. Use Read + Edit instead."""}, ensure_ascii=False)
             # killpg(getpgid(pid)) 会把 agent 自己所在的进程组一起杀掉
             start_new_session=not is_windows(),
         )
-        tool_process_tracker.register(p.pid)
+        # 显式后台化的任务不进 ESC 可杀名单——后台任务按设计可长期运行，
+        # 用户想停用 TUI 的 [x]（cancel_task 精确点杀）；ESC 只杀前台步骤
+        # （2026-10-15 事故：ESC 无差别 kill_all 屠杀了合法后台 du 任务）
+        _tracked_now = False
+        try:
+            from Tools.background_tasks import BackgroundTaskManager
+            _tracked_now = BackgroundTaskManager().is_tracked(asyncio.current_task())
+        except Exception:
+            _tracked_now = False
+        if not _tracked_now:
+            tool_process_tracker.register(p.pid)
         if not sandbox.attach(p):
             tool_process_tracker.unregister(p.pid)
             sandbox.close()
@@ -173,10 +190,13 @@ DO NOT retry with run_cmd. Use Read + Edit instead."""}, ensure_ascii=False)
             #（显式 run_background 或超时自动提升），进程豁免该超时——
             # 服务器/守护进程不应被定时器杀死（否则会出现"宣布启动成功后
             # 进程悄悄被杀"的事故）。
-            from Agent.BackgroundTaskManager import BackgroundTaskManager
+            from Tools.background_tasks import BackgroundTaskManager
             deadline = time.monotonic() + FOREGROUND_CMD_TIMEOUT_S
             while True:
                 tracked = BackgroundTaskManager().is_tracked(asyncio.current_task())
+                if tracked:
+                    # 超时自动转后台的瞬间（此刻才被 track），从 ESC 可杀名单移出
+                    tool_process_tracker.unregister(p.pid)
                 slice_s = 30.0 if tracked else max(0.1, min(30.0, deadline - time.monotonic()))
                 try:
                     await asyncio.to_thread(p.wait, slice_s)
@@ -316,7 +336,7 @@ def background_status() -> str:
     - Pending tasks: completed tasks awaiting result injection
     - Reactivation count
     """
-    from Agent.BackgroundTaskManager import BackgroundTaskManager
+    from Tools.background_tasks import BackgroundTaskManager
     return BackgroundTaskManager().get_detailed_status()
 
 

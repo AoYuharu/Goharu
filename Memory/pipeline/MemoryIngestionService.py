@@ -53,6 +53,21 @@ class MemoryIngestionService:
             self.l0_repo.mark_turn_pipeline_state(turn_id, "atoms_ready")
         return heuristic_atoms
 
+    def store_manual_atom(self, atom, source_turn_id=None):
+        """模型主动写入单个原子（memory_add 工具路径）。
+
+        与 ingest_turn_atoms 的区别：不触碰 turn 的 pipeline_state——
+        主动写入不影响 PipelineManager 对该 turn 的自动 L1 提取。
+        仍走同一套 n-gram 去重 + embedding 索引。
+        """
+        stored = self._store_atom(int(source_turn_id) if source_turn_id else 0, atom)
+        if stored is not None:
+            logger.info(
+                "L1 manual atom stored: id=%s type=%s subject=%s",
+                stored.get("id"), stored.get("atom_type"), stored.get("subject"),
+            )
+        return stored
+
     def _store_atom(self, turn_id, atom):
         if not isinstance(atom, dict):
             return None

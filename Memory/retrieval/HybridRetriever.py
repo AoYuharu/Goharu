@@ -8,21 +8,19 @@ from Memory.MemoryDB import MemoryDB
 from Memory.memory_config import resolve_config
 from Memory.repositories.L1Repository import L1Repository
 from Memory.repositories.L2Repository import L2Repository
-from Memory.repositories.L3Repository import L3Repository
 from Memory.retrieval.EmbeddingService import EmbeddingService
 from Memory.retrieval.BM25Encoder import BM25Encoder
 from Memory.retrieval.RerankerService import RerankerService
 
 
 class HybridRetriever:
-    def __init__(self, db=None, l1_repo=None, l2_repo=None, l3_repo=None,
+    def __init__(self, db=None, l1_repo=None, l2_repo=None,
                  embedding_service=None, reranker=None, bm25_encoder=None,
                  scene_file_manager=None, persona_generator=None, cfg=None):
         cfg = resolve_config(cfg)
         self.db = db or MemoryDB(cfg=cfg)
         self.l1_repo = l1_repo or L1Repository(self.db)
         self.l2_repo = l2_repo or L2Repository(self.db)
-        self.l3_repo = l3_repo or L3Repository(self.db)
         self.embedding_service = embedding_service or EmbeddingService(self.db, cfg=cfg)
         self.bm25 = bm25_encoder or BM25Encoder()
         self.reranker = reranker or RerankerService(cfg=cfg)
@@ -54,6 +52,8 @@ class HybridRetriever:
         return self._persona_generator
 
     def retrieve(self, query, top_k=None):
+        from Core.timing import timeit
+
         query = str(query or "").strip()
         final_k = int(top_k or self.final_k)
         if not query:
@@ -61,49 +61,71 @@ class HybridRetriever:
 
         candidate_lists = []
 
-        fts_candidates = self._fts_search(query, top_k=max(final_k, self.fts_k))
+        with timeit("memory.retrieve.fts"):
+            fts_candidates = self._fts_search(query, top_k=max(final_k, self.fts_k))
         candidate_lists.append(fts_candidates)
 
-        embedding_candidates = self._embedding_search(query, top_k=max(final_k, self.embedding_k))
+        with timeit("memory.retrieve.embedding"):
+            embedding_candidates = self._embedding_search(query, top_k=max(final_k, self.embedding_k))
         candidate_lists.append(embedding_candidates)
 
         if self.bm25_enabled:
-            bm25_candidates = self._bm25_search(query, top_k=max(final_k, self.bm25_k))
+            with timeit("memory.retrieve.bm25"):
+                bm25_candidates = self._bm25_search(query, top_k=max(final_k, self.bm25_k))
             candidate_lists.append(bm25_candidates)
 
-        fused = self._rrf_fuse(candidate_lists)
-        reranked = self.reranker.rerank(query, fused, top_k=final_k)
+        with timeit("memory.retrieve.rrf_rerank"):
+            fused = self._rrf_fuse(candidate_lists)
+            reranked = self.reranker.rerank(query, fused, top_k=final_k)
+
+        with timeit("memory.retrieve.persona"):
+            profile = self._read_persona_compact_summary()
 
         memories = [item for item in reranked if item.get("record_type") == "l1"]
         scenes = [item for item in reranked if item.get("record_type") == "l2"]
         return {
-            "profile_summary": self._read_persona_compact_summary(),
+            "profile_summary": profile,
             "memories": memories[:final_k],
             "scenes": scenes[:final_k],
         }
 
     def _read_persona_compact_summary(self):
-        """从 persona.md 读取精简摘要，fallback 到 SQLite L3。"""
+        """从 persona.md 读取精简摘要；读不到返回空串。"""
         try:
             summary = self.persona_generator.get_persona_summary()
             if summary and summary != "(empty persona)":
                 return summary
         except Exception:
             pass
-        return self.l3_repo.build_compact_summary()
+        return ""
 
     def build_query_from_messages(self, messages):
-        relevant = list(messages or [])[-self.default_query_window :]
-        parts = []
-        for item in relevant:
-            content = item.get("content", "")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        parts.append(str(block.get("text") or block.get("content") or ""))
-            else:
-                parts.append(str(content))
-        return "\n".join(part for part in parts if part).strip()
+        # 仅取最近的 user 角色文本（用户实际发出的内容），
+        # 跳过 assistant 回复与工具结果，避免它们主导检索方向。
+        user_texts = []
+        for item in reversed(list(messages or [])):
+            if (item.get("role") or "").strip() != "user":
+                continue
+            text = self._extract_message_text(item)
+            if text:
+                user_texts.append(text)
+                if len(user_texts) >= self.default_query_window:
+                    break
+        user_texts.reverse()  # 恢复时间正序
+        return "\n".join(user_texts).strip()
+
+    @staticmethod
+    def _extract_message_text(item):
+        content = item.get("content", "")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text") or ""))
+            return "\n".join(p for p in parts if p).strip()
+        return ""
 
     # FTS5 空格分词做隐式 AND，中文功能词（的/是/什么…）会导致全句匹配失败，
     # 查询侧分词后过滤掉这些停用词，只保留实义 token。
@@ -148,7 +170,10 @@ class HybridRetriever:
         return candidates
 
     def _embedding_search(self, query, top_k=8):
-        query_vector = self.embedding_service.encode(query, prompt_name="query")
+        from Core.timing import timeit
+
+        with timeit("memory.retrieve.embedding.encode"):
+            query_vector = self.embedding_service.encode(query, prompt_name="query")
         if not query_vector:
             return []
         rows = self.db.query_all(
@@ -169,13 +194,14 @@ class HybridRetriever:
             scored.append((similarity, row["source_table"], row["source_id"]))
         scored.sort(key=lambda item: item[0], reverse=True)
         results = []
-        for rank, (similarity, source_table, source_id) in enumerate(scored[: int(top_k)], start=1):
-            candidate = self._hydrate_candidate(source_table, source_id)
-            if candidate is None:
-                continue
-            candidate["embedding_similarity"] = similarity
-            candidate["embedding_rank"] = rank
-            results.append(candidate)
+        with timeit("memory.retrieve.embedding.hydrate"):
+            for rank, (similarity, source_table, source_id) in enumerate(scored[: int(top_k)], start=1):
+                candidate = self._hydrate_candidate(source_table, source_id)
+                if candidate is None:
+                    continue
+                candidate["embedding_similarity"] = similarity
+                candidate["embedding_rank"] = rank
+                results.append(candidate)
         return results
 
     def _bm25_search(self, query, top_k=8):

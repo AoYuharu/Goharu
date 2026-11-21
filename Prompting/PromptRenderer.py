@@ -1,9 +1,31 @@
 import json
 
 from Core.PromptDocument import PromptDocument
+from Core.text_utils import strip_id_prefixes
 
 
 class PromptRenderer:
+    @staticmethod
+    def _strip_assistant_echo_ids(content):
+        """清掉历史 assistant 文本里模型模仿的 [ID:msg_x]/[ID=msg_x] 前缀。
+
+        旧消息在写入时可能已带上模仿前缀（修复前的脏历史）；渲染时统一清掉，
+        避免模型在上下文中不断看到并继续模仿。
+        """
+        if isinstance(content, str):
+            return strip_id_prefixes(content)
+        if isinstance(content, list):
+            cleaned = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = strip_id_prefixes(str(block.get("text", "")))
+                    if not text.strip():
+                        continue
+                    block = {**block, "text": text}
+                cleaned.append(block)
+            return cleaned
+        return content
+
     @staticmethod
     def _stringify_content(content):
         if isinstance(content, str):
@@ -48,16 +70,10 @@ class PromptRenderer:
             content = self._normalize_native_blocks(raw_content)
         else:
             content = self._stringify_content(raw_content).strip()
+        if section.kind == "assistant":
+            content = self._strip_assistant_echo_ids(content)
         if not content and section.kind != "tool_result":
             return None
-
-        msg_id = section.metadata.get("id")
-        if msg_id:
-            if isinstance(content, str):
-                if section.kind not in {"user", "assistant"}:
-                    content = f"[ID:{msg_id}] {content}"
-            elif isinstance(content, list):
-                content = [{"type": "text", "text": f"[ID:{msg_id}] "}] + list(content)
 
         if section.kind in {"system", "user", "assistant"}:
             message = {

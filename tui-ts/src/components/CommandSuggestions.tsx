@@ -15,6 +15,7 @@ export function CommandSuggestions({
       {suggestions.map((cmd, i) => (
         <Text
           key={cmd.name}
+          wrap="truncate"
           backgroundColor={i === selectedIndex ? "blue" : undefined}
           color={i === selectedIndex ? "white" : undefined}
         >

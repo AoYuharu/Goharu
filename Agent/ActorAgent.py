@@ -7,6 +7,12 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
+from Prompting.loop_messages import (
+    build_tool_result_message,
+    sanitize_messages_for_api,
+    truncate_history,
+)
+from Core.text_utils import strip_id_prefixes as _strip_id_prefixes
 from Core.Message import CoreMessage, MessageSource
 from Core.ToolCall import ToolCall
 from Core.LifecycleLog import lifecycle
@@ -22,13 +28,8 @@ from configurationLoader import config
 logger = logging.getLogger(__name__)
 
 # PromptRenderer 会为每条历史消息注入 XML 标签（如 &lt;user_message id="msg_xxx"&gt;），
-# LLM 可能模仿这个格式在输出开头写入同样的 ID 标记。这里用正则剥离这些前缀。
-_ID_PREFIX_PATTERN = re.compile(r'^(\[ID:msg_[a-f0-9]+\]\s*)+')
-
-
-def _strip_id_prefixes(text):
-    """移除 LLM 输出中从 Prompt 上下文模仿的 [ID:xxx] 前缀。"""
-    return _ID_PREFIX_PATTERN.sub('', text)
+# LLM 可能模仿这个格式在输出开头写入同样的 ID 标记。剥离实现收敛在
+# Core/text_utils.py（兼容 [ID:...] / [ID=...] / 全角冒号 / 叠加形式）。
 
 # ── 文本格式工具调用打捞 ──────────────────────────────────────────
 # 部分模型（如 MiniMax）偶发不走原生 tool_use，而是把工具调用写成
@@ -142,13 +143,75 @@ def shutdown_llm_executor(wait=True):
     logger.info("LLM executor shut down")
 
 
+def strip_stale_image_blocks(messages):
+    """把历史消息里的 image 块替换为文本占位符（最新一条 user 消息除外）。
+
+    截图只在捕获后的那一次 LLM 调用中对模型可见；长驻历史会撑爆上下文
+    （每张 ~100KB base64 ≈ 数万 token）。模块级纯函数，可独立测试。
+    """
+    if not messages:
+        return messages
+
+    def _strip(blocks):
+        out = []
+        changed = False
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "image":
+                out.append({"type": "text", "text": "[历史截图已省略]"})
+                changed = True
+            elif isinstance(b, dict) and isinstance(b.get("content"), list):
+                inner, inner_changed = _strip(b["content"])
+                if inner_changed:
+                    nb = dict(b)
+                    nb["content"] = inner
+                    out.append(nb)
+                    changed = True
+                else:
+                    out.append(b)
+            else:
+                out.append(b)
+        return out, changed
+
+    last_user_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if (messages[i].get("role") or "") == "user":
+            last_user_idx = i
+            break
+    for i, msg in enumerate(messages):
+        if i == last_user_idx or not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and (b.get("type") == "image" or isinstance(b.get("content"), list))
+            for b in content
+        ):
+            stripped, changed = _strip(content)
+            if changed:
+                msg["content"] = stripped
+    return messages
+
+
 class ActorAgent(LargeLanguageModel):
-    def __init__(self, tool_runtime, working):
-        super().__init__()
+    def __init__(self, tool_runtime, working, llm=None, document_builder=None,
+                 verify_gate_enabled=True):
+        # llm 注入（独立部署）：结构化接口对象，需提供 query(messages, on_retry, **kwargs)，
+        # 返回带 .content(text/tool_use/thinking 块) 与 .stop_reason 的响应。
+        # 注入时跳过 LLMCore 单例构造（不依赖全局 configurationLoader）。
+        if llm is not None:
+            self.core = None
+        else:
+            super().__init__()
+        self._injected_llm = llm
         self.tool_runtime = tool_runtime
         self.working = working
         self.prompt_assembler = PromptAssembler()
         self.prompt_renderer = PromptRenderer()
+        # document_builder（子代理等宿主注入）：可替换的消息组装策略，
+        # 签名 build(history, tool_definitions) -> list[dict]。None 时走
+        # Goharu 默认组装（PromptAssembler 全家桶：检索/persona/SOUL/git）。
+        self.document_builder = document_builder
+        # verify 闸门只在主代理开启；子代理本身就是验收者/只读，不闸自己
+        self.verify_gate_enabled = verify_gate_enabled
         self.guard = None  # 延迟初始化，等待工具列表加载
         # 记忆检索缓存：只在 turn 开始搜一次，后续 step 复用
         self._retrieval_cache = None
@@ -157,11 +220,24 @@ class ActorAgent(LargeLanguageModel):
         # 渲染时按 id 永久贴回原消息，保证历史前缀跨 turn 逐字节稳定
         # （prompt cache 命中的前提；只贴最新消息会使旧前缀失效）。
         self._memory_contexts = {}
+        # 便利贴节流状态（date_change 上次贴出的日期、技能清单已公告集合），
+        # 跨 turn 复用——与 _memory_contexts 同生命周期
+        self._reminder_state = {}
 
     def reset_retrieval_cache(self):
         """清空记忆检索缓存（Gateway 在每轮 turn 开始时调用，act 是每步级的不能在这重置）。"""
         self._retrieval_done = False
         self._retrieval_cache = None
+
+    def set_plan_mode(self, active: bool):
+        """设置计划模式标志（写 _reminder_state，贯穿到 TurnReminders 的 plan_mode_reminder）。"""
+        self._reminder_state["plan_mode"] = bool(active)
+
+    def query(self, messages, on_retry=None, **kwargs):
+        """LLM 调用入口：注入 llm 时转发，否则走 LLMCore 单例（Goharu 路径）。"""
+        if self._injected_llm is not None:
+            return self._injected_llm.query(messages, on_retry=on_retry, **kwargs)
+        return super().query(messages, on_retry=on_retry, **kwargs)
 
     @staticmethod
     def _stringify_tool_result(result):
@@ -206,7 +282,7 @@ class ActorAgent(LargeLanguageModel):
 
         Called after tool execution, before recording to working memory.
         """
-        from Agent.ToolResultBudget import ToolResultBudget
+        from Core.ToolResultBudget import ToolResultBudget
 
         max_single = config.get("tools.result_budget.max_single_tokens", 8000)
         max_batch = config.get("tools.result_budget.max_batch_tokens", 24000)
@@ -239,135 +315,13 @@ class ActorAgent(LargeLanguageModel):
 
     @staticmethod
     def _truncate_history(history, max_messages):
-        """保留最近 N 条消息，防止上下文随会话无限膨胀。
-
-        截断必须保持 tool_use/tool_result 配对完整：若截断点落在
-        assistant tool_use 与其 user tool_result 之间，首条消息会是
-        孤立的 tool_result（配对的 tool_use 已被截掉），Anthropic API
-        会直接报 400——因此持续丢弃首部的孤立 tool_result 消息。
-        """
-        if max_messages <= 0 or len(history) <= max_messages:
-            return history
-        trimmed = history[-max_messages:]
-        dropped_pairs = 0
-        while trimmed:
-            first = trimmed[0]
-            content = first.get("content") if isinstance(first, dict) else None
-            has_tool_result = isinstance(content, list) and any(
-                isinstance(block, dict) and block.get("type") == "tool_result"
-                for block in content
-            )
-            if not has_tool_result:
-                break
-            trimmed = trimmed[1:]
-            dropped_pairs += 1
-        logger.info(
-            "Context truncation: %d → %d messages (dropped %d orphan tool_result)",
-            len(history), len(trimmed), dropped_pairs,
-        )
-        return trimmed
+        """委托给模块级纯函数 truncate_history（保持内部调用兼容）。"""
+        return truncate_history(history, max_messages)
 
     @staticmethod
     def _sanitize_messages_for_api(messages):
-        """清理不符合 Anthropic API 规则的消息序列。
-
-        API 要求：assistant 的 tool_use 必须被后续 user 的 tool_result 配对；
-        任何孤立的 tool_use 或 tool_result 都会触发 400/2013。
-        这里只修复“配对完整性”，不修改消息语义。
-        """
-        if not messages:
-            return messages
-
-        n = len(messages)
-        keep = [True] * n
-
-        # pending_assistants: assistant 消息索引 -> 未匹配 tool_use_id 集合
-        pending_assistants = {}
-
-        for i, msg in enumerate(messages):
-            role = msg.get("role")
-            content = msg.get("content") or []
-            blocks = content if isinstance(content, list) else []
-
-            if role == "assistant":
-                tool_use_ids = {
-                    block.get("id")
-                    for block in blocks
-                    if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id")
-                }
-                if tool_use_ids:
-                    pending_assistants[i] = tool_use_ids
-            elif role == "user":
-                result_ids = {
-                    block.get("tool_use_id")
-                    for block in blocks
-                    if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id")
-                }
-                if not result_ids:
-                    continue
-
-                # 优先匹配最近一个待处理的 assistant
-                matched_idx = None
-                for idx in sorted(pending_assistants.keys(), reverse=True):
-                    if result_ids.issubset(pending_assistants[idx]):
-                        matched_idx = idx
-                        break
-
-                if matched_idx is not None:
-                    pending_assistants[matched_idx] -= result_ids
-                    if not pending_assistants[matched_idx]:
-                        del pending_assistants[matched_idx]
-                else:
-                    # 孤立的 tool_result：只移除 tool_result 块
-                    non_result_blocks = [
-                        block for block in blocks
-                        if not (isinstance(block, dict) and block.get("type") == "tool_result")
-                    ]
-                    if non_result_blocks:
-                        messages[i]["content"] = non_result_blocks
-                    else:
-                        keep[i] = False
-
-        # 处理仍未完全匹配的 assistant：删除未匹配的 tool_use 块
-        for idx, unmatched_ids in pending_assistants.items():
-            content = messages[idx].get("content") or []
-            blocks = content if isinstance(content, list) else []
-            new_blocks = [
-                block for block in blocks
-                if not (
-                    isinstance(block, dict)
-                    and block.get("type") == "tool_use"
-                    and block.get("id") in unmatched_ids
-                )
-            ]
-            if new_blocks:
-                messages[idx]["content"] = new_blocks
-            else:
-                keep[idx] = False
-
-        cleaned = [msg for i, msg in enumerate(messages) if keep[i]]
-
-        # 防御性处理：如果清理后最前面是尚未配对的 assistant tool_use，直接删除
-        while cleaned:
-            first = cleaned[0]
-            if first.get("role") != "assistant":
-                break
-            content = first.get("content") or []
-            blocks = content if isinstance(content, list) else []
-            has_tool_use = any(
-                isinstance(b, dict) and b.get("type") == "tool_use"
-                for b in blocks
-            )
-            if not has_tool_use:
-                break
-            cleaned.pop(0)
-
-        if len(cleaned) != len(messages):
-            logger.info(
-                "History sanitized for API: %d → %d messages",
-                len(messages), len(cleaned),
-            )
-        return cleaned
+        """委托给模块级纯函数 sanitize_messages_for_api（保持内部调用兼容）。"""
+        return sanitize_messages_for_api(messages)
 
     def build_messages_with_document(self, extra_system_prompt=None):
         tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
@@ -400,6 +354,18 @@ class ActorAgent(LargeLanguageModel):
             int(configurationLoader.config.get("agent.max_context_messages", 0) or 0),
         )
         history = self._sanitize_messages_for_api(history)
+        # 视觉链路：截图只在捕获后的下一次调用可见，历史中的旧截图替换为占位符
+        history = strip_stale_image_blocks(history)
+
+        # persona.md 全文作为静态 system section 注入（断点1之前）；working 是
+        # 结构化接口，get_persona_markdown 可能不存在（独立部署的内存态），hasattr 守卫
+        persona_text = None
+        get_persona = getattr(self.working, "get_persona_markdown", None)
+        if callable(get_persona):
+            try:
+                persona_text = get_persona()
+            except Exception:
+                persona_text = None
 
         with timeit("actor.build.assemble"):
             document = self.prompt_assembler.build_actor_document(
@@ -408,6 +374,8 @@ class ActorAgent(LargeLanguageModel):
                 tool_definitions=tool_definitions,
                 retrieval_pack=retrieval_pack,
                 memory_contexts=self._memory_contexts,
+                persona_text=persona_text,
+                reminder_state=self._reminder_state,
             )
         with timeit("actor.build.render"):
             messages = self.prompt_renderer.render_document(document)
@@ -417,6 +385,38 @@ class ActorAgent(LargeLanguageModel):
             "messages": messages,
             "tool_definitions": tool_definitions,
         }
+
+    def _build_step_messages(self, extra_system_prompt=None):
+        """组装本步消息的统一入口：注入 document_builder 时走它（子代理路径），
+        否则走默认组装管线（PromptAssembler 全家桶）。递归重入点（messages=None）
+        也经由这里，保证子代理路径的递归不会落回默认组装器。"""
+        if self.document_builder is not None:
+            tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
+            messages = self.document_builder(
+                history=self.working.get_context(),
+                tool_definitions=tool_definitions,
+            )
+            return {"document": None, "messages": messages,
+                    "tool_definitions": tool_definitions}
+        return self.build_messages_with_document(extra_system_prompt)
+
+    def _commit_reminders(self):
+        """LLM 请求成功：确认本轮注入的定时提醒已送达（消费掉）。"""
+        fn = getattr(getattr(self, "prompt_assembler", None), "commit_pending_reminders", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception as exc:  # 提醒投递失败绝不能影响主流程
+                logger.warning("commit_pending_reminders failed: %s", exc)
+
+    def _rollback_reminders(self):
+        """请求失败/中断：释放认领，让提醒在下一轮重新投递。"""
+        fn = getattr(getattr(self, "prompt_assembler", None), "rollback_pending_reminders", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception as exc:
+                logger.warning("rollback_pending_reminders failed: %s", exc)
 
     def _convert_tools_to_anthropic_format(self, tool_definitions):
         """
@@ -451,8 +451,12 @@ class ActorAgent(LargeLanguageModel):
         """判断当前 provider 是否支持原生工具调用且工具定义已加载"""
         tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
 
+        # 注入 llm 的独立部署：契约要求支持 Anthropic 风格原生工具调用
+        supports_native = (
+            self.core.provider_supports_native_tools if self.core is not None else True
+        )
         return (
-            self.core.provider_supports_native_tools
+            supports_native
             and tool_definitions is not None
             and bool(tool_definitions)
         )
@@ -535,7 +539,7 @@ class ActorAgent(LargeLanguageModel):
                 t.cancel()
             raise
 
-    async def act(self, max_retries=3, on_tool_call_start=None, on_thinking=None, on_tool_result=None, on_text=None, on_retry=None, _interrupt_check=None, extra_system_prompt=None, on_built=None):
+    async def act(self, max_retries=3, on_tool_call_start=None, on_thinking=None, on_tool_result=None, on_text=None, on_retry=None, _interrupt_check=None, extra_system_prompt=None, on_built=None, tool_result_trailing_texts=None):
         """
         执行一次推理，支持工具调用重试和并发执行多个工具
 
@@ -546,9 +550,12 @@ class ActorAgent(LargeLanguageModel):
             on_tool_result: 单个工具执行完成时立即回调，接收(tool_name, result_text)，不等其他工具
             on_text: 收到 text 块时立即回调，接收(text_content)，在工具执行前触发
             _interrupt_check: 可选中断检查回调，返回 True 表示用户请求了中断
-            extra_system_prompt: 额外的系统提示词（如 Snip 提醒），注入到本步 prompt 中
+            extra_system_prompt: 额外的系统提示词，注入到本步 prompt 中
             on_built: 消息组装完成后的回调，接收 build_result dict。Gateway 用它
                       基于同一次构建发 token 统计，避免每步重复组装一次。
+            tool_result_trailing_texts: 可选 () -> list[str]，本轮 tool_result 消息
+                      尾部追加的提示文本（子代理的倒计时/提醒注入缝）；None 或空列表
+                      时消息结构与默认路径完全一致。
         """
         # 确保工具定义已加载（防止首次调用来不及加载）
         tool_definitions = getattr(self.tool_runtime, "last_tool_definitions", None)
@@ -559,8 +566,16 @@ class ActorAgent(LargeLanguageModel):
             except Exception:
                 pass
 
+        # guard 初始化/同步（默认组装路径原先在 build_messages_with_document 内做，
+        # 上移到这里保证 document_builder 注入路径同样有防线）
+        if tool_definitions:
+            if self.guard is None:
+                self.guard = ToolCallGuard(tool_definitions)
+            elif len(self.guard.available_tools) != len(tool_definitions):
+                self.guard.update_tools(tool_definitions)
+
         # 先构建消息（这会触发工具定义的加载）
-        build_result = self.build_messages_with_document(extra_system_prompt)
+        build_result = self._build_step_messages(extra_system_prompt)
         messages = build_result["messages"]
         tool_definitions = build_result["tool_definitions"]
         if on_built is not None:
@@ -586,10 +601,11 @@ class ActorAgent(LargeLanguageModel):
             max_retries, on_tool_call_start, messages, anthropic_tools,
             on_thinking=on_thinking, on_tool_result=on_tool_result,
             on_text=on_text, on_retry=on_retry,
-            _interrupt_check=_interrupt_check
+            _interrupt_check=_interrupt_check,
+            tool_result_trailing_texts=tool_result_trailing_texts,
         )
 
-    async def _act_with_native_tools(self, max_retries=3, on_tool_call_start=None, messages=None, _reuse_tools=None, on_thinking=None, on_tool_result=None, on_text=None, on_retry=None, _auto_continue_count=0, _interrupt_check=None):
+    async def _act_with_native_tools(self, max_retries=3, on_tool_call_start=None, messages=None, _reuse_tools=None, on_thinking=None, on_tool_result=None, on_text=None, on_retry=None, _auto_continue_count=0, _interrupt_check=None, tool_result_trailing_texts=None):
         """
         使用 Anthropic 原生工具调用格式
 
@@ -602,7 +618,7 @@ class ActorAgent(LargeLanguageModel):
         - max_tokens 截断自动续写（最多 2 次）
         """
         if messages is None:
-            messages = self.build_messages()
+            messages = self._build_step_messages()["messages"]
 
         # 优先使用调用方传入的工具定义（避免 TOCTOU 重复读取 last_tool_definitions）
         if _reuse_tools is not None:
@@ -635,19 +651,28 @@ class ActorAgent(LargeLanguageModel):
             except Exception as e:
                 # 重试耗尽或不可重试错误：优雅报错，不向上抛、不触发 Gateway 崩溃重启
                 logger.error("LLM query failed after retries: %s", e)
+                self._rollback_reminders()
                 return {
                     "type": "error",
-                    "error": f"LLM 调用失败（已重试 10 次）: {type(e).__name__}: {e}",
+                    "error": f"LLM 调用失败（重试耗尽或错误不可重试）: {type(e).__name__}: {e}",
                 }
         if response is None:
+            self._rollback_reminders()
             return {"type": "interrupted"}
 
-        # 提取usage信息
-        usage = self.core._extract_usage(response)
+        # 提取usage信息（注入 llm 时原样取 response.usage）
+        usage = (
+            self.core._extract_usage(response)
+            if self.core is not None
+            else getattr(response, "usage", None)
+        )
 
         # 解析响应
         if not hasattr(response, "content"):
             raise ValueError("Native tool mode requires Anthropic response objects with content blocks")
+
+        # 请求成功且响应结构有效：确认本轮注入的定时提醒已送达
+        self._commit_reminders()
 
         # 提取所有 tool_use、text、thinking 块
         tool_use_blocks = []
@@ -718,23 +743,21 @@ class ActorAgent(LargeLanguageModel):
                     "role": "assistant",
                     "content": [block for block in response.content],
                 })
-                self.working.append({
-                    "role": "user",
-                    "content": tool_results + [{
-                        "type": "text",
-                        "text": (
-                            f"部分工具调用失败: {'; '.join(error_msgs)}\n"
-                            "请重新生成正确的工具调用。"
-                        ),
-                    }],
-                })
+                self.working.append(build_tool_result_message(
+                    tool_results,
+                    [
+                        f"部分工具调用失败: {'; '.join(error_msgs)}\n"
+                        "请重新生成正确的工具调用。"
+                    ],
+                ))
 
                 if max_retries > 0:
                     return await self._act_with_native_tools(
                         max_retries - 1, on_tool_call_start,
                         _reuse_tools=_reuse_tools,
                         on_thinking=on_thinking, on_tool_result=on_tool_result,
-                        on_text=on_text, on_retry=on_retry, _interrupt_check=_interrupt_check
+                        on_text=on_text, on_retry=on_retry, _interrupt_check=_interrupt_check,
+                        tool_result_trailing_texts=tool_result_trailing_texts,
                     )
                 return {
                     "type": "error",
@@ -780,14 +803,15 @@ class ActorAgent(LargeLanguageModel):
                     ),
                 })
 
-            new_messages = self.build_messages()
+            new_messages = self._build_step_messages()["messages"]
             return await self._act_with_native_tools(
                 max_retries, on_tool_call_start, new_messages,
                 _reuse_tools=_reuse_tools,
                 on_thinking=on_thinking, on_tool_result=on_tool_result,
                 on_text=on_text, on_retry=on_retry,
                 _auto_continue_count=_auto_continue_count + 1,
-                _interrupt_check=_interrupt_check
+                _interrupt_check=_interrupt_check,
+                tool_result_trailing_texts=tool_result_trailing_texts,
             )
 
         # 仅包含 thinking 块 → 模型还在思考，继续循环
@@ -811,9 +835,12 @@ class ActorAgent(LargeLanguageModel):
             answer = _strip_id_prefixes("\n".join(text_content).strip())
             if answer:
                 # verify 硬闸门：有足量未验证的文件修改时拦截最终答案，
-                # 强制先调 verify 子智能体（防绕过验收）
-                from Tools.verify_nudge import verify_nudge
-                gate_msg = verify_nudge.gate_final_answer()
+                # 强制先调 verify 子智能体（防绕过验收）。
+                # 仅主代理开启——子代理本身就是验收者/只读，不闸自己
+                gate_msg = None
+                if self.verify_gate_enabled:
+                    from Tools.verify_nudge import verify_nudge
+                    gate_msg = verify_nudge.gate_final_answer()
                 if gate_msg:
                     self.working.append({
                         "role": "assistant",
@@ -824,7 +851,8 @@ class ActorAgent(LargeLanguageModel):
                         max_retries, on_tool_call_start, self.build_messages(),
                         _reuse_tools=anthropic_tools,
                         on_thinking=on_thinking, on_tool_result=on_tool_result,
-                        on_text=on_text, on_retry=on_retry, _interrupt_check=_interrupt_check
+                        on_text=on_text, on_retry=on_retry, _interrupt_check=_interrupt_check,
+                        tool_result_trailing_texts=tool_result_trailing_texts,
                     )
                 self.working.append({
                     "role": "assistant",
@@ -842,7 +870,7 @@ class ActorAgent(LargeLanguageModel):
                 return result
             # 空响应，重试
             if max_retries > 0:
-                return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, on_text=on_text, on_retry=on_retry, _interrupt_check=_interrupt_check)
+                return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, on_text=on_text, on_retry=on_retry, _interrupt_check=_interrupt_check, tool_result_trailing_texts=tool_result_trailing_texts)
             # 重试耗尽：优雅报错，绝不上抛——冲出这里会触发 Gateway 崩溃重启
             logger.error("Empty LLM response after exhausting %d retries", max_retries)
             return {
@@ -973,15 +1001,12 @@ class ActorAgent(LargeLanguageModel):
                     )
 
             error_msgs = [r["error"] for r in errors]
-            self.working.append({
-                "role": "user",
-                "content": tool_results + [{
-                    "type": "text",
-                    "text": f"部分工具调用失败: {'; '.join(error_msgs)}\n请重新生成正确的工具调用。",
-                }],
-            })
+            self.working.append(build_tool_result_message(
+                tool_results,
+                [f"部分工具调用失败: {'; '.join(error_msgs)}\n请重新生成正确的工具调用。"],
+            ))
 
-            return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, on_text=on_text, on_retry=on_retry, _interrupt_check=_interrupt_check)
+            return await self._act_with_native_tools(max_retries - 1, on_tool_call_start, _reuse_tools=anthropic_tools, on_thinking=on_thinking, on_tool_result=on_tool_result, on_text=on_text, on_retry=on_retry, _interrupt_check=_interrupt_check, tool_result_trailing_texts=tool_result_trailing_texts)
 
         # 记录所有成功的工具调用到 working memory
         # Separate backgrounded results from synchronous results
@@ -989,6 +1014,18 @@ class ActorAgent(LargeLanguageModel):
         backgrounded_results = []
         synchronous_results = []
         kept_tool_uses = []  # 非 error 结果的 tool_use 块，用于重建 assistant 消息
+
+        # 视觉链路：批次里有成功的截图工具时，取出 MCP 侧暂存的 image 块
+        pending_images = []
+        if any(
+            "screenshot" in (r.get("tool_name") or "")
+            for r in results if "error" not in r
+        ) and config.get("model.large-language-model.vision", False):
+            try:
+                from Tools.mcp.manager import pop_pending_images
+                pending_images = pop_pending_images()
+            except Exception:
+                pending_images = []
 
         # 分类处理 tool_use 块（tool_result 配对 + 后台/同步区分）
         for i, result in enumerate(results):
@@ -1032,10 +1069,14 @@ class ActorAgent(LargeLanguageModel):
                 synchronous_results.append(result)
                 kept_tool_uses.append(tool_use_blocks[i])
                 is_error = ToolCall.classify_is_error(result["tool_name"], result["result_text"])
+                # 截图工具：图像块附加在文本结果之前（Anthropic tool_result 支持混合块）
+                result_content = result["result_text"]
+                if pending_images and "screenshot" in (result.get("tool_name") or ""):
+                    result_content = [pending_images.pop(0), {"type": "text", "text": result["result_text"]}]
                 user_content.append(
                     ToolCall.create_anthropic_tool_result(
                         result["tool_use_id"],
-                        result["result_text"],
+                        result_content,
                         is_error=is_error,
                     )
                 )
@@ -1051,10 +1092,14 @@ class ActorAgent(LargeLanguageModel):
             })
 
         if user_content:
-            self.working.append({
-                "role": "user",
-                "content": user_content,
-            })
+            trailing = []
+            if tool_result_trailing_texts is not None:
+                trailing = [
+                    t for t in (tool_result_trailing_texts() or [])
+                    if t and str(t).strip()
+                ]
+            # 空列表时产物与裸 append 完全一致（主路径缓存前缀无扰动）
+            self.working.append(build_tool_result_message(user_content, trailing))
 
         # Determine response type
         all_sync = [r for r in results if "error" not in r and not self._is_backgrounded(r["result_text"])]

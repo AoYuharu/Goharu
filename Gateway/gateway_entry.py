@@ -10,7 +10,6 @@ when changing the protocol.
 """
 
 import asyncio
-import faulthandler
 import http.server
 import json
 import logging
@@ -36,19 +35,14 @@ setup_stdio_encoding()
 _real_stdout = sys.stdout
 _stdout_lock = threading.Lock()
 
-from Agent.ActorAgent import ActorAgent
-from Agent.BackgroundTaskManager import BackgroundTaskManager
-from Agent.MicroCompactor import MicroCompactor
-from Core.Message import CoreMessage, MessageSource
-from Memory.MemoryManager import MemoryManager
-from Tools.runtime import create_tool_runtime
-from Tools.tool_process_tracker import tool_process_tracker
+from Tools.api import reconnect_mcp_server
 from configurationLoader import config
+from Gateway.channels.base import ChannelMessage
+from Gateway.session_manager import SessionManager
 
 # Logging setup — centralized, per-module file output
 from Core.LogManager import init_logging, get_logger
 from Core.LifecycleLog import lifecycle
-from Core.timing import timeit
 init_logging()
 logger = get_logger(__name__)
 lifecycle("════════ 新会话 ════════", f"Gateway 进程启动 pid={os.getpid()}", level=1)
@@ -138,1005 +132,23 @@ def _classify_switch_failure(err: str):
     return "unknown", f"切换失败：{(err or '')[:160]}"
 
 
-class GatewaySession:
-    """Gateway session managing agent components"""
-
-    def __init__(self):
-        self.memory_manager: Optional[MemoryManager] = None
-        self.actor: Optional[ActorAgent] = None
-        self.runtime = None
-        self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self._initialized = False
-        self._prompt_loader = None  # Lazily initialized
-        # Unified queue: messages + commands processed in FIFO order
-        # Each item is a dict with "type" key: "message" or "command"
-        #   message: {"type": "message", "data": str, "req_id": str}
-        #   command: {"type": "command", "name": str, "params": dict, "req_id": str}
-        self.pending_items: list = []
-        self._processing = False  # Whether currently processing
-        self._batch_lock = threading.Lock()
-        # Interrupt support
-        self._interrupt_event = threading.Event()
-        # Micro-compact flag (once per session turn)
-        self._micro_compacted = False
-        # Background task reactivation dedup flag
-        self._bg_reactivation_queued: bool = False
-        # PipelineManager: TencentDB-aligned memory pipeline
-        self.pipeline_manager = None
-        # 卡死看门狗：step 超时未返回时自动 dump 全部线程栈到此文件
-        self._watchdog_file = None
-        # 生命周期日志轮次计数
-        self._turn_count = 0
-
-    def queue_message(self, message: str, req_id):
-        """Queue a user message for batching"""
-        with self._batch_lock:
-            self.pending_items.append({"type": "message", "data": message, "req_id": req_id})
-            logger.info(f"Queued message (total pending: {len(self.pending_items)})")
-
-    def queue_command(self, command_name: str, params: dict, req_id):
-        """Queue a command to be executed between message batches"""
-        with self._batch_lock:
-            self.pending_items.append(
-                {"type": "command", "name": command_name, "params": params, "req_id": req_id}
-            )
-            logger.info(
-                "Queued command '%s' (total pending: %d)",
-                command_name, len(self.pending_items),
-            )
-
-    def get_pending_messages(self):
-        """Get and clear only pending messages, leaving commands in queue.
-
-        Used by mid-step message merge inside process_message().
-        Commands must NOT be executed mid-step — they wait for the
-        next iteration of the outer processing loop.
-        """
-        with self._batch_lock:
-            msgs = []
-            reqs = []
-            remaining = []
-            for item in self.pending_items:
-                if item["type"] == "message":
-                    msgs.append(item["data"])
-                    reqs.append(item["req_id"])
-                else:
-                    remaining.append(item)
-            self.pending_items = remaining
-            return msgs, reqs
-
-    def drain_pending_items(self):
-        """Get and clear ALL pending items (messages and commands).
-
-        Used by the main processing loop to get everything queued so far.
-        """
-        with self._batch_lock:
-            items = list(self.pending_items)
-            self.pending_items.clear()
-            return items
-
-    def has_pending(self) -> bool:
-        """Check if there are pending items (messages or commands)"""
-        with self._batch_lock:
-            return len(self.pending_items) > 0
-
-    def _drain_background_results(self):
-        """Thread-safe: drain background results → inject into memory → emit event.
-
-        Returns:
-            list: The drained BackgroundResult objects (empty list if none).
-        """
-        bg_results = BackgroundTaskManager().drain_pending()
-        if not bg_results:
-            return []
-        BackgroundTaskManager().inject_into_memory(self.memory_manager, bg_results)
-        write_json({
-            "jsonrpc": "2.0", "method": "event",
-            "params": {
-                "type": "task.background.completed",
-                "payload": {
-                    "count": len(bg_results),
-                    "task_ids": [r.task_id for r in bg_results],
-                }
-            }
-        })
-        logger.info(
-            "Drained %d background task result(s) into memory",
-            len(bg_results),
-        )
-        return bg_results
-
-    async def initialize(self):
-        """Initialize all components"""
-        if self._initialized:
-            return
-
-        try:
-            logger.info("Initializing gateway session...")
-
-            # Create event loop if needed
-            try:
-                self.loop = asyncio.get_running_loop()
-            except RuntimeError:
-                self.loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(self.loop)
-
-            # Initialize memory manager
-            self.memory_manager = MemoryManager()
-            logger.info("MemoryManager initialized")
-            lifecycle("启动: MemoryManager", "初始化完成")
-
-            # Initialize PipelineManager (TencentDB-aligned L1/L2/L3 pipeline)
-            from Agent.PipelineManager import PipelineManager
-            self.pipeline_manager = PipelineManager(memory_manager=self.memory_manager)
-            logger.info("PipelineManager initialized")
-            lifecycle("启动: PipelineManager", "初始化完成")
-
-            # 一次性迁移：SQLite L2 → scene_blocks/*.md, USER.md → persona.md
-            try:
-                migrated_l2 = self.pipeline_manager.migrate_legacy_l2_to_scene_blocks()
-                if migrated_l2 > 0:
-                    logger.info("Migration: %d L2 scenes migrated to scene_blocks", migrated_l2)
-                self.pipeline_manager.migrate_legacy_l3_to_persona()
-            except Exception as e:
-                logger.warning("Migration failed (non-critical): %s", e)
-
-            # Initialize tool runtime
-            self.runtime = create_tool_runtime(config.get("tools.runtime", "in_process"))
-            await self.runtime.initialize()
-            lifecycle("启动: 工具运行时", "初始化完成")
-
-            # Start MCP client manager: connect configured servers, bridge their
-            # tools into the registry (mcp__<server>__<tool>), then refresh the
-            # tool table so the actor sees them immediately
-            from Tools.mcp.manager import mcp_manager
-            mcp_manager.attach_runtime(self.runtime)
-            try:
-                await mcp_manager.start()
-            except Exception as e:
-                logger.error("MCP manager startup failed (non-critical): %s", e)
-
-            await self.runtime.list_tools()  # populate last_tool_definitions
-            logger.info("Tool runtime initialized")
-            lifecycle("启动: 工具加载", f"{len(self.runtime.last_tool_definitions)} 个工具")
-
-            # Inject WorkingMemory into snip tool (module loaded during initialize)
-            import Tools.builtin.snip_tool as snip_tool
-            snip_tool.set_working_memory(self.memory_manager.working)
-
-            # Initialize agents
-            self.actor = ActorAgent(self.runtime, self.memory_manager)
-            logger.info("Agents initialized")
-            lifecycle("启动: ActorAgent", "初始化完成")
-
-            # Register background task completion callback for real-time TUI updates
-            def _on_bg_complete(task_id, bg_result):
-                # 1. Immediately notify TUI of status change
-                status = BackgroundTaskManager().get_status_summary()
-                write_json({
-                    "jsonrpc": "2.0", "method": "event",
-                    "params": {
-                        "type": "task.background.status",
-                        "payload": status,
-                    }
-                })
-                # 1b. Per-task completion event for the TUI background panel
-                from Core.ToolCall import ToolCall
-                failed = bool(bg_result.error) or ToolCall.classify_is_error(
-                    bg_result.tool_name, str(bg_result.result)
-                )
-                write_json({
-                    "jsonrpc": "2.0", "method": "event",
-                    "params": {
-                        "type": "task.background.update",
-                        "payload": {
-                            "task_id": task_id,
-                            "tool": bg_result.tool_name,
-                            "status": "error" if failed else "success",
-                        },
-                    }
-                })
-                # 2. If agent is processing, step boundary will drain naturally
-                if self._processing:
-                    return
-                # 3. Idle: queue a synthetic message and wake up processing
-                if self._bg_reactivation_queued:
-                    return
-                self._bg_reactivation_queued = True
-                synthetic_msg = (
-                    f"[System: background results arrived after previous answer] "
-                    f"Background task(s) completed. Please review and respond if needed."
-                )
-                self.memory_manager.append(CoreMessage.context_only(
-                    MessageSource.REACTIVATION, synthetic_msg,
-                ).to_dict())
-                with self._batch_lock:
-                    self.pending_items.append({
-                        "type": "message",
-                        "data": synthetic_msg,
-                        "req_id": "bg_reactivation",
-                    })
-                _start_processing("default")
-
-            BackgroundTaskManager().register_callback(_on_bg_complete)
-            logger.info("Background task completion callback registered")
-
-            # Warm up the embedding model in the background so the first user
-            # message doesn't block ~60s on SentenceTransformer load during
-            # retrieve_prompt_memory (perceived as "stuck at step 1").
-            def _warmup_embedding():
-                try:
-                    from Memory.retrieval.EmbeddingService import EmbeddingService
-                    EmbeddingService().encode("warmup")
-                    logger.info("Embedding model warmup completed")
-                except Exception as e:
-                    logger.warning("Embedding warmup failed: %s", e)
-
-            threading.Thread(target=_warmup_embedding, daemon=True, name="embedding-warmup").start()
-            lifecycle("启动: embedding 预热", "后台线程")
-
-            # Per-task start events for the TUI background panel
-            def _on_bg_start(task_id, meta):
-                write_json({
-                    "jsonrpc": "2.0", "method": "event",
-                    "params": {
-                        "type": "task.background.update",
-                        "payload": {
-                            "task_id": task_id,
-                            "tool": meta.get("tool_name", "?"),
-                            "args": meta.get("args", ""),
-                            "status": "running",
-                            "started_at": meta.get("submitted_at", 0),
-                        },
-                    }
-                })
-
-            BackgroundTaskManager().register_start_callback(_on_bg_start)
-            logger.info("Background task start callback registered")
-
-            # Wire subagent (AgentDelegate) lifecycle/activity events to TUI
-            from Tools.builtin import agent_delegate as _agent_delegate
-
-            def _on_subagent_event(payload: dict):
-                write_json({
-                    "jsonrpc": "2.0", "method": "event",
-                    "params": {"type": "subagent.update", "payload": payload},
-                })
-
-            _agent_delegate._manager.set_output_callback(_on_subagent_event)
-            logger.info("Subagent output callback registered")
-
-            # Forward live tool (run_cmd) stdout/stderr to TUI as tool.output events
-            from Tools.tool_output_stream import tool_output_bus
-
-            def _on_tool_output(line: str, stream: str, source: str):
-                write_json({
-                    "jsonrpc": "2.0", "method": "event",
-                    "params": {
-                        "type": "tool.output",
-                        "payload": {"line": line, "stream": stream, "cmd": source},
-                    },
-                })
-
-            tool_output_bus.subscribe(_on_tool_output)
-            logger.info("Tool output stream subscribed")
-
-            # Dangerous-command confirmation: run_cmd blocks until user answers
-            from Tools.confirmation_manager import confirmation_manager
-
-            def _on_confirm_request(confirm_id: str, cmd: str, description: str):
-                write_json({
-                    "jsonrpc": "2.0", "method": "event",
-                    "params": {
-                        "type": "tool.confirm_request",
-                        "payload": {
-                            "confirm_id": confirm_id,
-                            "cmd": cmd,
-                            "description": description,
-                        },
-                    },
-                })
-
-            confirmation_manager.set_notifier(_on_confirm_request)
-            logger.info("Confirmation manager notifier registered")
-
-            self._initialized = True
-            logger.info("Gateway session initialized successfully")
-
-        except Exception as e:
-            logger.error(f"Failed to initialize gateway: {e}", exc_info=True)
-            raise
-
-    async def process_message(self, message: str, session_id: str = "default") -> str:
-        """
-        Process a user message and return the response.
-        Supports message batching: pending messages are merged before each actor step.
-
-        Args:
-            message: User message
-            session_id: Session identifier
-
-        Returns:
-            str: Agent response
-        """
-        if not self._initialized:
-            await self.initialize()
-
-        self._processing = True
-        self._micro_compacted = False  # reset per turn
-
-        # 重置本轮的工具调用历史板与触及文件跟踪（供 Verify 上下文收敛用）
-        try:
-            from Tools.touched_files import reset as reset_touched_files
-            reset_touched_files()
-            from Tools.tool_call_board import reset_main_calls
-            reset_main_calls()
-        except Exception:
-            pass
-
-        logger.debug(
-            "process_message start: session=%s msg_len=%d",
-            session_id, len(message),
-        )
-
-        # Emit thinking event IMMEDIATELY (before any blocking operations)
-        # so TUI shows spinner feedback right away
-        write_json({
-            "jsonrpc": "2.0",
-            "method": "event",
-            "params": {
-                "type": "agent.thinking",
-                "payload": {}
-            }
-        })
-
-        # PipelineManager: notify activity & check triggers
-        if self.pipeline_manager:
-            try:
-                with timeit("gateway.process.notify_activity"):
-                    self.pipeline_manager.notify_activity()
-            except Exception as e:
-                logger.warning(f"PipelineManager.notify_activity failed: {e}")
-
-        # Periodic memory maintenance: trigger pipeline turn start (L1 check)
-        # Pass before_l1_callback to emit agent.l1_extracting event when L1 runs
-        if self.pipeline_manager:
-            try:
-                def _on_l1_start():
-                    write_json({
-                        "jsonrpc": "2.0",
-                        "method": "event",
-                        "params": {
-                            "type": "agent.l1_extracting",
-                            "payload": {}
-                        }
-                    })
-                with timeit("gateway.process.on_turn_start"):
-                    self.pipeline_manager.on_turn_start(before_l1_callback=_on_l1_start)
-            except Exception as e:
-                logger.warning(f"PipelineManager.on_turn_start failed: {e}")
-
-        try:
-            # 清除上一次可能残留的中断标记
-            self._interrupt_event.clear()
-
-            # Check for pending messages that should be merged BEFORE first step
-            pending_msgs, pending_reqs = self.get_pending_messages()
-            # If bg_reactivation was queued, clear the dedup flag for this turn
-            if "bg_reactivation" in pending_reqs:
-                self._bg_reactivation_queued = False
-            all_messages = [message] + pending_msgs
-            combined = "\n".join(all_messages)
-
-            # Add ALL user messages to memory
-            self.memory_manager.append({"role": "user", "content": combined})
-            self._turn_count += 1
-            # turn 边界：清空记忆检索缓存，本轮首次构建时重新检索一次
-            self.actor.reset_retrieval_cache()
-            lifecycle(
-                "══ 第 {} 轮 ══".format(self._turn_count),
-                f'用户消息: "{combined[:80]}"',
-                level=1,
-            )
-
-            # If messages were batched, notify TUI
-            if len(all_messages) > 1:
-                write_json({
-                    "jsonrpc": "2.0",
-                    "method": "event",
-                    "params": {
-                        "type": "user.batch",
-                        "payload": {
-                            "count": len(all_messages),
-                            "combined": combined[:100]
-                        }
-                    }
-                })
-
-            # Process with actor
-            step = 0
-            max_steps = config.get("agent.maxDepth", 8)
-
-            def emit_token_stats_from_build(build_result):
-                """复用 actor 主构建的结果发 token 统计（不再单独组装一次），
-                面板数值与实际发给 LLM 的 messages 完全一致。"""
-                token_stats = self.calculate_token_stats_from_messages(
-                    build_result["messages"]
-                )
-                write_json({
-                    "jsonrpc": "2.0",
-                    "method": "event",
-                    "params": {
-                        "type": "token.stats",
-                        "payload": token_stats
-                    }
-                })
-
-            while step < max_steps:
-                step += 1
-                lifecycle(f"第 {step} 步", f"max_steps={max_steps}", level=2)
-
-                # ── 中断检查：用户按下了 ESC ──
-                if self._interrupt_event.is_set():
-                    self._interrupt_event.clear()
-                    tool_process_tracker.kill_all()
-                    self.memory_manager.append(CoreMessage.context_only(
-                        MessageSource.INTERRUPT,
-                        "Request interrupted by user",
-                    ).to_dict())
-                    write_json({
-                        "jsonrpc": "2.0",
-                        "method": "event",
-                        "params": {
-                            "type": "agent.interrupted",
-                            "payload": {"message": "请求已被用户中断"}
-                        }
-                    })
-                    lifecycle("轮结束", "被用户中断", level=2)
-                    return "请求已被用户中断。"
-
-                # Before each step: check for pending messages and merge
-                pending_msgs, pending_reqs = self.get_pending_messages()
-                # Clear dedup flag if bg_reactivation is being consumed
-                if "bg_reactivation" in pending_reqs:
-                    self._bg_reactivation_queued = False
-                if pending_msgs:
-                    pending_text = "\n".join(pending_msgs)
-                    # Add to memory so actor sees them
-                    # bg_reactivation already injected directly as context_only above
-                    if "bg_reactivation" not in pending_reqs:
-                        self.memory_manager.append({"role": "user", "content": f"[新消息] {pending_text}"})
-                    # Merge into the combined answer
-                    combined += f"\n{pending_text}"
-                    write_json({
-                        "jsonrpc": "2.0",
-                        "method": "event",
-                        "params": {
-                            "type": "user.merge",
-                            "payload": {
-                                "count": len(pending_msgs),
-                                "merged": pending_text[:100]
-                            }
-                        }
-                    })
-                    # Re-emit thinking event for new context
-                    write_json({
-                        "jsonrpc": "2.0",
-                        "method": "event",
-                        "params": {
-                            "type": "agent.thinking",
-                            "payload": {}
-                        }
-                    })
-
-                # Drain completed background tasks before each step
-                self._drain_background_results()
-
-                logger.info("step %d: bg drained, entering micro-compact check", step)
-                self._arm_step_watchdog(step)  # 覆盖整个 step（含 token stats），不只 act()
-
-                # Micro-compact: collapse older tool results (once per turn)
-                if (
-                    not self._micro_compacted
-                    and config.get("agent.micro_compact.enabled", True)
-                ):
-                    with timeit("gateway.step.micro_compact"):
-                        messages = self.memory_manager.get_context()
-                        age_h = float(config.get("agent.micro_compact.age_threshold_hours", 1))
-                        keep_n = int(config.get("agent.micro_compact.keep_tool_results", 5))
-                        min_chars = int(config.get("agent.micro_compact.min_content_chars", 120))
-                        compacted, folded = MicroCompactor.compact(
-                            messages,
-                            age_threshold_hours=age_h,
-                            keep_tool_results=keep_n,
-                            min_content_chars=min_chars,
-                        )
-                        if compacted is not messages:
-                            self.memory_manager.clear_context()
-                            for msg in compacted:
-                                self.memory_manager.append(msg)
-                            logger.info(
-                                "Micro-compact: folded %d older tool results (threshold=%sh, keep=%d, min_chars=%d)",
-                                folded, age_h, keep_n, min_chars,
-                            )
-                            write_json({
-                                "jsonrpc": "2.0",
-                                "method": "event",
-                                "params": {
-                                    "type": "context.micro_compact",
-                                    "payload": {"removed_results": folded}
-                                }
-                            })
-                        self._micro_compacted = True
-
-                # Emit step event
-                write_json({
-                    "jsonrpc": "2.0",
-                    "method": "event",
-                    "params": {
-                        "type": "agent.step",
-                        "payload": {"step": step}
-                    }
-                })
-
-                # Emit LLM requesting event (before actor.act() LLM call)
-                write_json({
-                    "jsonrpc": "2.0",
-                    "method": "event",
-                    "params": {
-                        "type": "agent.llm_requesting",
-                        "payload": {}
-                    }
-                })
-
-                # Get actor response with on_tool_call_start callback
-                # This callback fires BEFORE each tool executes, allowing us
-                # to emit tool.call events in real-time (not after completion)
-                current_step = step  # capture for closure
-
-                # 读取 see 配置，控制哪些内容实时展示
-                see_config = config.get("ui.see", {})
-                show_thinking = see_config.get("thinking", True)
-                show_text = see_config.get("text", True)
-
-                def _on_tool_call(tool_name, tool_args, call_id="", *args):
-                    write_json({
-                        "jsonrpc": "2.0",
-                        "method": "event",
-                        "params": {
-                            "type": "tool.call",
-                            "payload": {
-                                "tool": tool_name,
-                                "arguments": tool_args,
-                                "call_id": str(call_id),
-                                "step": current_step
-                            }
-                        }
-                    })
-
-                def _on_thinking(thinking_text):
-                    if not show_thinking:
-                        return
-                    write_json({
-                        "jsonrpc": "2.0",
-                        "method": "event",
-                        "params": {
-                            "type": "agent.thinking_content",
-                            "payload": {
-                                "step": current_step,
-                                "thinking": str(thinking_text).strip()
-                            }
-                        }
-                    })
-
-                def _on_text(text_content):
-                    if not show_text:
-                        return
-                    write_json({
-                        "jsonrpc": "2.0",
-                        "method": "event",
-                        "params": {
-                            "type": "agent.text_content",
-                            "payload": {
-                                "step": current_step,
-                                "text": str(text_content).strip()
-                            }
-                        }
-                    })
-
-                def _on_tool_result(tool_name, call_id, result_text):
-                    write_json({
-                        "jsonrpc": "2.0",
-                        "method": "event",
-                        "params": {
-                            "type": "tool.result",
-                            "payload": {
-                                "tool": tool_name,
-                                "call_id": str(call_id),
-                                "result": str(result_text)
-                            }
-                        }
-                    })
-
-                def _on_retry(attempt, max_retries, backoff, phase="backoff"):
-                    write_json({
-                        "jsonrpc": "2.0",
-                        "method": "event",
-                        "params": {
-                            "type": "agent.retry",
-                            "payload": {
-                                "attempt": attempt,
-                                "max_retries": max_retries,
-                                "backoff": backoff,
-                                "phase": phase,
-                                "step": current_step
-                            }
-                        }
-                    })
-
-                logger.info("Actor step %d/%d starting LLM call...", step, max_steps)
-                try:
-                    with timeit(f"gateway.step{step}.actor_act"):
-                        actor_response = await self.actor.act(
-                            on_tool_call_start=_on_tool_call,
-                            on_thinking=_on_thinking,
-                            on_tool_result=_on_tool_result,
-                            on_text=_on_text,
-                            on_retry=_on_retry,
-                            _interrupt_check=lambda: self._interrupt_event.is_set(),
-                            on_built=emit_token_stats_from_build
-                        )
-                finally:
-                    faulthandler.cancel_dump_traceback_later()
-                logger.debug(
-                    "Actor step %d response: type=%s",
-                    step, actor_response.get("type"),
-                )
-
-                # Drain background results that completed during actor.act()
-                # before checking the response type. Without this, a background
-                # task that finishes mid-act() is invisible until the next step's
-                # drain (one full step of latency).
-                self._drain_background_results()
-
-                # Check response type
-                response_type = actor_response.get("type")
-
-                # Note: thinking and tool results are already emitted in real-time
-                # via on_thinking / on_tool_result callbacks during act() execution.
-                # Only emit events that are NOT covered by callbacks.
-
-                if response_type == "answer":
-                    # Don't return immediately if background tasks are pending
-                    if BackgroundTaskManager().has_pending():
-                        bg_results = self._drain_background_results()
-                        if bg_results:
-                            logger.info(
-                                "Background tasks completed during answer, injecting %d result(s) and continuing",
-                                len(bg_results),
-                            )
-                            continue
-
-                    # Got final answer - return directly without streaming
-                    answer = actor_response.get("answer", "")
-                    lifecycle("轮结束", f"answer {len(answer)} 字", level=2)
-
-                    # Send complete answer as one event
-                    write_json({
-                        "jsonrpc": "2.0",
-                        "method": "event",
-                        "params": {
-                            "type": "agent.answer",
-                            "payload": {"answer": answer}
-                        }
-                    })
-
-                    # PipelineManager: on_turn_end (L3 check)
-                    if self.pipeline_manager:
-                        ctx = self.memory_manager.get_context()
-                        turn_slice = ctx[-24:] if len(ctx) > 24 else ctx
-                        try:
-                            with timeit("gateway.process.on_turn_end"):
-                                self.pipeline_manager.on_turn_end(turn_slice)
-                        except Exception as e:
-                            logger.warning(f"PipelineManager.on_turn_end failed: {e}")
-
-                    return answer
-
-                elif response_type == "tool":
-                    # Single tool — result already emitted by on_tool_result callback
-                    pass
-
-                elif response_type == "tool_batch":
-                    # tool.call and tool.result already emitted by callbacks — nothing more to emit
-                    pass
-
-                elif response_type == "tool_backgrounded":
-                    # Tool(s) moved to background — notify TUI and continue
-                    has_bg = actor_response.get("has_backgrounded", False)
-                    if has_bg:
-                        write_json({
-                            "jsonrpc": "2.0",
-                            "method": "event",
-                            "params": {
-                                "type": "task.background.started",
-                                "payload": {
-                                    "tool_calls": actor_response.get("tool_calls", []),
-                                }
-                            }
-                        })
-
-                elif response_type == "continue":
-                    # Thinking already emitted by on_thinking callback — just keep looping
-                    pass
-
-                elif response_type == "interrupted":
-                    # User pressed ESC during tool execution — actor skipped tools
-                    self._interrupt_event.clear()
-                    tool_process_tracker.kill_all()
-                    self.memory_manager.append(CoreMessage.context_only(
-                        MessageSource.INTERRUPT,
-                        "Request interrupted by user",
-                    ).to_dict())
-                    write_json({
-                        "jsonrpc": "2.0",
-                        "method": "event",
-                        "params": {
-                            "type": "agent.interrupted",
-                            "payload": {"message": "请求已被用户中断"}
-                        }
-                    })
-                    lifecycle("轮结束", "被用户中断（工具执行期间）", level=2)
-                    return "请求已被用户中断。"
-
-                elif response_type == "error":
-                    # Error occurred
-                    error_msg = actor_response.get("error", "Unknown error")
-                    logger.error(f"Actor error: {error_msg}")
-                    lifecycle("轮结束", f"错误: {error_msg}", level=2)
-                    return f"Error: {error_msg}"
-
-                else:
-                    # Unknown response type
-                    logger.warning(f"Unknown actor response type: {response_type}")
-                    logger.warning(f"Response: {actor_response}")
-                    break
-
-            # Max steps reached
-            logger.warning("Max steps (%d) reached for session %s", max_steps, session_id)
-            lifecycle("轮结束", f"达到最大步数 {max_steps}", level=2)
-            return "I apologize, but I've reached the maximum number of steps. Please try rephrasing your question."
-
-        except Exception as e:
-            import traceback
-            err_type = type(e).__name__
-            err_msg = str(e) or "(no message)"
-            logger.error(f"Error processing message: {err_type}: {err_msg}", exc_info=True)
-            # Emit error event to TUI before re-raise
-            write_json({
-                "jsonrpc": "2.0",
-                "method": "event",
-                "params": {
-                    "type": "agent.error",
-                    "payload": {"message": f"Agent异常 [{err_type}]: {err_msg}"}
-                }
-            })
-            raise
-        finally:
-            self._processing = False
-
-    async def clear_session(self, session_id: str):
-        """Clear a session's memory"""
-        if self.memory_manager:
-            self.memory_manager.clear_context()
-        if self.pipeline_manager:
-            self.pipeline_manager.reset_warmup()
-
-    async def compact_session(self, session_id: str):
-        """Summarize current conversation via LLM and replace with summary"""
-        if not self.memory_manager:
-            return
-
-        messages = self.memory_manager.get_context()
-        if not messages:
-            return
-
-        # Serialize messages for the LLM prompt
-        history_lines = []
-        for msg in messages:
-            role = msg.get("role", "unknown") if isinstance(msg, dict) else "unknown"
-            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-            if isinstance(content, list):
-                parts = []
-                for item in content:
-                    if isinstance(item, dict):
-                        t = item.get("type", "")
-                        if t == "text":
-                            parts.append(item.get("text", ""))
-                        elif t == "tool_use":
-                            parts.append(f"[调用工具: {item.get('name', '?')}]")
-                        elif t == "tool_result":
-                            rc = item.get("content", "")
-                            parts.append(f"[工具结果: {str(rc)[:200]}]")
-                    else:
-                        parts.append(str(item))
-                content = " ".join(parts)
-            content = str(content)[:2000]
-            history_lines.append(f"[{role}] {content}")
-
-        history_text = "\n".join(history_lines)
-
-        # Build compact prompt
-        compact_prompt = (
-            "你是一个对话摘要助手。请用中文对以下对话进行精炼摘要，保留关键信息：\n"
-            "1. 用户的主要问题和需求\n"
-            "2. 助手给出的关键回答和结论\n"
-            "3. 任何重要的决策、代码修改或文件操作\n"
-            "4. 未解决的问题或待办事项\n\n"
-            "请用200字以内完成摘要，直接输出摘要文本，不要加任何前缀或标记。\n\n"
-            f"=== 对话记录 ===\n{history_text}\n=== 结束 ==="
-        )
-
-        try:
-            from Agent.LargeLanguageModel import LargeLanguageModel
-            llm = LargeLanguageModel()
-            summary = llm.query([{"role": "user", "content": compact_prompt}])
-            if not summary or not summary.strip():
-                summary = "(摘要生成失败)"
-        except Exception as e:
-            logger.warning(f"Compact summary generation failed: {e}")
-            summary = "(摘要生成失败)"
-
-        # Clear context and insert summary
-        self.memory_manager.clear_context()
-        self.memory_manager.append({
-            "role": "system",
-            "content": f"[对话摘要 - {datetime.now().strftime('%Y-%m-%d %H:%M')}]\n{summary.strip()}"
-        })
-        logger.info(f"Session compacted: {len(messages)} messages → summary ({len(summary)} chars)")
-
-    def _get_prompt_loader(self):
-        """Get or create PromptLoader"""
-        if self._prompt_loader is None:
-            from Prompting.PromptLoader import PromptLoader
-            self._prompt_loader = PromptLoader()
-        return self._prompt_loader
-
-    def _read_file_safe(self, path):
-        """Read a file safely, return empty string on error"""
-        try:
-            p = Path(path)
-            if p.exists():
-                return p.read_text(encoding="utf-8")
-        except Exception:
-            pass
-        return ""
-
-    def _estimate_tokens(self, text):
-        """Estimate token count for text (uses TokenEstimator)"""
-        from Agent.TokenEstimator import TokenEstimator
-        return TokenEstimator().estimate(text)
-
-    @staticmethod
-    def _stringify_token_content(content):
-        if isinstance(content, str):
-            return content
-        if content is None:
-            return ""
-        try:
-            return json.dumps(content, ensure_ascii=False, default=str)
-        except TypeError:
-            return str(content)
-
-    def _estimate_rendered_messages(self, messages):
-        if not self.actor:
-            return {"current_tokens": 0}
-
-        core = getattr(self.actor, "core", None)
-        provider = getattr(core, "provider", None)
-        prepare = getattr(provider, "_prepare_messages", None)
-
-        if core is not None and callable(prepare):
-            system_blocks, remote_messages = prepare(messages)
-
-            parts = []
-            for block in system_blocks:
-                text = self._stringify_token_content(block.get("text", "")).strip()
-                if not text:
-                    continue
-                parts.append(f"system: {text}")
-
-            for message in remote_messages:
-                role = message.get("role", "user")
-                content = self._stringify_token_content(message.get("content", "")).strip()
-                if content:
-                    parts.append(f"{role}: {content}")
-
-            current_tokens = self._estimate_tokens("\n".join(parts)) if parts else 0
-            return {"current_tokens": current_tokens}
-
-        current_tokens = self._estimate_tokens(json.dumps(messages, ensure_ascii=False, default=str))
-        return {"current_tokens": current_tokens}
-
-    def calculate_token_stats(self, extra_system_prompt=None):
-        """Calculate compact token stats for the next assembled request.
-
-        缓存命中率来自最近一次 API 响应的真实 usage（cache_read 占总输入的
-        比例），而不是本地 cache_control 标记估算——MiniMax 走自动前缀缓存，
-        本地标记与实际命中无对应关系。
-        """
-        if not self.actor:
-            return {
-                "current_tokens": 0,
-                "prompt_cache_ratio": 0.0,
-            }
-
-        logger.debug("token stats: building messages snapshot...")
-        snapshot = self.actor.build_messages_with_document(extra_system_prompt)
-        logger.debug("token stats: snapshot built (%d msgs), estimating...",
-                     len(snapshot["messages"]))
-        return self.calculate_token_stats_from_messages(snapshot["messages"])
-
-    def calculate_token_stats_from_messages(self, messages):
-        """基于已组装好的 messages 估算 token（不重新构建提示词）。"""
-        stats = self._estimate_rendered_messages(messages)
-        current_tokens = stats["current_tokens"]
-
-        usage = getattr(getattr(self.actor, "core", None), "_last_usage", None) or {}
-        uncached_input = int(usage.get("input_tokens") or 0)
-        cache_read = int(usage.get("cache_read_input_tokens") or 0)
-        cache_write = int(usage.get("cache_creation_input_tokens") or 0)
-        total_input = uncached_input + cache_read + cache_write
-        prompt_cache_ratio = (cache_read / total_input) if total_input > 0 else 0.0
-        return {
-            "current_tokens": current_tokens,
-            "prompt_cache_ratio": prompt_cache_ratio,
-            "cache_read_tokens": cache_read,
-            "cache_write_tokens": cache_write,
-            "uncached_input_tokens": uncached_input,
-        }
-
-    def _arm_step_watchdog(self, step: int):
-        """卡死看门狗：actor step 超过阈值未返回时，自动 dump 全部线程栈。
-
-        输出到 logs/gateway/watchdog.log。正常返回时由调用方 cancel。
-        """
-        timeout = float(config.get("agent.step_watchdog_seconds", 150) or 150)
-        if timeout <= 0:
-            return
-        try:
-            if self._watchdog_file is None:
-                log_dir = Path(config.get("logging.base_dir", "./runtime_memory/logs")) / "gateway"
-                log_dir.mkdir(parents=True, exist_ok=True)
-                self._watchdog_file = open(log_dir / "watchdog.log", "a", encoding="utf-8")
-            self._watchdog_file.write(
-                f"\n===== step {step} watchdog armed at {datetime.now().isoformat()} "
-                f"(timeout={timeout}s) =====\n"
-            )
-            self._watchdog_file.flush()
-            faulthandler.cancel_dump_traceback_later()
-            faulthandler.dump_traceback_later(timeout, file=self._watchdog_file)
-        except Exception as e:
-            logger.warning("step watchdog arm failed: %s", e)
-
-    async def shutdown(self):
-        """Shutdown the gateway"""
-        if self.pipeline_manager:
-            self.pipeline_manager.shutdown()
-        try:
-            from Tools.mcp.manager import mcp_manager
-            await mcp_manager.close()
-        except Exception as e:
-            logger.warning("MCP manager close failed: %s", e)
-        if self.runtime:
-            await self.runtime.close()
-
-
-# Global session
-_session: Optional[GatewaySession] = None
+# Global session manager（多 session 装配根；TUI 请求经它路由到目标 session）
+_manager: Optional[SessionManager] = None
 _request_queue: queue.Queue = queue.Queue()  # Incoming request queue
 _bg_reader_running = False
-_processing_lock = threading.Lock()  # Prevent concurrent background processing
+
+# 进程级常驻事件循环：MCP 会话（asyncio 资源）绑定在创建它的 loop 上，
+# 历史上 init/每条消息/收尾各建一个临时 loop 并即关，导致 MCP 首调必报
+# "Event loop is closed"，重连途中还会间歇性静默崩溃。统一用同一个 loop。
+_MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _get_main_loop() -> asyncio.AbstractEventLoop:
+    global _MAIN_LOOP
+    if _MAIN_LOOP is None or _MAIN_LOOP.is_closed():
+        _MAIN_LOOP = asyncio.new_event_loop()
+        asyncio.set_event_loop(_MAIN_LOOP)
+    return _MAIN_LOOP
 _SHUTTING_DOWN = False  # Set to True during process shutdown to stop new processing
 
 
@@ -1153,7 +165,7 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     Returns:
         JSON-RPC response or None for notifications
     """
-    global _session
+    global _manager
 
     method = request.get("method")
     params = request.get("params", {})
@@ -1164,15 +176,12 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             message = params.get("message", "")
             session_id = params.get("session_id", "default")
 
-            import sys as _sys2
-            _sys2.stderr.write(f"[TRACE] dispatch: agent.send_message msg_len={len(message)} session={session_id}\n")
-            _sys2.stderr.flush()
-
-            # Always queue the message and return immediately (non-blocking)
-            _session.queue_message(message, req_id)
-
-            # Start background processing if not already running
-            _start_processing(session_id)
+            # TUI 入口等价于 tui channel 的入站消息（带来源标注入队）
+            # priority="high"：插队 + 打断当前轮（默认 normal 排队）
+            _manager.get_session(session_id).enqueue(ChannelMessage(
+                text=message, channel_type="tui", channel_id="tui_main",
+                priority=str(params.get("priority", "normal")),
+            ))
 
             return {
                 "jsonrpc": "2.0",
@@ -1183,11 +192,9 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         elif method == "agent.clear_session":
             session_id = params.get("session_id", "default")
 
-            # Queue command for execution in the processing loop.
-            # No lock contention — commands are processed sequentially
-            # between message batches by _process_queued_messages().
-            _session.queue_command("clear_session", {"session_id": session_id}, req_id)
-            _start_processing(session_id)
+            session = _manager.get_session(session_id)
+            session.queue_command("clear_session", {"session_id": session_id}, req_id)
+            session._start_processing()
 
             return {
                 "jsonrpc": "2.0",
@@ -1198,15 +205,26 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         elif method == "agent.compact":
             session_id = params.get("session_id", "default")
 
-            # Queue command for execution in the processing loop.
-            # No lock contention — commands are processed sequentially
-            # between message batches by _process_queued_messages().
-            _session.queue_command("compact", {"session_id": session_id}, req_id)
-            _start_processing(session_id)
+            session = _manager.get_session(session_id)
+            session.queue_command("compact", {"session_id": session_id}, req_id)
+            session._start_processing()
 
             return {
                 "jsonrpc": "2.0",
                 "result": {"queued": True, "command": "compact"},
+                "id": req_id,
+            }
+
+        elif method == "agent.upgrade":
+            session_id = params.get("session_id", "default")
+
+            session = _manager.get_session(session_id)
+            session.queue_command("upgrade", {"session_id": session_id}, req_id)
+            session._start_processing()
+
+            return {
+                "jsonrpc": "2.0",
+                "result": {"queued": True, "command": "upgrade"},
                 "id": req_id,
             }
 
@@ -1218,110 +236,43 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             存储的 assistant 文本可能带有 LLM 模仿的 [ID:msg_xxx] 前缀，
             回放前统一剥离（与 ActorAgent 实时输出同一规则）。
             """
-            from Agent.ActorAgent import _strip_id_prefixes
-
-            history = _session.memory_manager.get_context()
-            serialized = []
-            pending_tools = {}  # tool_use_id → 已追加的 tool 条目（等待结果回填）
-
-            for msg in history:
-                if not isinstance(msg, dict):
-                    continue
-                # Skip context-only messages (internal system messages)
-                if CoreMessage.is_context_only(msg):
-                    continue
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")
-                ts = msg.get("timestamp", "")
-
-                if isinstance(content, str):
-                    if content.strip():
-                        serialized.append({
-                            "role": role, "kind": "text",
-                            "text": _strip_id_prefixes(content), "timestamp": ts,
-                        })
-                    continue
-                if not isinstance(content, list):
-                    continue
-
-                for item in content:
-                    if not isinstance(item, dict):
-                        continue
-                    block_type = item.get("type")
-                    if block_type == "text":
-                        text = item.get("text", "")
-                        if text.strip():
-                            serialized.append({
-                                "role": role, "kind": "text",
-                                "text": _strip_id_prefixes(text), "timestamp": ts,
-                            })
-                    elif block_type == "thinking":
-                        thinking = item.get("thinking", "")
-                        if thinking.strip():
-                            serialized.append({
-                                "role": role, "kind": "thinking",
-                                "text": _strip_id_prefixes(thinking)[:4000], "timestamp": ts,
-                            })
-                    elif block_type == "tool_use":
-                        tool_input = item.get("input", {})
-                        # 极简显示：只列参数值（逗号分隔），不带参数名
-                        if isinstance(tool_input, dict):
-                            args_brief = ", ".join(
-                                (str(v)[:24] + "…") if len(str(v)) > 24 else str(v)
-                                for v in tool_input.values()
-                            )
-                        else:
-                            args_brief = str(tool_input)[:40]
-                        entry = {
-                            "role": "assistant", "kind": "tool",
-                            "tool": item.get("name", "?"),
-                            "args": args_brief,
-                            "args_full": json.dumps(tool_input, ensure_ascii=False, indent=2)[:2000],
-                            "result": None,
-                            "is_error": False,
-                            "timestamp": ts,
-                        }
-                        serialized.append(entry)
-                        pending_tools[item.get("id", "")] = entry
-                    elif block_type == "tool_result":
-                        result_content = item.get("content", "")
-                        if isinstance(result_content, str):
-                            result_text = result_content
-                        elif isinstance(result_content, list):
-                            result_text = "\n".join(
-                                rc.get("text", "")
-                                for rc in result_content
-                                if isinstance(rc, dict) and rc.get("type") == "text"
-                            )
-                        else:
-                            result_text = str(result_content)
-                        entry = pending_tools.pop(item.get("tool_use_id", ""), None)
-                        if entry is not None:
-                            entry["result"] = result_text[:4000]
-                            entry["is_error"] = bool(item.get("is_error"))
-                        else:
-                            serialized.append({
-                                "role": role, "kind": "tool",
-                                "tool": "?", "args": "",
-                                "result": result_text[:4000],
-                                "is_error": bool(item.get("is_error")),
-                                "timestamp": ts,
-                            })
-
-            # 会话中断残留的 tool_use（无结果）
-            for entry in pending_tools.values():
-                entry["result"] = "(no result — session interrupted)"
-
-            # 只发送今天的内容（TUI 也只回放今天）；今天没有则回退最近 20 条。
-            # 避免把 7 天保留窗内的全部历史（可能数 MB 的工具结果）传给前端。
-            today_prefix = datetime.now().strftime("%Y-%m-%d")
-            today_entries = [e for e in serialized if str(e.get("timestamp", "")).startswith(today_prefix)]
-            replay = today_entries if today_entries else serialized[-20:]
+            session_id = params.get("session_id", "default")
+            replay = _manager.get_session(session_id).get_history_payload()
 
             return {
                 "jsonrpc": "2.0",
                 "result": {"messages": replay},
                 "id": req_id
+            }
+
+        elif method == "tools.list":
+            """列出当前注册的全部工具（内置 + MCP），供 TUI 工具面板展示。
+
+            MCP 工具命名约定 mcp__<server>__<tool>，据此还原来源分组；
+            last_tool_definitions 在启动与 ReloadTools/mcp refresh 后保持最新。
+            """
+            definitions = list(
+                getattr(_manager.runtime, "last_tool_definitions", []) or []
+            )
+            tools = []
+            for definition in definitions:
+                name = str(definition.get("name") or "")
+                source, server = "builtin", None
+                if name.startswith("mcp__"):
+                    parts = name.split("__", 2)
+                    if len(parts) == 3:
+                        source, server = "mcp", parts[1]
+                tools.append({
+                    "name": name,
+                    "description": str(definition.get("description") or "")[:2000],
+                    "source": source,
+                    "server": server,
+                    "schema": definition.get("inputSchema") or {},
+                })
+            return {
+                "jsonrpc": "2.0",
+                "result": {"count": len(tools), "tools": tools},
+                "id": req_id,
             }
 
         elif method == "agent.update_config":
@@ -1373,7 +324,7 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     "id": req_id,
                 }
             try:
-                cancelled = BackgroundTaskManager().cancel_task(int(task_id))
+                cancelled = _manager.bg_tasks.cancel_task(int(task_id))
                 return {
                     "jsonrpc": "2.0",
                     "result": {"cancelled": cancelled, "task_id": task_id},
@@ -1391,9 +342,11 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             # 仅在 agent 正在处理消息或队列里有待处理消息时才标记中断
             # （has_pending 覆盖"消息已入队但处理线程还没进入 process_message"的窗口，
             # 此时不设标志的话，用户想取消的消息会照常跑起来）
-            if _session._processing or _session.has_pending():
-                _session._interrupt_event.set()
-                logger.info("Interrupt requested by user")
+            session_id = params.get("session_id", "default")
+            session = _manager.get_session(session_id)
+            if session._processing or session.has_pending():
+                session._interrupt_event.set()
+                logger.info("Interrupt requested by user (session=%s)", session_id)
                 interrupted = True
             else:
                 interrupted = False
@@ -1413,6 +366,19 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return {
                 "jsonrpc": "2.0",
                 "result": {"ok": found, "approved": approved},
+                "id": req_id
+            }
+
+        elif method == "agent.user_question_response":
+            # 用户对 AskUser 提问的回答——放行等待中的工具线程
+            from Tools.question_manager import question_manager
+            request_id = str(params.get("request_id", ""))
+            answer = str(params.get("answer", ""))
+            found = question_manager.resolve(request_id, answer)
+            logger.info("User question %s resolved: found=%s", request_id, found)
+            return {
+                "jsonrpc": "2.0",
+                "result": {"ok": found, "request_id": request_id},
                 "id": req_id
             }
 
@@ -1453,6 +419,43 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "id": req_id,
             }
 
+        elif method == "browser_llm.get_status":
+            from Gateway import browser_llm_config
+            return {
+                "jsonrpc": "2.0",
+                "result": browser_llm_config.get_status(),
+                "id": req_id,
+            }
+
+        elif method == "browser_llm.set_config":
+            # 浏览器 LLM 抽取开关：写 browser-use 的 config.json 并重连 MCP server 生效
+            from Gateway import browser_llm_config
+            enabled = bool(params.get("enabled", False))
+            try:
+                status = browser_llm_config.set_enabled(enabled)
+            except Exception as e:
+                return {
+                    "jsonrpc": "2.0",
+                    "result": {"success": False, "message": str(e), **browser_llm_config.get_status()},
+                    "id": req_id,
+                }
+            # browser-use 是独立子进程且配置在启动时读取——必须重连才生效
+            reconnect_msg = ""
+            ok, err = reconnect_mcp_server("browser-use", timeout=30)
+            if ok:
+                reconnect_msg = "，browser-use 已重连生效"
+            elif err and "not configured" not in str(err):
+                reconnect_msg = f"，但重连失败（{err}），重启后生效"
+            return {
+                "jsonrpc": "2.0",
+                "result": {
+                    "success": True,
+                    "message": ("已开启" if enabled else "已关闭") + f"浏览器 LLM 抽取{reconnect_msg}",
+                    **status,
+                },
+                "id": req_id,
+            }
+
         elif method == "model.get_status":
             llm_cfg = config.get("model.large-language-model", {}) or {}
             api_key_env = llm_cfg.get("api_key_env", "")
@@ -1475,7 +478,7 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             }
 
         elif method == "model.set_config":
-            from Agent.LLMCore import LLMCore
+            from Agent.llm import reload_global_llm
             model = params.get("model")
             base_url = params.get("base_url")
             api_key = params.get("api_key")
@@ -1510,7 +513,7 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 _set_dotenv_value(api_key_env, api_key)
                 os.environ[api_key_env] = api_key
                 changed.append("api_key")
-            ok, err = LLMCore().reload()
+            ok, err = reload_global_llm()
             if not ok:
                 # 回滚 config（.env 与运行中的 os.environ 不回滚：写掉的 key
                 # 仍是有效密钥，留在新变量名下无害）；LLMCore 保持旧客户端，
@@ -1588,6 +591,11 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         }
 
 
+# stdio 前端（TUI spawn 的本进程）是否已活跃发过请求——用于拒绝第二个 TUI 的
+# TCP attach（一旦 stdio TUI 在用，事件流归它，不能被后到的 attach 抢走）
+_STDIO_ACTIVE = threading.Event()
+
+
 def _stdin_reader():
     """Background thread: read JSON-RPC requests from stdin"""
     global _bg_reader_running
@@ -1600,7 +608,8 @@ def _stdin_reader():
 
         try:
             request = json.loads(line)
-            _request_queue.put(request)
+            _STDIO_ACTIVE.set()
+            _request_queue.put((request, write_json))
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse error: {e}")
             write_json({
@@ -1613,258 +622,293 @@ def _stdin_reader():
     logger.info("stdin EOF")
 
 
-def _process_queued_messages(session_id: str):
+# ── TUI attach：TCP JSON-RPC 服务（守护进程侧）+ 代理模式（TUI 侧）────
+#
+# 场景：QQ 守护进程常驻时用户再开 TUI——TUI spawn 的 gateway_entry 探测到
+# 端口已被占用，自动降级为 stdio↔TCP 代理，对接现有守护；TUI 关闭时代理
+# 发 tui.shutdown，守护随之退出（不留守户进程）。
+
+
+class TuiRpcServer:
+    """守护进程的本地 TCP JSON-RPC 端点（127.0.0.1:gateway.rpc_port）。
+
+    - 普通连接（探测）直接关闭无副作用；只有发送 tui.attach 的连接才算
+      "已对接 TUI"：此后 tui channel 的事件流转到该 socket
+    - 已对接 TUI 断开 → 守护整体退出（gateway.tui_attach_shutdown，默认开）
     """
-    Background processing: drains the unified queue and processes items
-    in FIFO order.  Consecutive messages are batched; commands are executed
-    between message batches.
 
-    Queue item format:
-        {"type": "message", "data": str, "req_id": str}
-        {"type": "command", "name": str, "params": dict, "req_id": str}
-    """
-    global _session
-    global _processing_lock
+    def __init__(self, port, shutdown_on_detach=True):
+        self.port = int(port)
+        self.shutdown_on_detach = bool(shutdown_on_detach)
+        self._lock = threading.Lock()
+        self._attached_sock = None   # 当前对接中的 TUI socket
+        self._server = None
 
-    import sys as _sys
-    _sys.stderr.write("[DIAG] _process_queued_messages: START\n")
-    _sys.stderr.flush()
-
-    async def _execute_command(cmd_item: dict):
-        """Execute a queued command inside the processing event loop."""
-        name = cmd_item["name"]
-        params = cmd_item.get("params", {})
-        cid = cmd_item.get("req_id", "")
+    def start(self):
+        """绑定并开始监听。端口即单实例锁：Windows 上必须用
+        SO_EXCLUSIVEADDRUSE，绝不能用 SO_REUSEADDR（后者允许双绑定，
+        会导致两个 gateway 抢同一端口/事件）。"""
+        import socket
         try:
-            if name == "compact":
-                await _session.compact_session(params.get("session_id", session_id))
-            elif name == "clear_session":
-                await _session.clear_session(params.get("session_id", session_id))
-            else:
-                logger.warning("Unknown command: %s", name)
-                write_json({
-                    "jsonrpc": "2.0", "method": "event",
-                    "params": {
-                        "type": "command.complete",
-                        "payload": {"command": name, "success": False,
-                                     "error": f"Unknown command: {name}"}
-                    }
-                })
-                return
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):      # Windows
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:                                            # POSIX
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", self.port))
+            srv.listen(2)
+            self._server = srv
+        except OSError as e:
+            logger.warning("TuiRpcServer: port %s bind failed: %s", self.port, e)
+            return False
+        threading.Thread(target=self._accept_loop, daemon=True,
+                         name="tui-rpc-server").start()
+        logger.info("TuiRpcServer: listening on 127.0.0.1:%d", self.port)
+        return True
 
-            # Emit updated token stats after command
-            token_stats = _session.calculate_token_stats()
-            write_json({
-                "jsonrpc": "2.0", "method": "event",
-                "params": {"type": "token.stats", "payload": token_stats}
-            })
-            write_json({
-                "jsonrpc": "2.0", "method": "event",
-                "params": {
-                    "type": "command.complete",
-                    "payload": {"command": name, "success": True}
-                }
-            })
-            logger.info("Command '%s' executed successfully", name)
-        except Exception as exc:
-            logger.error("Command '%s' failed: %s", name, exc)
-            write_json({
-                "jsonrpc": "2.0", "method": "event",
-                "params": {
-                    "type": "command.complete",
-                    "payload": {"command": name, "success": False, "error": str(exc)}
-                }
-            })
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        while _session.has_pending():
-            # ── Drain ALL pending items (messages + commands) ──
-            items = _session.drain_pending_items()
-            if not items:
+    def _accept_loop(self):
+        while True:
+            try:
+                conn, _ = self._server.accept()
+            except OSError:
                 break
+            threading.Thread(target=self._serve_client, args=(conn,),
+                             daemon=True, name="tui-rpc-client").start()
 
-            last_answer = None
-            i = 0
-            while i < len(items):
-                item = items[i]
-
-                if item["type"] == "command":
-                    # Execute command inline between message batches
-                    loop.run_until_complete(_execute_command(item))
-                    i += 1
-
-                else:
-                    # Collect consecutive message items into a batch
-                    msg_items = []
-                    while i < len(items) and items[i]["type"] == "message":
-                        msg_items.append(items[i])
-                        i += 1
-
-                    combined = "\n".join(m["data"] for m in msg_items)
-
-                    # Notify TUI of batching
-                    if len(msg_items) > 1:
-                        write_json({
-                            "jsonrpc": "2.0", "method": "event",
-                            "params": {
-                                "type": "user.batch",
-                                "payload": {"count": len(msg_items),
-                                            "combined": combined[:100]}
-                            }
-                        })
-
-                    # Process as one combined message
-                    last_answer = loop.run_until_complete(
-                        _session.process_message(combined, session_id)
-                    )
-
-                    # Emit token stats
-                    token_stats = _session.calculate_token_stats()
-                    write_json({
-                        "jsonrpc": "2.0", "method": "event",
-                        "params": {"type": "token.stats", "payload": token_stats}
-                    })
-
-                    # Emit completion event (for all batched requests)
-                    write_json({
-                        "jsonrpc": "2.0", "method": "event",
-                        "params": {
-                            "type": "message.complete",
-                            "payload": {"answer": last_answer}
-                        }
-                    })
-
-            # ── Post-batch background watcher ─────────────────
-            # Only runs when ALL items from this drain are processed
-            # AND no new items arrived during processing.
-            # If _session.has_pending() is True, the outer while loop
-            # catches it and processes new items instead.
-            if _session.has_pending():
-                continue  # New items arrived, skip watcher
-
-            if last_answer is None:
-                continue  # No message was processed, skip watcher
-
-            from configurationLoader import config
-            watch_window = int(config.get("agent.background_watch_window", 1800))
-            max_reactivations = int(config.get("agent.background_max_reactivations", 3))
-            task_mgr = BackgroundTaskManager()
-
-            if watch_window > 0 and task_mgr._reactivation_count < max_reactivations:
-                start_watch = time.time()
-
-                async def _bg_watcher():
-                    while (time.time() - start_watch) < watch_window:
-                        # 用户发了新消息或命令，立即退出 watcher
-                        if _session.has_pending():
-                            return True
-                        if task_mgr.has_pending():
-                            bg_results = task_mgr.drain_pending()
-                            task_mgr.increment_reactivation()
-                            logger.info(
-                                "[bg-task] Post-answer reactivation #%d: %d results arrived",
-                                task_mgr._reactivation_count, len(bg_results),
-                            )
-                            # Inject results into memory so agent sees them
-                            if _session.memory_manager:
-                                task_mgr.inject_into_memory(
-                                    _session.memory_manager, bg_results
-                                )
-                            # Only queue synthetic message if callback didn't already
-                            if not _session._bg_reactivation_queued:
-                                synthetic_msg = (
-                                    f"[System: background results arrived after previous answer] "
-                                    f"{len(bg_results)} background task(s) completed. "
-                                    f"Please review and respond if needed."
-                                )
-                                _session.memory_manager.append(CoreMessage.context_only(
-                                    MessageSource.REACTIVATION, synthetic_msg,
-                                ).to_dict())
-                                with _session._batch_lock:
-                                    _session.pending_items.append({
-                                        "type": "message",
-                                        "data": synthetic_msg,
-                                        "req_id": "bg_reactivation",
-                                    })
-                            return True
-                        await asyncio.sleep(1.0)
-                    return False
-
-                loop.run_until_complete(_bg_watcher())
-
-    except Exception as e:
-        err_type = type(e).__name__
-        err_msg = str(e) or "(no message)"
-
-        # "cannot schedule new futures after shutdown" 是 executor 生命周期问题
-        # 不视为严重 crash，记录后尝试从新线程恢复
-        if "cannot schedule new futures" in err_msg:
-            logger.warning(
-                "LLM executor shutdown detected, restarting processor thread: %s",
-                err_msg,
-            )
-        else:
-            logger.error(f"Error in message processor: {e}", exc_info=True)
-            log_crash(f"Message processor error: {e}", sys.exc_info())
-
-        # Emit error event to TUI
-        write_json({
-            "jsonrpc": "2.0",
-            "method": "event",
-            "params": {
-                "type": "agent.error",
-                "payload": {"message": f"处理消息异常 [{err_type}]: {err_msg}"}
-            }
-        })
-    finally:
-        loop.close()
-        # CRITICAL: Release processing lock so new messages can start processing
+    def _send_line(self, sock, obj):
         try:
-            _processing_lock.release()
-        except RuntimeError:
-            pass  # Lock may not have been acquired (shouldn't happen normally)
-        # Re-check: items might have arrived during the lock release race window
-        if _session.has_pending():
-            _start_processing(session_id)
+            sock.sendall((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+            return True
+        except OSError:
+            return False
+
+    def _reroute_tui_channel(self, sock):
+        """把 default session 的 tui channel 事件流改道到对接的 socket。"""
+        session = _manager.get_session("default") if _manager else None
+        swapped = False
+        for ch in (session.channels if session else []):
+            if ch.channel_type == "tui":
+                ch._transport = lambda obj, _s=sock: self._send_line(_s, obj)
+                swapped = True
+        return swapped
+
+    def _restore_tui_channel(self):
+        session = _manager.get_session("default") if _manager else None
+        for ch in (session.channels if session else []):
+            if ch.channel_type == "tui":
+                ch._transport = write_json
+
+    def _serve_client(self, conn):
+        global _bg_reader_running
+        attached = False
+        try:
+            conn.settimeout(300)
+            buf = b""
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    text = line.decode("utf-8", errors="replace").strip()
+                    if not text:
+                        continue
+                    try:
+                        req = json.loads(text)
+                    except json.JSONDecodeError:
+                        self._send_line(conn, {
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32700, "message": "Parse error"},
+                            "id": None})
+                        continue
+                    method = req.get("method", "")
+
+                    if method == "tui.attach":
+                        with self._lock:
+                            already = self._attached_sock is not None
+                            if not already:
+                                self._attached_sock = conn
+                        if _STDIO_ACTIVE.is_set():
+                            # stdio 型 TUI 正在使用本 daemon（它就是本进程的
+                            # 父前端）——不允许 TCP attach 抢走事件流
+                            with self._lock:
+                                if self._attached_sock is conn:
+                                    self._attached_sock = None
+                            self._send_line(conn, {
+                                "jsonrpc": "2.0",
+                                "result": {"attached": False,
+                                           "error": "a TUI is already attached (stdio)"},
+                                "id": req.get("id")})
+                            return
+                        if already:
+                            self._send_line(conn, {
+                                "jsonrpc": "2.0",
+                                "result": {"attached": False,
+                                           "error": "another TUI already attached"},
+                                "id": req.get("id")})
+                            continue
+                        attached = True
+                        self._reroute_tui_channel(conn)
+                        self._send_line(conn, {
+                            "jsonrpc": "2.0", "result": {"attached": True},
+                            "id": req.get("id")})
+                        # 守护的 gateway.ready 早在启动时发过了——对接上的 TUI
+                        # 等不到它界面会永远卡"连接中"，补发一份
+                        self._send_line(conn, {
+                            "jsonrpc": "2.0", "method": "event",
+                            "params": {"type": "gateway.ready", "payload": {}}})
+                        logger.info("TuiRpcServer: TUI attached via TCP")
+                        continue
+
+                    if method == "tui.shutdown":
+                        self._send_line(conn, {
+                            "jsonrpc": "2.0", "result": {"shutting_down": True},
+                            "id": req.get("id")})
+                        logger.info("TuiRpcServer: shutdown requested by TUI")
+                        _bg_reader_running = False   # 主循环退出 → finally 走完整收尾
+                        return
+
+                    # 普通 RPC → 主循环 dispatch，应答经本 socket 回
+                    _request_queue.put((req, lambda o, _c=conn: self._send_line(_c, o)))
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+            if attached:
+                with self._lock:
+                    if self._attached_sock is conn:
+                        self._attached_sock = None
+                self._restore_tui_channel()
+                if self.shutdown_on_detach:
+                    logger.info("TuiRpcServer: attached TUI disconnected, "
+                                "shutting gateway down")
+                    _bg_reader_running = False
 
 
-def _start_processing(session_id: str):
+def _probe_existing_gateway(port, timeout=1.0) -> bool:
+    """探测 127.0.0.1:port 是否有常驻守护的 TuiRpcServer。"""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _run_proxy_mode(port) -> int:
+    """TUI spawn 进来的 gateway_entry 发现守护已在 → 本进程退化为代理。
+
+    stdio(TUI) ↔ TCP(守护)。stdin EOF（TUI 关闭）→ 发 tui.shutdown →
+    守护退出 → 代理退出。
     """
-    Start a background processing thread if one isn't already running.
-    Thread-safe, can be called from any thread.
-    """
-    global _SHUTTING_DOWN
-    if _SHUTTING_DOWN:
-        return
-    if _processing_lock.acquire(blocking=False):
-        thread = threading.Thread(
-            target=_process_queued_messages,
-            args=(session_id,),
-            daemon=True
-        )
-        thread.start()
+    import socket
+    logger.info("existing gateway detected, running as TUI proxy")
+    try:
+        sock = socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+    except OSError as e:
+        logger.warning("proxy connect failed: %s, fallback to standalone", e)
+        return 1   # 探测竞态（守护刚好死了）→ 调用方回退正常启动
+
+    def _sock_send(obj):
+        try:
+            sock.sendall((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+        except OSError:
+            pass
+
+    _sock_send({"jsonrpc": "2.0", "method": "tui.attach", "id": "attach"})
+
+    # 必须先确认 attach 被接受（否则说明守护已被另一个 TUI 占用）
+    import socket as _socket_mod
+    try:
+        sock.settimeout(5)
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        sock.settimeout(None)
+        first_line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace")
+        resp = json.loads(first_line) if first_line.strip() else {}
+    except Exception:
+        resp = {}
+    if resp.get("result", {}).get("attached") is not True:
+        err = resp.get("result", {}).get("error", "attach rejected")
+        logger.warning("TUI proxy: attach rejected (%s)", err)
+        try:
+            sock.close()
+        except OSError:
+            pass
+        return 2   # 另一个 TUI 已占用
+
+    stop = threading.Event()
+    # 若首行缓冲里还有剩余字节（事件），交给 pump 前置输出
+    _pending_first_chunk = buf.split(b"\n", 1)[1] if b"\n" in buf else b""
+    if _pending_first_chunk:
+        sys.stdout.write(_pending_first_chunk.decode("utf-8", errors="replace"))
+        sys.stdout.flush()
+
+    def _pump_sock_to_stdout():
+        try:
+            buf = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    sys.stdout.write(line.decode("utf-8", errors="replace") + "\n")
+                    sys.stdout.flush()
+        except OSError:
+            pass
+        finally:
+            stop.set()
+
+    threading.Thread(target=_pump_sock_to_stdout, daemon=True,
+                     name="proxy-sock-reader").start()
+
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            sock.sendall((line + "\n").encode("utf-8"))
+    except OSError:
+        pass
+
+    # stdin EOF = TUI 关闭 → 顺带关掉对接的守护
+    _sock_send({"jsonrpc": "2.0", "method": "tui.shutdown", "id": "bye"})
+    try:
+        sock.shutdown(socket.SHUT_WR)
+        deadline = time.time() + 5
+        while time.time() < deadline and not stop.is_set():
+            time.sleep(0.05)
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    logger.info("TUI proxy exit (gateway shut down)")
+    return 0
 
 
 def inject_voice_message(transcript: str) -> bool:
     """把语音识别结果作为带标签的 user 消息注入会话，并触发处理。"""
-    global _session
     transcript = (transcript or "").strip()
     if not transcript:
         logger.warning("voice: empty transcript, skip inject")
         return False
-    from Core.Message import CoreMessage, MessageSource
-    annotation = (
-        "[voice-recognize] This message originates from the user's voice "
-        "recognition input. It may contain Chinese homophone misrecognitions "
-        "or ASR errors — infer the intended meaning before acting."
-    )
-    _session.memory_manager.append(
-        CoreMessage.context_only(MessageSource.VOICE, annotation).to_dict()
-    )
-    _session.queue_message(f"[voice-recognize] {transcript}", "voice")
-    _start_processing("default")
+    session = _manager.default_session
+    session.enqueue(ChannelMessage(
+        text=f"[voice-recognize] {transcript}",
+        channel_type="voice",
+        channel_id="voice_wakeup",
+        meta={"note": "ASR 转写，可能含同音误识别"},
+    ))
     logger.info("voice: injected transcript into agent (%d chars)", len(transcript))
     return True
 
@@ -1909,16 +953,87 @@ def start_voice_http_server(port: int = 8999):
 
 def main():
     """Main entry point"""
-    global _session
+    global _manager
+
+    rpc_port = int(config.get("gateway.rpc_port", 8791) or 0)
+
+    # 单实例决策：端口先到先得。
+    # - 探测到已有守护 → 本进程退化为 TUI 代理（TUI 关闭时顺带关掉守护）
+    # - 否则**立即独占绑定端口再去做初始化**——消除"守护启动中(25s)
+    #   探测失败 → TUI 又起第二个完整 gateway"的竞态（2026-10-31 双实例事故）
+    if rpc_port > 0:
+        rpc_server = None
+        deadline = time.time() + 60
+        while True:
+            if _probe_existing_gateway(rpc_port, timeout=0.5):
+                code = _run_proxy_mode(rpc_port)
+                if code == 0:
+                    sys.exit(0)
+                if code == 2:
+                    # 另一个 TUI 已占用守护——不能再起第二个 gateway 抢 QQ 事件
+                    logger.error("another TUI is already using the running gateway")
+                    write_json({
+                        "jsonrpc": "2.0", "method": "event",
+                        "params": {"type": "gateway.init_error",
+                                   "payload": {"message":
+                                               "已有另一个 TUI 连接着后台网关，请先关闭那个 TUI"}}})
+                    sys.exit(1)
+                break   # 代理连接失败（对端刚好退出）→ 继续尝试本地绑定
+            candidate = TuiRpcServer(
+                rpc_port,
+                shutdown_on_detach=bool(config.get("gateway.tui_attach_shutdown", True)),
+            )
+            if candidate.start():        # 绑定即胜出：我是唯一实例
+                rpc_server = candidate
+                break
+            if time.time() > deadline:
+                logger.warning("RPC port busy, running without attach endpoint")
+                rpc_server = None
+                break
+            time.sleep(1)                # 对手刚绑上但还没 listen，稍等再探
+    else:
+        rpc_server = None
+
+    root_state = {"stop": None, "init_error": None}
 
     try:
-        # Initialize session immediately
-        _session = GatewaySession()
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(_session.initialize())
-        except Exception as init_err:
+        # 装配 SessionManager（共享服务 + 全部 session + channels）
+        loop = _get_main_loop()
+        _manager = SessionManager(tui_transport=write_json, loop=loop)
+
+        # ── 常驻根任务：MCP 会话是 anyio 结构化并发建的，宿主任务必须一直
+        # 活着，否则 task group 半坏——表现：启动时 list_tools 正常，之后
+        # CallTool 请求永远写不进子进程 stdin（2026-10-31 netease 全线挂死
+        # 的根因：run_until_complete(_manager.start()) 返回即宿主任务结束）。
+        # 方案：事件循环跑在独立线程，一个根协程 start → 等停止 → shutdown。
+        root_started = threading.Event()
+
+        def _loop_runner():
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        threading.Thread(target=_loop_runner, daemon=True,
+                         name="main-loop").start()
+        while not loop.is_running():
+            time.sleep(0.02)
+
+        async def _async_root():
+            root_state["stop"] = asyncio.Event()
+            try:
+                await _manager.start()
+            except Exception as e:
+                root_state["init_error"] = e
+            finally:
+                root_started.set()
+            await root_state["stop"].wait()
+            await _manager.shutdown()
+
+        asyncio.run_coroutine_threadsafe(_async_root(), loop)
+        root_started.wait(timeout=300)
+        if root_state["init_error"] is None and not (_manager and _manager.sessions):
+            root_state["init_error"] = RuntimeError("initialization timed out")
+        if root_state["init_error"] is not None:
+            init_err = root_state["init_error"]
             error_msg = str(init_err)
             log_crash(f"Gateway initialization failed: {error_msg}", sys.exc_info())
             write_json({
@@ -1930,8 +1045,6 @@ def main():
                 }
             })
             sys.exit(1)
-        finally:
-            loop.close()
 
         logger.info("Gateway session initialized")
 
@@ -1966,10 +1079,16 @@ def main():
         reader_thread = threading.Thread(target=_stdin_reader, daemon=True, name="stdin-reader")
         reader_thread.start()
 
+        # 若 TUI 在初始化完成前就已 attach（启动竞态窗口内），此时 channel
+        # 才刚装配出来——补一次事件流改道
+        if rpc_server is not None and rpc_server._attached_sock is not None:
+            rpc_server._reroute_tui_channel(rpc_server._attached_sock)
+            logger.info("TuiRpcServer: re-routed events for early-attached TUI")
+
         # Emit initial token stats —— 放后台线程，不阻塞请求主循环
         def _emit_initial_token_stats():
             try:
-                stats = _session.calculate_token_stats()
+                stats = _manager.default_session.calculate_token_stats()
             except Exception as exc:
                 logger.warning("initial token stats failed: %s", exc)
                 return
@@ -1991,17 +1110,15 @@ def main():
         # Process requests from queue
         while _bg_reader_running:
             try:
-                request = _request_queue.get(timeout=0.1)
+                request, reply = _request_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
             # Dispatch request
             method = request.get("method", "?")
-            sys.stderr.write(f"[TRACE] main loop dispatching: method={method}\n")
-            sys.stderr.flush()
             response = dispatch(request)
             if response is not None:
-                if not write_json(response):
+                if not reply(response):
                     log_crash("Failed to write response (broken pipe)")
                     sys.exit(0)
 
@@ -2016,18 +1133,27 @@ def main():
         # keep submitting LLM queries during executor shutdown
         _SHUTTING_DOWN = True
 
-        # Cleanup gateway
-        if _session:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        # Cleanup gateway：通知常驻根任务自己在 loop 线程里跑 shutdown
+        #（AsyncExitStack/MCP 拆除必须发生在进入它的同一任务里，跨任务会报
+        # "cancel scope in a different task"）
+        if _manager:
+            loop = _get_main_loop()
             try:
-                loop.run_until_complete(_session.shutdown())
-            finally:
-                loop.close()
+                stop_ev = root_state.get("stop") if "root_state" in locals() else None
+                if stop_ev is not None and loop.is_running():
+                    loop.call_soon_threadsafe(stop_ev.set)
+                    time.sleep(5)     # 根任务在此窗口内完成 MCP/工具拆除
+                if loop.is_running():
+                    loop.call_soon_threadsafe(loop.stop)
+                    time.sleep(0.5)
+                if not loop.is_running():
+                    loop.close()
+            except Exception as exc:
+                logger.warning("gateway shutdown cleanup failed: %s", exc)
 
         # Shutdown the persistent LLM executor last
         try:
-            from Agent.ActorAgent import shutdown_llm_executor
+            from Agent.api import shutdown_llm_executor
             shutdown_llm_executor(wait=False)
         except Exception:
             pass
