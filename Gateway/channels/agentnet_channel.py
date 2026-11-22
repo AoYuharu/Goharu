@@ -240,8 +240,9 @@ class AgentNetChannel(Channel):
             "ts": env.get("ts") or "",
         }
         with self._urgent_lock:
+            # 去重旗标只在 flush（新 turn 起点）重置——turn 进行中到达的
+            # 消息不得重置它，否则同一轮回答会被中继两次（双广播事故）
             self._urgent_buf.append(item)
-            self._agent_replied = False
             # 回复目标：主人消息优先，否则取最新消息的发送者
             if is_owner or self._reply_target is None or not self._reply_target.get("is_owner"):
                 self._reply_target = {"sender": sender, "is_owner": is_owner}
@@ -256,6 +257,8 @@ class AgentNetChannel(Channel):
             items = self._urgent_buf
             self._urgent_buf = []
             self._flush_timer = None
+            if items:
+                self._agent_replied = False  # 新 turn 起点：重置 reply 工具去重旗标
         if not items:
             return
         owners = [i for i in items if i["is_owner"]]
