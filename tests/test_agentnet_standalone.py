@@ -410,6 +410,21 @@ async def channel_test(root: Path):
               and "安静期闲聊二" in inbound[-1].text,
               inbound[-1].text[:120] if inbound else "")
         check("合并阅读后群消息已读", ch.box.unread_count(class_="group") == 0)
+
+        # update_profile：工具更新档案 → 落盘 + hub presence 即时生效
+        up = json.loads(await agentnet_tools.serverMessageHandler(
+            action="update_profile", focus="代码与组网协作",
+            tags=["coding", "agentnet"]))
+        check("工具 update_profile", up.get("ok"), str(up))
+        ok = await wait(
+            lambda: (hub.presence.snapshot().get(id_g.agent_id, {})
+                     .get("profile", {}).get("focus") == "代码与组网协作"),
+            label="profile pushed")
+        check("档案上报 hub 生效", ok, str(hub.presence.snapshot()))
+        prof_disk = json.loads(
+            (root / "ch_goharu" / "profile.json").read_text(encoding="utf-8"))
+        check("档案落盘", prof_disk.get("focus") == "代码与组网协作"
+              and "agentnet" in (prof_disk.get("tags") or []), str(prof_disk))
     finally:
         agentnet_tools.set_agentnet_handle(None)
         ch.stop()

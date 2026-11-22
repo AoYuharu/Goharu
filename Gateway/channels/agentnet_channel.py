@@ -250,6 +250,18 @@ class AgentNetChannel(Channel):
             return None
         return asyncio.run_coroutine_threadsafe(self._client.query_presence(), self._loop)
 
+    def net_update_profile_fut(self, focus: str | None = None, tags: list | None = None):
+        """更新自己的档案（focus/tags）并上报 hub；同时落盘 profile.json。"""
+        if focus is not None:
+            self.params["focus"] = str(focus)
+        if tags is not None:
+            self.params["tags"] = [str(t) for t in tags]
+        self._persist_profile()
+        if not self._client or not self._loop or not self._connected.is_set():
+            return None
+        return asyncio.run_coroutine_threadsafe(
+            self._client.update_profile(focus=focus, tags=tags), self._loop)
+
     # ------------------------------------------------------------- 便利贴
     def turn_extras(self) -> list[str]:
         """SessionMemoryView 的 turn_extras_provider：messagebox 摘要便利贴。"""

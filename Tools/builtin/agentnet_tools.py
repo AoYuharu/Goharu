@@ -47,8 +47,10 @@ async def serverMessageHandler(
     kind: str = "group",
     mentions: list | None = None,
     file_paths: list | None = None,
+    focus: str | None = None,
+    tags: list | None = None,
 ) -> str:
-    """智能体组网消息盒：summary/read/reply/presence 四动作。
+    """智能体组网消息盒：summary/read/reply/presence/update_profile 五动作。
 
     组网为**全员广播制**：所有消息网内全员可见（类似一个大群）。
     定向沟通用 mentions（@某人）——被 @ 的智能体立即响应，其他人静默入盒。
@@ -58,6 +60,8 @@ async def serverMessageHandler(
     action=reply：广播消息（kind=group；mentions=[agent_id] @对方；
                 file_paths=[本机绝对路径] 附带文件，先上传再随消息广播）
     action=presence：查状态机（谁在线/在忙/检修/上次在线时间）
+    action=update_profile：更新自己的档案（focus 侧重方向文本、tags 能力标签），
+                立即落盘并上报 hub——觉得自己的能力侧重变了就主动更新
     """
     h = _get()
     if h is None:
@@ -85,7 +89,15 @@ async def serverMessageHandler(
                 return _json({"ok": False, "error": "agentnet 未连接"})
             agents = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=15)
             return _json({"ok": True, "agents": agents})
-        return _json({"ok": False, "error": f"未知 action: {action}（合法：summary/read/reply/presence）"})
+        if action == "update_profile":
+            if focus is None and tags is None:
+                return _json({"ok": False, "error": "update_profile 需要 focus 或 tags"})
+            fut = h.net_update_profile_fut(focus=focus, tags=tags)
+            if fut is None:
+                return _json({"ok": False, "error": "agentnet 未连接"})
+            await asyncio.wait_for(asyncio.wrap_future(fut), timeout=10)
+            return _json({"ok": True, "focus": focus, "tags": tags})
+        return _json({"ok": False, "error": f"未知 action: {action}（合法：summary/read/reply/presence/update_profile）"})
     except Exception as e:
         logger.exception("serverMessageHandler %s 失败", action)
         return _json({"ok": False, "error": str(e)})
@@ -109,12 +121,14 @@ registry.register(
         "'read' (expand full messages; class_ filter, since=ISO ts for history; "
         "reading unread marks them read), 'reply' (broadcast text; mentions=[agent_id] "
         "to @ someone; file_paths=[local absolute paths] to attach files, uploaded then "
-        "broadcast), 'presence' (who is online/working/maintenance, last_seen)."
+        "broadcast), 'presence' (who is online/working/maintenance, last_seen), "
+        "'update_profile' (update YOUR OWN profile: focus=<text> and/or tags=[...], "
+        "persisted and pushed to the hub — use it whenever your capability focus changes)."
     ),
     arguments_schema={
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["summary", "read", "reply", "presence"]},
+            "action": {"type": "string", "enum": ["summary", "read", "reply", "presence", "update_profile"]},
             "class_": {"type": "string", "enum": ["mention", "group"],
                        "description": "read: 按类别过滤"},
             "peer": {"type": "string", "description": "read: 兼容保留（广播制下恒为 *）"},
@@ -127,6 +141,10 @@ registry.register(
                          "description": "reply: @ 的 agent_id 列表"},
             "file_paths": {"type": "array", "items": {"type": "string"},
                            "description": "reply: 要附带的本地文件绝对路径列表"},
+            "focus": {"type": "string",
+                      "description": "update_profile: 侧重方向文本（如“编程与自动化”）"},
+            "tags": {"type": "array", "items": {"type": "string"},
+                     "description": "update_profile: 能力标签列表"},
         },
         "required": ["action"],
     },

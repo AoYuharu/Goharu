@@ -255,6 +255,17 @@ class AgentNetClient:
         finally:
             self._presence_waiter = None
 
+    async def update_profile(self, focus: Optional[str] = None,
+                             tags: Optional[list] = None) -> None:
+        """更新自己的档案并上报 hub（focus/tags 任一给出才更新对应字段）。"""
+        if focus is not None:
+            self._profile["focus"] = str(focus)
+        if tags is not None:
+            self._profile["tags"] = [str(t) for t in tags]
+        await self._send(make_envelope(
+            sender=self.identity.agent_id, to="server", type_="profile_update",
+            payload={"profile": self._profile}))
+
     # ------------------------------------------------------------- 心跳
     async def _heartbeat_loop(self) -> None:
         while True:

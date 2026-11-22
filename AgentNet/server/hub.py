@@ -116,6 +116,15 @@ class Presence:
         }
         self._persist()
 
+    def set_profile(self, agent_id: str, profile: dict) -> bool:
+        """智能体自报档案更新（profile_update 消息驱动）。"""
+        if agent_id not in self._table:
+            return False
+        self._table[agent_id]["profile"] = dict(profile)
+        self._table[agent_id]["last_seen"] = now_ts()
+        self._persist()
+        return True
+
     def set_offline(self, agent_id: str) -> None:
         if agent_id in self._table:
             self._table[agent_id]["online"] = False
@@ -422,6 +431,19 @@ class HubServer:
         if t == "mailbox_pull":
             for queued in self.mailbox.drain(sender):
                 await self._send_to(sender, queued)
+            return
+        if t == "profile_update":
+            # 智能体自报档案更新（验签后生效并广播新状态机表）
+            record = self.whitelist.agent(sender)
+            if record is None or not Identity.verify(
+                    record["pubkey"], canonical_bytes(env), env.get("sig", "")):
+                logger.warning("profile_update 验签失败 from=%s", sender)
+                return
+            profile = (env.get("payload") or {}).get("profile")
+            if isinstance(profile, dict) and self.presence.set_profile(sender, profile):
+                logger.info("档案更新: %s → focus=%s tags=%s", sender,
+                            profile.get("focus", ""), profile.get("tags", []))
+                await self._broadcast_presence()
             return
         if t == "message":
             # 验签（防冒充）；白名单公钥
