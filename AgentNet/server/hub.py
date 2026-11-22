@@ -359,10 +359,14 @@ class HubServer:
             logger.exception("连接处理异常 agent=%s", agent_id)
         finally:
             if agent_id is not None:
-                self._online.pop(agent_id, None)
-                self.presence.set_offline(agent_id)
-                await self._broadcast_presence()
-                logger.info("下线: %s (last_seen 已落盘)", agent_id)
+                # 同一身份可能已建立新连接（重连竞态）：只有当前登记的仍是
+                # 本连接时才允许它下线——否则旧连接的迟来清理会把新连接
+                # 误判离线（曾导致 presence 幻影离线）
+                if self._online.get(agent_id) is ws:
+                    self._online.pop(agent_id, None)
+                    self.presence.set_offline(agent_id)
+                    await self._broadcast_presence()
+                    logger.info("下线: %s (last_seen 已落盘)", agent_id)
 
     async def _handshake(self, ws):
         """UNKNOWN → IDENTIFIED → CONFIRMED；任一步失败回 auth_error 并断开。

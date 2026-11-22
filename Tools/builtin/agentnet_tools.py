@@ -27,9 +27,34 @@ def set_agentnet_handle(handle) -> None:
         _handle = handle
 
 
+def _recover_handle():
+    """句柄丢失时（如 ReloadTools 重跑模块级代码）从运行中的 channel 实例找回。"""
+    global _handle
+    try:
+        from Gateway.channels.agentnet_channel import AgentNetChannel
+    except Exception:
+        return None
+    try:
+        import gc
+        for obj in gc.get_objects():
+            if isinstance(obj, AgentNetChannel):
+                _handle = obj
+                logger.warning(
+                    "agentnet 句柄丢失，已从运行实例自动恢复: %s",
+                    getattr(getattr(obj, "identity", None), "agent_id", "?"),
+                )
+                return obj
+    except Exception:
+        logger.exception("agentnet 句柄自动恢复失败")
+    return None
+
+
 def _get():
     with _lock:
-        return _handle
+        handle = _handle
+    if handle is not None:
+        return handle
+    return _recover_handle()
 
 
 def _json(obj) -> str:

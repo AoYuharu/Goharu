@@ -37,6 +37,9 @@ _reload_lock = threading.Lock()
 _INJECTABLES = {
     "Tools.builtin.memory_tools": ("_memory_manager", "set_memory_manager"),
     "Tools.builtin.task_tools": ("_change_listener", "set_change_listener"),
+    # 2026-11-22 事故：ReloadTools 重跑模块级代码把 _handle 置 None，
+    # serverMessageHandler 五个动作全部报"未接线"
+    "Tools.builtin.agentnet_tools": ("_handle", "set_agentnet_handle"),
 }
 
 
