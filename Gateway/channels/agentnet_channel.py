@@ -53,6 +53,9 @@ class AgentNetChannel(Channel):
         # 超时无消息自动退出，回到"@才醒 + 安静期自动阅读"
         self.attention_seconds = float(self.params.get("attention_seconds", 300))
         self._attentive_until = 0.0
+        # 乒乓刹车：连续 N 轮纯同事对话（无主人参与）后，同事闲聊不再唤醒
+        self._agent_pingpong_limit = int(self.params.get("agent_pingpong_limit", 3))
+        self._agent_streak = 0
         identity_dir = self.params.get("identity_dir", "./runtime_memory/agentnet/identity")
         box_path = self.params.get("messagebox_path", "./runtime_memory/agentnet/messagebox.db")
         self.identity = Identity.load_or_create(identity_dir, name=self.name)
@@ -202,8 +205,16 @@ class AgentNetChannel(Channel):
                          attachments=payload.get("attachments") or None)
         is_owner = sender in self.owner_ids
         in_attention = time.time() < self._attentive_until
+        if is_owner:
+            self._agent_streak = 0   # 主人说话重置乒乓计数
         urgent = (class_ in (CLASS_MENTION, CLASS_DM) or is_owner
                   or (class_ == CLASS_GROUP and in_attention))
+        # 乒乓刹车：关注期内的同事普通群聊，连续 N 轮无主人参与后不再唤醒
+        if urgent and not is_owner and class_ == CLASS_GROUP:
+            if self._agent_streak >= self._agent_pingpong_limit:
+                logger.info("乒乓刹车：同事闲聊不再唤醒（streak=%d）", self._agent_streak)
+                return
+            self._agent_streak += 1
         if not urgent:
             return
         # 已被唤醒的消息直接从收件箱标记已读（内容会进合并上下文）
@@ -269,6 +280,14 @@ class AgentNetChannel(Channel):
         parts.extend(self._consume_group_rows())
         parts.append("提示：以上为组网消息合辑——关注可能与你有关的内容即可；"
                      "不重要且不相关的可以不回复。回复请用 serverMessageHandler(reply)。")
+        if not owners:
+            parts.append("（同事消息：只有确实需要回应或行动时才用 reply 回复；"
+                         "不要发送纯确认/待命/寒暄类消息，避免与同事形成反弹循环。）")
+        # 自动中继策略：只有主人触发的 turn 才把回答自动广播回网；
+        # 纯同事触发的 turn 必须用 reply 工具显式回应——防止"我不回复"被中继成新消息
+        with self._urgent_lock:
+            if self._reply_target is not None:
+                self._reply_target["auto_relay"] = bool(owners)
         first_owner = owners[0] if owners else None
         meta = {"agentnet": True, "class": items[0]["class"],
                 "sender": (first_owner or items[-1])["sender"],
@@ -330,6 +349,10 @@ class AgentNetChannel(Channel):
         if self._agent_replied:
             self._agent_replied = False
             logger.info("agentnet: 模型已自行广播，跳过 send_answer 中继")
+            return
+        # 纯同事触发的 turn 不自动中继（防反弹循环）：要回应必须用 reply 工具
+        if not target.get("auto_relay", True):
+            logger.info("agentnet: 同事触发的回答不自动中继（防乒乓）")
             return
         if not self._client or not self._loop:
             return

@@ -239,6 +239,8 @@ class SessionManager:
                         config.get("agentnet.group_inline_max_chars", 1500)),
                     "attention_seconds": float(
                         config.get("agentnet.attention_seconds", 300)),
+                    "agent_pingpong_limit": int(
+                        config.get("agentnet.agent_pingpong_limit", 3)),
                 })
                 session.attach_channel(ch)
                 ch.bind(session.enqueue)

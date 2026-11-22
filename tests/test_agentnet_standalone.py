@@ -487,6 +487,33 @@ async def channel_test(root: Path):
         await client_x.send_message("grp:town", "过期后闲聊C", kind="group")
         await asyncio.sleep(0.6)
         check("关注期过期回静默", len(inbound) == mid)
+
+        # ── 防乒乓 ──────────────────────────────────────────────
+        # 同事触发的 turn：send_answer 不自动中继（必须用 reply 工具）
+        ch.attention_seconds = 60
+        ch._attentive_until = 0
+        mid = len(inbound)
+        await client_x.send_message("grp:town", "同事消息一", kind="group",
+                                    mentions=[id_g.agent_id])
+        await wait(lambda: len(inbound) > mid, label="agent-trigger")
+        mid_recv = len(received_x)
+        ch.send_answer("我不回复")
+        await asyncio.sleep(0.6)
+        check("同事触发不自动中继", len(received_x) == mid_recv,
+              f"received={len(received_x)}")
+
+        # 连续同事闲聊超过 pingpong_limit → 不再唤醒
+        ch._agent_pingpong_limit = 1
+        ch._agent_streak = 0
+        ch._attentive_until = time.time() + 60
+        mid = len(inbound)
+        await client_x.send_message("grp:town", "同事闲聊第一次", kind="group")
+        ok1 = await wait(lambda: len(inbound) > mid, label="pp1")
+        mid2 = len(inbound)
+        await client_x.send_message("grp:town", "同事闲聊第二次", kind="group")
+        await asyncio.sleep(1.6)
+        check("乒乓刹车生效", ok1 and len(inbound) == mid2,
+              f"woke_first={ok1} delta={len(inbound) - mid2}")
     finally:
         agentnet_tools.set_agentnet_handle(None)
         ch.stop()
