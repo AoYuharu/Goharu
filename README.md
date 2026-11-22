@@ -1,4 +1,3 @@
-
 <p align="center">
   <a href="#chinese">中文</a> | <a href="#english">English</a>
 </p>
@@ -6,7 +5,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10+-blue?style=for-the-badge&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/LLM-Anthropic_Compatible-orange?style=for-the-badge&logo=anthropic&logoColor=white" alt="LLM">
-  <img src="https://img.shields.io/badge/UI-Textual_TUI-purple?style=for-the-badge&logo=terminal&logoColor=white" alt="Textual">
+  <img src="https://img.shields.io/badge/TUI-TypeScript_Ink-purple?style=for-the-badge&logo=terminal&logoColor=white" alt="TUI">
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="License">
 </p>
 
@@ -14,20 +13,9 @@
   <img src="GoharuCover.png" alt="Goharu Cover" width="600">
 </p>
 
-<h1 align="center">
-  <pre>
-  ██████╗  ██████╗ ██╗  ██╗ █████╗ ██████╗ ██╗   ██╗
-  ██╔════╝ ██╔═══██╗██║  ██║██╔══██╗██╔══██╗██║   ██║
-  ██║  ███╗██║   ██║███████║███████║██████╔╝██║   ██║
-  ██║   ██║██║   ██║██╔══██║██╔══██║██╔══██╗██║   ██║
-  ╚██████╔╝╚██████╔╝██║  ██║██║  ██║██║  ██║╚██████╔╝
-   ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝
-  </pre>
-</h1>
-
 <p align="center">
-  一个多功能的编程与电脑助手。<br>
-  A multi-functional coding &amp; computer assistant.
+  双智能体个人 AI 系统：前台对话 Hero + 幕后助手 Arch。<br>
+  A dual-agent personal AI system — Hero talks to you, Arch keeps the system alive.
 </p>
 
 ---
@@ -38,178 +26,90 @@
 
 ### Goharu 是什么？
 
-**Goharu** 是一个基于大语言模型（兼容 Anthropic API）的终端编程 Agent。它运行在 ReAct 循环中——思考 → 行动 → 观察 → 回答——直接操作文件系统和 Shell。
+**Goharu** 是一个运行在 Windows / Linux 上的个人 AI 智能体系统。它由两个智能体组成：
 
-#### 核心能力
+- **Hero（主智能体）**——你在 QQ / 终端 TUI 里对话的那个。ReAct 循环（思考 → 工具 → 观察 → 回答），操作文件、跑命令、联网、读 PDF，带着一套 L0→L3 记忆金字塔长期记得你。
+- **Arch（幕后助手）**——你看不见的守护者。它在后台观察系统遥测，故障时自愈、代码更新时审计、裸机部署时自我探测环境。Hero 和 Arch 可以双向对话。
+
+### 核心能力
 
 | 能力 | 说明 |
 |---|---|
-| **文件操作** | 读取、写入、diff 式编辑（Write / Read / Edit），带权限门控 |
-| **Shell 执行** | 运行任意命令，带多层安全防火墙 |
-| **子 Agent 委托** | 派生子 Agent 进行探索、规划、验证 |
-| **PDF 解析** | 提取 PDF 中的文本和表格，支持 OCR 回退 |
-| **记忆系统** | L0→L1→L2→L3 长短期记忆体系，混合检索（BM25 + 向量 + 全文搜索） |
-| **技能系统** | 预制 SOP 范式：论文分析、引文、绘图、学术润色、审稿回复 |
-| **后台任务** | 长时间工具调用转入后台异步执行，完成后自动唤醒 Agent |
+| **多通道对话** | QQ 机器人（私聊/群聊@）+ TypeScript Ink TUI，消息跟随最近活跃通道，TUI 常驻旁观 |
+| **记忆金字塔** | L0 原始消息 → L1 经验原子 → L2 场景 → L3 人设，混合检索（FTS5 + BM25 + 向量） |
+| **子智能体** | Explore / Plan / Verify（只读）+ Arch（可写、有私有记忆塔） |
+| **自愈与自升级** | Arch 监听健康信号（卡死/逻辑错误/更新），故障诊断修复；GitHub 更新经 staging 审计 + 四态确认流才合并 |
+| **Bootstrap 裸机部署** | 首次启动自动探测 12 类系统信息（OS/CPU/GPU/网络/外设…），探不到的由 Arch 补漏 |
+| **Checkpoint 审计** | turn 级文件+记忆双捕获，可回退 |
+| **智能体组网** | HaruNet：多个 Goharu 实例互联广播 |
+| **安全链** | 命令三态（允许/确认/硬拒）、先 Read 后 Edit、shell 写操作拦截 |
 
-#### 架构总览
+### 一键安装
 
-Goharu 采用分层架构。入口为 `run_tui_ts.py`（终端 TUI），通过 JSON-RPC 与 Gateway 后端通信，Gateway 将请求转发给 Actor Agent。Agent 运行 ReAct 循环（思考 → 工具 → 观察 → 回答），内部由 PromptAssembler → LLMCore → ToolRuntime 串联。下层依赖三大系统：工具层（9 个内置模块）、记忆系统（L0→L3 金字塔 + 混合检索）、子 Agent（探索/规划/验证）。
-
-#### 记忆金字塔
-
-记忆系统分四层：**L0** = SQLite 中的原始消息；**L1** = 每 5 轮对话提取一次的记忆原子（JSON + 向量嵌入）；**L2** = 从 L1 原子聚合的场景上下文（scene_blocks/*.md），延迟 90 秒触发；**L3** = 用户画像（persona.md），当累计 50+ 个新 L1 原子时生成。
-
-检索融合 **BM25**（结巴中文分词）+ **FTS5**（SQLite 全文搜索）+ **向量嵌入**，三路召回。
-
----
-
-### 项目结构
-
-```
-Goharu/
-├── Agent/                    # 核心 Agent 智能
-│   ├── ActorAgent.py         #   ReAct 循环：思考 → 工具 → 观察 → 回答
-│   ├── LLMCore.py            #   Anthropic 兼容 API 单例
-│   ├── SubAgent.py           #   子 Agent 委托（探索/规划/验证）
-│   ├── SummarizerAgent.py    #   L1 记忆原子提取
-│   ├── PipelineManager.py    #   L0→L1→L2→L3 管道编排
-│   ├── BackgroundTaskManager.py  # 异步后台任务管理
-│   ├── MicroCompactor.py     #   旧工具结果折叠压缩
-│   └── ContextCompactor.py   #   长对话自动摘要
-│
-├── Memory/                   # 长期记忆系统
-│   ├── MemoryManager.py      #   外观接口：工作记忆 + 检索 + 画像
-│   ├── WorkingMemory.py      #   短期记忆：每日 JSON + SQLite 双写
-│   ├── retrieval/
-│   │   └── HybridRetriever.py    # BM25 + 向量 + FTS 混合检索
-│   └── pipeline/
-│       ├── SceneExtractor.py     # L2 场景聚合
-│       └── PersonaGenerator.py   # L3 用户画像生成
-│
-├── Tools/                    # 进程内工具运行时
-│   ├── builtin/
-│   │   ├── core_tools.py     #   run_cmd 命令执行、知识管理
-│   │   ├── file_tools.py     #   文件写、读、编辑（diff 式）、搜索
-│   │   ├── pdf_tools.py      #   PDF 解析（含 OCR）
-│   │   ├── agent_delegate.py #   子 Agent 委托
-│   │   ├── skill_tool.py     #   预制技能 SOP 加载
-│   │   └── glob_tool.py      #   Glob 文件搜索
-│   ├── security.py           #   命令安全检查器
-│   └── registry.py           #   工具注册表单例
-│
-├── Prompting/                # 提示词组装管道
-│   ├── PromptAssembler.py    #   构建完整 Agent 提示词（SOUL + L1/L2/L3 + 历史）
-│   ├── PromptLoader.py       #   加载 Markdown 提示词模板
-│   └── PromptRenderer.py     #   渲染 PromptDocument → LLM 消息
-│
-├── tui-ts/                   # 终端用户界面 (TypeScript + Ink)
-│   ├── src/components/       #   App/ChatLog/StatusBar/InputBar 等组件
-│   ├── src/gateway/          #   GatewayClient（子进程 + NDJSON 协议）
-│   └── test/                 #   mock gateway + UI 冒烟测试
-│
-├── Gateway/                  # 后端 Gateway 子进程入口
-│   └── gateway_entry.py      #   JSON-RPC over stdio，初始化 Agent/记忆/工具
-│
-├── Core/                     # 共享数据结构
-│   ├── Config.py             #   类型化数据类
-│   ├── Message.py            #   带来源追踪的核心消息
-│   └── LogManager.py         #   集中日志管理
-│
-├── Skills/                   # 预制技能范式
-├── prompts/                  # Markdown 提示词模板
-├── config.yaml               # 主配置文件
-├── requirements.txt          # Python 依赖
-└── run_tui_ts.py             # ▶ 主入口
-```
-
----
-
-### 安装
-
-#### 前置条件
-
-- **Python 3.10+**
-- **兼容 Anthropic 的 API Key**（Claude API、MiniMax 或任意兼容提供商）
-- **Tesseract OCR**（可选，PDF OCR 功能需要）
-
-#### 快速开始
+**Linux / macOS：**
 
 ```bash
-# 1. 克隆仓库
-git clone https://github.com/your-org/Goharu.git
+git clone https://github.com/AoYuharu/Goharu.git && cd Goharu
+./install.sh                  # 核心安装（轻量，FTS5+BM25 检索）
+./install.sh --with-embedding # 可选：语义检索增强（torch，>2GB）
+./install.sh --systemd        # 可选：注册 headless 常驻服务
+```
+
+**Windows：**
+
+```bat
+git clone https://github.com/AoYuharu/Goharu.git
 cd Goharu
-
-# 2. 安装依赖
-pip install -r requirements.txt
-
-# 3. 设置 API Key 环境变量
-# Windows PowerShell:
-$env:ANTHROPIC_API_KEY="your-api-key-here"
-# Linux / macOS:
-export ANTHROPIC_API_KEY="your-api-key-here"
-
-# 4. 启动
-python run_tui_ts.py       # TypeScript/Ink TUI（需先 cd tui-ts && npm install && npm run build）
+install.bat
 ```
 
-base_url、模型等参数在 `config.yaml` → `model.large-language-model` 中配置。
+安装后：编辑 `.env` 填入 LLM 密钥（`ANTHROPIC_API_KEY` 或 `ZHIPU_API_KEY`，任一 Anthropic 兼容端点），然后：
 
-> **tui-ts**：TypeScript + Ink 实现的 TUI 前端（Ink 不捕获鼠标，终端原生框选复制可用）。
-> 旧版 Python/Textual TUI 保留在 `python` 分支。
-> 与 Python TUI 共用同一 Gateway 后端和协议（见 `docs/tui-protocol.md`）。
-> 开发模式：`cd tui-ts && npm run dev`；离线 UI 开发：`npm run mock`。
+```bash
+./start.sh        # Linux/macOS
+start.bat         # Windows
+```
 
----
+**卸载：**
 
-### 使用
+```bash
+./uninstall.sh            # 清依赖产物，保留数据
+./uninstall.sh --all      # 连记忆数据一起清
+./uninstall.sh --purge    # 连 .env 密钥一起清
+```
 
-#### TUI 界面
+### 配置
 
-TUI 为单栏对话流布局：消息、思考过程、工具调用与结果、最终回答按时间顺序滚动展示；底部状态栏显示连接状态和 Token 统计。
+全部走 `config.yaml`（首次安装无需改动即可跑）：
 
-| 快捷键 | 功能 |
+| 区块 | 控制什么 |
 |---|---|
-| `Ctrl+C` | 退出 |
-| `Ctrl+L` | 清空对话 |
-| `Ctrl+H` | 切换帮助 |
-| `Esc` | 中断 Agent |
-| `Tab` | 切换焦点 |
+| `model` | LLM 端点/模型/重试（支持多模型历史切换） |
+| `memory` | 记忆金字塔与检索参数 |
+| `tools` | 工具链、安全黑名单/灰名单、MCP servers（`${ENV_VAR}` 引用密钥） |
+| `agent` | ReAct 深度、看门狗、上下文压缩阶梯 |
+| `architect_hub` | Arch 的遥测/唤醒/更新门控/Bootstrap |
+| `sessions` | 多会话 + channel 挂载（TUI/QQBot/遥测） |
 
-#### 使用示例
+TUI 内置设置界面：右下角 `☰ Settings` → 模型 / 语音 / 浏览器抽取 / **通道管理**（可视化增删 channel，保存后重启生效）。
+
+### 架构
 
 ```
-You: 帮我写一个冒泡排序的 Python 实现，并测试它
-
-Goharu: 好的，我来创建实现和测试文件。
-
-  [Tool: Write]  → 创建 bubble_sort.py
-  [Tool: Write]  → 创建 test_bubble_sort.py
-  [Tool: run_cmd]  → 运行测试
-
-  测试全部通过。冒泡排序已实现在 bubble_sort.py 中。
+QQ / TUI / …（channel 插件，能力声明轮发）
+        │
+   Gateway（多 session 装配、路由、压缩阶梯）
+        │
+   Hero ── ActorAgent（ReAct 引擎，主/子智能体共用）
+        │
+   Tools / Memory / Prompting / Agent（四大解耦子系统，facade 接入）
+        │
+   Arch ── 遥测 digest · 唤醒触发器 · staging 审计 · Bootstrap 探测
 ```
 
----
+### 开发
 
-### 安全机制
-
-Goharu 在本地运行所有工具，带**多层安全体系**：
-
-- **命令安全检查器**：阻止危险命令执行（shutdown、rm -rf、format、diskpart、reg delete、powershell -enc 等）
-- **文件操作拦截**：Shell 中的文件操作命令（echo/cat/sed/awk 等）被主动拦截，引导使用专用文件工具
-- **权限门控**：编辑前必须先读取；写入拒绝覆盖已存在文件
-- **全程可配**：所有安全规则定义在 `config.yaml` → `tools.security`
-
----
-
-### 设计理念
-
-- **模块化**：组件小而专注，职责清晰，易于理解和维护
-- **可配置**：从模型选择到记忆阈值，一切尽在 `config.yaml`
-- **可观测**：每层都有全面日志——Agent、工具、记忆、TUI
-- **最简开发**：按需添加复杂度，拒绝过度设计
-- **安全第一**：工具不能绕过文件权限或执行破坏性命令
+模块化团队协作：每个子系统有 `CLAUDE.md` 维护者文档 + 独立契约测试（`tests/test_*_standalone.py`）。改公共接口后必须跑对应测试。详见根目录 `CLAUDE.md`。
 
 ---
 
@@ -217,187 +117,20 @@ Goharu 在本地运行所有工具，带**多层安全体系**：
 
 ## English
 
-### What is Goharu?
+**Goharu** is a dual-agent personal AI system for Windows/Linux:
 
-**Goharu** is a terminal-based Coding Agent powered by large language models (Anthropic-compatible API). It operates in a ReAct loop — Think → Act → Observe → Answer — working directly on your filesystem and shell.
+- **Hero** — the conversational agent you talk to (QQ bot / terminal TUI). ReAct loop, file & shell tools, L0→L3 memory pyramid, sub-agents (Explore/Plan/Verify).
+- **Arch** — a backstage maintainer agent with its own private memory tower. Watches telemetry, self-heals failures, audits code updates through a staging pipeline, and probes bare-metal deployments.
 
-#### Core Capabilities
-
-| Capability | Description |
-|---|---|
-| **File Operations** | Read, Write, and patch-style Edit (like `git diff`) with permission gating |
-| **Shell Execution** | Run arbitrary commands with a multi-layer security firewall |
-| **Sub-Agent Delegation** | Spawn sub-agents for exploration, planning, and verification |
-| **PDF Parsing** | Extract text and tables from PDFs, with OCR fallback |
-| **Memory System** | L0→L1→L2→L3 long-term memory with hybrid retrieval (BM25 + Embedding + FTS) |
-| **Skills System** | Pre-built SOPs: paper analysis, citation, figure generation, academic polishing |
-| **Background Tasks** | Long-running tool calls go async; agent reactivates when they complete |
-
-#### Architecture at a Glance
-
-Goharu uses a layered architecture. The entry point is `run_tui_ts.py` (terminal TUI), which communicates with the Gateway backend via JSON-RPC. The Gateway routes requests to the Actor Agent. The Agent runs a ReAct loop (Think → Tools → Observe → Answer), internally wired as PromptAssembler → LLMCore → ToolRuntime. Three downstream systems support it: the Tools layer (9 built-in modules), the Memory system (L0→L3 pyramid + hybrid retrieval), and Sub-Agents (explore/plan/verify).
-
-#### Memory Pyramid
-
-The memory system has four tiers: **L0** = raw messages in SQLite; **L1** = memory atoms (JSON + embedding vectors) extracted every 5 conversation turns; **L2** = scene contexts (scene_blocks/*.md) aggregated from L1 atoms with a 90-second delay; **L3** = persona profile (persona.md) generated when 50+ new L1 atoms accumulate.
-
-Retrieval combines **BM25** (with Jieba Chinese segmentation), **FTS5** (SQLite full-text search), and **embedding-based** vector search for multi-signal recall.
-
----
-
-### Project Structure
-
-```
-Goharu/
-├── Agent/                    # Core agent intelligence
-│   ├── ActorAgent.py         #   ReAct-loop: Think → Tools → Observe → Answer
-│   ├── LLMCore.py            #   Anthropic-compatible API singleton
-│   ├── SubAgent.py           #   Delegate sub-agents (explore/plan/verify)
-│   ├── SummarizerAgent.py    #   L1 memory atom extraction
-│   ├── PipelineManager.py    #   L0→L1→L2→L3 orchestration
-│   ├── BackgroundTaskManager.py  # Async long-running tool tasks
-│   ├── MicroCompactor.py     #   Collapse old tool results
-│   └── ContextCompactor.py   #   Summarize long conversations
-│
-├── Memory/                   # Long-term memory system
-│   ├── MemoryManager.py      #   Facade: Working + Retrieval + Persona
-│   ├── WorkingMemory.py      #   Short-term: daily JSON + SQLite dual-write
-│   ├── retrieval/
-│   │   └── HybridRetriever.py    # BM25 + Embedding + FTS multi-signal search
-│   └── pipeline/
-│       ├── SceneExtractor.py     # L2 scene aggregation
-│       └── PersonaGenerator.py   # L3 persona profiling
-│
-├── Tools/                    # In-process tool runtime
-│   ├── builtin/
-│   │   ├── core_tools.py     #   run_cmd, knowledge management
-│   │   ├── file_tools.py     #   Write, Read, Edit (patch-style), Grep
-│   │   ├── pdf_tools.py      #   PDF parsing with OCR
-│   │   ├── agent_delegate.py #   Sub-agent delegation
-│   │   ├── skill_tool.py     #   Pre-built skill SOPs
-│   │   └── glob_tool.py      #   Glob file search
-│   ├── security.py           #   Command safety checker
-│   └── registry.py           #   Tool registry singleton
-│
-├── Prompting/                # Prompt assembly pipeline
-│   ├── PromptAssembler.py    #   Builds full agent prompt (SOUL + L1/L2/L3 + history)
-│   ├── PromptLoader.py       #   Loads markdown prompt templates
-│   └── PromptRenderer.py     #   Renders PromptDocument → LLM messages
-│
-├── tui-ts/                   # Terminal User Interface (TypeScript + Ink)
-│   ├── src/components/       #   App/ChatLog/StatusBar/InputBar components
-│   ├── src/gateway/          #   GatewayClient (subprocess + NDJSON protocol)
-│   └── test/                 #   mock gateway + UI smoke tests
-│
-├── Gateway/                  # Backend Gateway subprocess entry
-│   └── gateway_entry.py      #   JSON-RPC over stdio, boots Agent/memory/tools
-│
-├── Core/                     # Shared data structures
-│   ├── Config.py             #   Typed dataclasses
-│   ├── Message.py            #   CoreMessage with source tracking
-│   └── LogManager.py         #   Centralized logging
-│
-├── Skills/                   # Pre-built skill paradigms
-├── prompts/                  # Markdown prompt templates
-├── config.yaml               # Main configuration
-├── requirements.txt          # Python dependencies
-└── run_tui_ts.py             # ▶ Primary entry point
-```
-
----
-
-### Installation
-
-#### Prerequisites
-
-- **Python 3.10+**
-- **An Anthropic-compatible API key** (Claude API, MiniMax, or any compatible provider)
-- **Tesseract OCR** (optional, for PDF OCR features)
-
-#### Quick Start
+### Quickstart
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/your-org/Goharu.git
-cd Goharu
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Set the API key environment variable
-# Windows PowerShell:
-$env:ANTHROPIC_API_KEY="your-api-key-here"
-# Linux / macOS:
-export ANTHROPIC_API_KEY="your-api-key-here"
-
-# 4. Launch
-python run_tui_ts.py
+git clone https://github.com/AoYuharu/Goharu.git && cd Goharu
+./install.sh        # Windows: install.bat
+cp .env.example .env  # fill in your Anthropic-compatible API key
+./start.sh          # Windows: start.bat
 ```
 
-The base URL, model, and other parameters are configured in `config.yaml` → `model.large-language-model`.
+Uninstall: `./uninstall.sh [--all|--purge]` (Windows: `uninstall.bat`).
 
-The default config uses MiniMax's Anthropic-compatible endpoint. To use Anthropic directly, change `base_url` to `https://api.anthropic.com`.
-
----
-
-### Usage
-
-#### TUI Interface
-
-The TUI uses a two-panel layout: the left panel handles the conversation (streaming messages, thinking blocks, final answers), while the right panel tracks live tool calls, results, errors, and background task status. A bottom status bar shows connection state, tool count, and token usage.
-
-| Key | Action |
-|---|---|
-| `Ctrl+C` | Quit |
-| `Ctrl+L` | Clear chat |
-| `Ctrl+H` | Toggle help |
-| `Esc` | Interrupt agent |
-| `Tab` | Switch focus |
-
-#### Example Session
-
-```
-You: 帮我写一个冒泡排序的 Python 实现，并测试它
-
-Goharu: 好的，我来创建实现和测试文件。
-
-  [Tool: Write]  → 创建 bubble_sort.py
-  [Tool: Write]  → 创建 test_bubble_sort.py
-  [Tool: run_cmd]  → 运行测试
-
-  测试全部通过。冒泡排序已实现在 bubble_sort.py 中。
-```
-
----
-
-### Security
-
-Goharu runs tools locally with a **multi-layer security system**:
-
-- **Command Safety Checker**: Blocks destructive commands (shutdown, rm -rf, format, diskpart, reg delete, powershell -enc, etc.) before execution
-- **File Operation Enforcement**: Shell commands like `echo`/`cat`/`sed`/`awk` that target files are actively blocked — the model is redirected to use dedicated file tools
-- **Permission Gating**: Edit requires prior Read; Write refuses to overwrite existing files
-- **Configurable**: All security rules are defined in `config.yaml` → `tools.security`
-
----
-
-### Key Design Principles
-
-- **Modular**: Components are small, focused classes with clear responsibilities
-- **Configurable**: Everything from model selection to memory thresholds lives in `config.yaml`
-- **Observable**: Comprehensive logging at every layer — agent, tools, memory, TUI
-- **Minimal**: No over-engineering; complexity only where the problem demands it
-- **Safe**: Tools cannot bypass file permissions or execute destructive commands
-
----
-
-## License
-
-MIT © Goharu
-
----
-
-<p align="center">
-  <sub>Built with Python · Anthropic API · Textual TUI · SQLite · PyMuPDF</sub><br>
-  <sub>使用 Python · Anthropic API · Textual TUI · SQLite · PyMuPDF 构建</sub>
-</p>
+Any Anthropic-compatible endpoint works (DeepSeek, MiniMax, Kimi, GLM, official). Configuration is fully driven by `config.yaml`. Each subsystem (`Tools/`, `Memory/`, `Prompting/`, `Agent/`, `Architect/`) is independently pluggable with its own facade and contract tests.
