@@ -1,9 +1,5 @@
 pyyaml
 python-dotenv
-# 锁定已验证可用的组合（CPU 加载 embedding 通过）；勿裸依赖，否则 pip 拉到新版易触发 CUDA 加载崩溃
-torch==2.8.0
-transformers==4.57.1
-sentence-transformers==5.4.1
 anthropic
 openai>=1.0.0  # provider=openai_compatible 时需要
 mcp>=1.27.0  # MCP server 热接入（mcp_manage 工具）
@@ -21,3 +17,11 @@ pywin32>=306; sys_platform == "win32"
 
 # BM25 + jieba 中文分词
 jieba>=0.42.1
+
+# QQ Bot channel
+websockets>=12.0
+
+# ── 向量检索（可选增强）──
+# embedding/reranker 模型加载需要 torch 等重依赖（>2GB）。
+# 不装则自动降级为 FTS5+BM25 纯文本检索，功能完整仅召回精度略降。
+# 需要时装：pip install -r requirements-embedding.txt

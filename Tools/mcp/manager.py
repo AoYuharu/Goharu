@@ -32,7 +32,30 @@ _pending_images_MAX = 4
 _pending_images = []
 
 
+def _expand_env(value):
+    """展开 spec 字符串里的 ${VAR} 环境变量（密钥不落 config.yaml）。
+
+    未设置的变量保留占位符并告警——让用户从日志一眼看出缺哪个，
+    而不是把字面值 ${VAR} 发去服务端报一个莫名其妙的错。
+    """
+    if not isinstance(value, str) or "${" not in value:
+        return value
+    import os
+    import re
+
+    def _sub(m):
+        name = m.group(1)
+        v = os.environ.get(name)
+        if v is None:
+            logger.warning("MCP spec 引用的环境变量未设置: %s", name)
+            return m.group(0)
+        return v
+
+    return re.sub(r"\$\{(\w+)\}", _sub, value)
+
+
 def _stash_image_block(block):
+
     _pending_images.append(block)
     del _pending_images[:-_pending_images_MAX]
 
@@ -175,7 +198,8 @@ class MCPClientManager:
                 # （2026-10-31 事故：netease music_search 25s+ 全军覆没）。
                 # 需要代理的 stdio server 在其 env 里显式覆盖 NO_PROXY。
                 env = {**get_default_environment(), "NO_PROXY": "*"}
-                env.update(spec.get("env") or {})
+                env.update({k: _expand_env(str(v))
+                            for k, v in (spec.get("env") or {}).items()})
                 params = StdioServerParameters(
                     command=spec["command"],
                     args=[str(a) for a in (spec.get("args") or [])],
@@ -197,10 +221,14 @@ class MCPClientManager:
                 if spec.get("headers"):
                     import httpx
                     http_client = await stack.enter_async_context(
-                        httpx.AsyncClient(headers=spec["headers"], follow_redirects=True)
+                        httpx.AsyncClient(
+                            headers={k: _expand_env(str(v))
+                                     for k, v in spec["headers"].items()},
+                            follow_redirects=True)
                     )
                 read, write, _ = await stack.enter_async_context(
-                    streamable_http_client(spec["url"], http_client=http_client)
+                    streamable_http_client(_expand_env(spec["url"]),
+                                           http_client=http_client)
                 )
             else:
                 raise ValueError(f"Unsupported MCP transport: {transport} (supported: stdio, http)")

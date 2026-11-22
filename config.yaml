@@ -171,23 +171,18 @@ tools:
   mcp:
     call_timeout_seconds: 60
     servers:
-      browser-use:
-        command: D:\MyProject\Programming\AgentDevelop\browser-use\.venv\Scripts\python.exe
-        args:
-        - -m
-        - browser_use.mcp
-        env:
-          ANONYMIZED_TELEMETRY: 'False'
-      netease-music:
-        command: D:\MyAnaconda\python.exe
-        args:
-        - D:\MyProject\Programming\python\pythonsome\pythonsome\newbroker\netmusic_mcp.py
-        call_timeout_seconds: 30
-        env:
-          PYTHONIOENCODING: utf-8
       tavily:
         transport: http
-        url: https://mcp.tavily.com/mcp/?tavilyApiKey=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
+        url: https://mcp.tavily.com/mcp/?tavilyApiKey=${TAVILY_API_KEY}
+      # ── 本机 stdio MCP 示例（按本机实际路径配置后取消注释）──
+      # browser-use:
+      #   command: /path/to/browser-use/.venv/bin/python
+      #   args: [-m, browser_use.mcp]
+      #   env: {ANONYMIZED_TELEMETRY: 'False'}
+      # netease-music:
+      #   command: /path/to/python
+      #   args: [/path/to/netmusic_mcp.py]
+      #   call_timeout_seconds: 30
   security:
     allow_confirmation: true
     dangerous_commands:

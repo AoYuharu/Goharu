@@ -1,0 +1,5 @@
+# 向量检索增强依赖（可选）——安装后启用 embedding 语义检索
+# 锁定已验证可用的组合（CPU 加载 embedding 通过）；勿裸依赖，否则 pip 拉到新版易触发 CUDA 加载崩溃
+torch==2.8.0
+transformers==4.57.1
+sentence-transformers==5.4.1
