@@ -123,9 +123,13 @@
   .kv .k { color: var(--dim); }
   .kv .v { text-align: right; word-break: break-all; }
   .section { margin: 14px 0 2px; color: var(--dim); font-size: 12px; letter-spacing: .5px; }
-  .ctrlRow { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+  .ctrlSection { margin-top: 28px; padding-top: 14px; border-top: 1px solid var(--line);
+    padding-bottom: 10px; }
+  .ctrlRow { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
   .ctrlBtn { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
-    border-radius: 10px; padding: 7px 12px; font-size: 13px; cursor: pointer; }
+    border-radius: 12px; padding: 11px 16px; font-size: 14px; cursor: pointer;
+    min-width: 46%; }
+  .ctrlHint { color: var(--dim); font-size: 11px; margin-top: 10px; line-height: 1.5; }
   .ctrlBtn.warn { color: var(--red); border-color: rgba(247,118,142,.5); }
   .ctrlBtn:disabled { opacity: .4; }
   .msg.control { background: transparent; border-style: dashed; text-align: center;
@@ -429,7 +433,9 @@ function showAgent(id) {
   body.appendChild(kv('Python', dev.python || '—'));
   body.appendChild(el('div', 'section', '身份'));
   body.appendChild(kv('agent_id', id));
-  body.appendChild(el('div', 'section', '中控'));
+  // 中控区固定在详情页最下方：滑到底即可操作
+  const ctrl = el('div', 'ctrlSection');
+  ctrl.appendChild(el('div', 'section', '⚙ 中控操作（管理员）'));
   const row = el('div', 'ctrlRow');
   for (const [action, label, warn] of [
     ['clear_context', '清除会话历史', false],
@@ -440,7 +446,10 @@ function showAgent(id) {
     b.onclick = () => sendControl(id, action, label, b);
     row.appendChild(b);
   }
-  body.appendChild(row);
+  ctrl.appendChild(row);
+  ctrl.appendChild(el('div', 'ctrlHint',
+    '以上操作直接作用于该智能体，不可撤销。目标离线时会自动排队，上线后执行。'));
+  body.appendChild(ctrl);
 }
 
 async function sendControl(agentId, action, label, btn) {
