@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 
 from Tools.registry import registry
 
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _handle = None  # AgentNetChannel（duck-typed 门面）
+_recover_cooldown_until = 0.0  # 找不到实例后的退避截止时间（避免每次调用全堆扫描）
 
 
 def set_agentnet_handle(handle) -> None:
@@ -27,26 +29,54 @@ def set_agentnet_handle(handle) -> None:
         _handle = handle
 
 
+def _is_live(obj) -> bool:
+    """channel 是否仍连着 hub（陈旧实例不能拿来当句柄）。"""
+    try:
+        client = getattr(obj, "_client", None)
+        connected = getattr(obj, "_connected", None)
+        return client is not None and connected is not None and connected.is_set()
+    except Exception:
+        return False
+
+
 def _recover_handle():
-    """句柄丢失时（如 ReloadTools 重跑模块级代码）从运行中的 channel 实例找回。"""
-    global _handle
+    """句柄丢失时（如 ReloadTools 重跑模块级代码）从运行中的 channel 实例找回。
+
+    只接受仍然连着的实例；写回时持锁并二次检查，避免覆盖宿主并发注入的句柄。
+    """
+    global _handle, _recover_cooldown_until
+    now = time.monotonic()
+    if now < _recover_cooldown_until:
+        return None
     try:
         from Gateway.channels.agentnet_channel import AgentNetChannel
     except Exception:
         return None
+
+    picked = None
     try:
         import gc
         for obj in gc.get_objects():
-            if isinstance(obj, AgentNetChannel):
-                _handle = obj
-                logger.warning(
-                    "agentnet 句柄丢失，已从运行实例自动恢复: %s",
-                    getattr(getattr(obj, "identity", None), "agent_id", "?"),
-                )
-                return obj
+            if isinstance(obj, AgentNetChannel) and _is_live(obj):
+                picked = obj
+                break
     except Exception:
         logger.exception("agentnet 句柄自动恢复失败")
-    return None
+        return None
+
+    if picked is None:
+        _recover_cooldown_until = now + 2.0  # 短时间内不重复全堆扫描
+        return None
+
+    with _lock:
+        if _handle is not None:  # 扫描期间宿主已注入，以宿主为准
+            return _handle
+        _handle = picked
+    logger.warning(
+        "agentnet 句柄丢失，已从运行实例自动恢复: %s",
+        getattr(getattr(picked, "identity", None), "agent_id", "?"),
+    )
+    return picked
 
 
 def _get():

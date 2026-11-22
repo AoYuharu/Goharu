@@ -48,6 +48,7 @@ class AgentNetChannel(Channel):
         identity_dir = self.params.get("identity_dir", "./runtime_memory/agentnet/identity")
         box_path = self.params.get("messagebox_path", "./runtime_memory/agentnet/messagebox.db")
         self.identity = Identity.load_or_create(identity_dir, name=self.name)
+        self._restore_saved_profile()   # 自我更新的档案优先于 config 默认
         self.box = MessageBox(box_path)
         self._state_provider = lambda: "idle"
         self._can_auto_read = lambda: True       # SessionManager 注入（会话空闲才自动读群）
@@ -60,6 +61,25 @@ class AgentNetChannel(Channel):
         self._connected = threading.Event()
         self._persist_profile()
 
+    def _profile_path(self) -> Path:
+        return Path(self.params.get("identity_dir",
+                                    "./runtime_memory/agentnet/identity")) / "profile.json"
+
+    def _restore_saved_profile(self) -> None:
+        """启动时恢复自我更新的档案（profile.json 优先于 config 装配值）。"""
+        import json
+
+        try:
+            saved = json.loads(self._profile_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if saved.get("focus"):
+            self.params["focus"] = saved["focus"]
+        if saved.get("tags"):
+            self.params["tags"] = saved["tags"]
+        if saved.get("name"):
+            self.name = self.name or saved["name"]
+
     def _persist_profile(self) -> None:
         """端侧身份资料落盘（新机器加入组网时随握手上报）。"""
         import json
@@ -71,10 +91,8 @@ class AgentNetChannel(Channel):
             "focus": self.params.get("focus", ""),
             "tags": list(self.params.get("tags") or []),
         }
-        path = Path(self.params.get("identity_dir",
-                                    "./runtime_memory/agentnet/identity")) / "profile.json"
-        path.write_text(json.dumps(profile, ensure_ascii=False, indent=1),
-                        encoding="utf-8")
+        self._profile_path().write_text(
+            json.dumps(profile, ensure_ascii=False, indent=1), encoding="utf-8")
 
     # ------------------------------------------------------------- 生命周期
     def start(self):
