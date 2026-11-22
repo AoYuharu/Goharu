@@ -37,3 +37,7 @@ temp_size.ps1
 E盘目录*.md
 goharu_prompts_full.md
 prompt_export.md
+
+# 大模型权重（语音唤醒等）——不进仓库，从 ModelScope 下载
+*.onnx
+extras/voice-wakeup/
