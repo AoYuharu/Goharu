@@ -257,8 +257,11 @@ class AgentNetChannel(Channel):
             items = self._urgent_buf
             self._urgent_buf = []
             self._flush_timer = None
-            if items:
-                self._agent_replied = False  # 新 turn 起点：重置 reply 工具去重旗标
+            # 只有"会话空闲时"的 flush 才是新 turn 起点，才重置去重旗标；
+            # turn 进行中到来的消息批量 flush 会被会话合并进当前 turn，
+            # 若此时重置会把 dedupe 打穿（双广播 race）
+            if items and self._can_auto_read():
+                self._agent_replied = False
         if not items:
             return
         owners = [i for i in items if i["is_owner"]]
