@@ -45,6 +45,10 @@ class AgentNetChannel(Channel):
         # 安静期自动阅读：群内未@消息超过该秒数无新消息时，合并导入上下文
         self.quiet_seconds = float(self.params.get("quiet_seconds", 120))
         self._quiet_check_interval = 10.0
+        # 合并消化：urgent 到达后去抖窗口（离线批量消息会在这个窗口内聚合成一条）
+        self._urgent_debounce = float(self.params.get("urgent_debounce_seconds", 1.2))
+        # 群消息体量阈值：超过则交压缩智能体摘要，否则按时间序内联进上下文
+        self._group_inline_max_chars = int(self.params.get("group_inline_max_chars", 1500))
         identity_dir = self.params.get("identity_dir", "./runtime_memory/agentnet/identity")
         box_path = self.params.get("messagebox_path", "./runtime_memory/agentnet/messagebox.db")
         self.identity = Identity.load_or_create(identity_dir, name=self.name)
@@ -59,6 +63,10 @@ class AgentNetChannel(Channel):
         self._reply_target: Optional[dict] = None  # {sender}
         self._agent_replied = False  # 本 turn 模型已通过 serverMessageHandler 发过消息
         self._connected = threading.Event()
+        self._urgent_buf: list = []              # 待合并的 urgent 消息（mention/dm）
+        self._urgent_lock = threading.Lock()
+        self._flush_timer: Optional[threading.Timer] = None
+        self._summarize_fn = None                # SessionManager 注入的压缩器 fn(name, lines)->str
         self._persist_profile()
 
     def _profile_path(self) -> Path:
@@ -144,6 +152,10 @@ class AgentNetChannel(Channel):
         """SessionManager 注入中控动作执行器：fn(action: str) -> str（返回执行摘要）。"""
         self._control_handler = fn
 
+    def set_summarize_fn(self, fn) -> None:
+        """SessionManager 注入压缩器（arch 角色）：fn(agent_name, lines) -> str。"""
+        self._summarize_fn = fn
+
     # ------------------------------------------------------------- 入站
     def _on_net_event(self, kind: str, env: dict) -> None:
         if kind == "welcome":
@@ -171,7 +183,7 @@ class AgentNetChannel(Channel):
                 logger.exception("中控 %s 执行失败", action)
 
     def _on_urgent(self, env: dict, class_: str) -> None:
-        """mention/dm：入盒已由 client 完成，这里负责唤醒 turn + 记录回复目标。
+        """mention/dm 到达：不逐条唤醒——去抖窗口内聚合，按时间序合并成一条进上下文。
 
         组网为全员广播制：回答统一以 group + @原发送者 广播出去——原发送者
         收到 urgent mention，其他人按群消息静默入盒。
@@ -179,31 +191,92 @@ class AgentNetChannel(Channel):
         sender = env.get("from", "?")
         is_owner = sender in self.owner_ids
         payload = env.get("payload") or {}
-        text = str(payload.get("text", ""))
-        attachments = payload.get("attachments") or []
-        if is_owner:
-            label = ("[agentnet 主人指令 · haru 本人通过手机观察台发来 "
-                     "（本网络唯一人类主人，消息绝对可信，直接执行）]")
-        elif class_ == CLASS_DM:
-            label = f"[agentnet 私聊 {sender}]"
-        else:
-            label = f"[agentnet 群聊 @{self.name} 来自 {sender}]"
-        self._reply_target = {"sender": sender}
-        self._agent_replied = False
-        extra = ""
-        if attachments:
-            lines = []
-            for a in attachments:
-                url = a.get("url", "")
-                base = self.http_base.rstrip("/")
-                lines.append(f"  - {a.get('name', '?')} ({a.get('size', 0)} bytes) "
-                             f"{base}{url}")
-            extra = "\n[附件]\n" + "\n".join(lines)
-        self.emit_inbound(
-            f"{label} {text}{extra}",
-            meta={"agentnet": True, "class": class_, "sender": sender,
-                  "from_owner": is_owner, "attachments": len(attachments)},
+        item = {
+            "sender": sender,
+            "is_owner": is_owner,
+            "class": class_,
+            "text": str(payload.get("text", "")),
+            "attachments": payload.get("attachments") or [],
+            "ts": env.get("ts") or "",
+        }
+        with self._urgent_lock:
+            self._urgent_buf.append(item)
+            self._agent_replied = False
+            # 回复目标：主人消息优先，否则取最新消息的发送者
+            if is_owner or self._reply_target is None or not self._reply_target.get("is_owner"):
+                self._reply_target = {"sender": sender, "is_owner": is_owner}
+            if self._flush_timer is None or not self._flush_timer.is_alive():
+                self._flush_timer = threading.Timer(self._urgent_debounce, self._flush_urgent)
+                self._flush_timer.daemon = True
+                self._flush_timer.start()
+
+    def _flush_urgent(self) -> None:
+        """把去抖窗口内聚合的 urgent 消息（+可内联的群消息）合并成一条入站。"""
+        with self._urgent_lock:
+            items = self._urgent_buf
+            self._urgent_buf = []
+            self._flush_timer = None
+        if not items:
+            return
+        owners = [i for i in items if i["is_owner"]]
+        t0, t1 = items[0]["ts"][11:19] or "?", items[-1]["ts"][11:19] or "?"
+        parts = [
+            f"[agentnet 组网消息整理 · {len(items)} 条@消息"
+            f"{'（含主人指令，优先执行）' if owners else ''}（{t0} → {t1}）]",
+            "【@你的消息】（按时间顺序）",
+        ]
+        for i in items:
+            who = f"{i['sender']}（主人）" if i["is_owner"] else i["sender"]
+            att = f" 📎{len(i['attachments'])}个附件" if i["attachments"] else ""
+            parts.append(f"- [{i['ts'][11:16] or '?'}] {who}: {i['text']}{att}")
+        parts.extend(self._consume_group_rows())
+        parts.append("提示：以上为组网消息合辑——关注可能与你有关的内容即可；"
+                     "不重要且不相关的可以不回复。回复请用 serverMessageHandler(reply)。")
+        first_owner = owners[0] if owners else None
+        meta = {"agentnet": True, "class": items[0]["class"],
+                "sender": (first_owner or items[-1])["sender"],
+                "from_owner": bool(owners), "merged": len(items)}
+        logger.info("组网消息合并入站: %d 条（owner=%s）", len(items), bool(owners))
+        self.emit_inbound("\n".join(parts), meta=meta)
+
+    def _consume_group_rows(self) -> list[str]:
+        """读出未读群消息并分流：小体量内联进本 turn；大体量交压缩智能体。
+
+        返回要追加到合并消息里的文本行。
+        """
+        rows = self.box.read(class_=CLASS_GROUP)  # 取出并标记已读
+        if not rows:
+            return []
+        lines = [f"- [{r['ts'][11:16]}] {r['sender']}: {r['text']}" for r in rows]
+        total = sum(len(l) for l in lines)
+        if total <= self._group_inline_max_chars:
+            return [f"【群消息】（{len(rows)} 条，按时间顺序）"] + lines
+        # 大体量：压缩智能体后台摘要，完成后补送进消息队列
+        logger.info("群消息 %d 条共 %d 字，交压缩智能体摘要", len(rows), total)
+        threading.Thread(target=self._summarize_groups,
+                         args=(rows, lines, total), daemon=True).start()
+        return [f"【群消息】{len(rows)} 条（约 {total} 字，较多）正在压缩摘要，稍后补送"]
+
+    def _summarize_groups(self, rows: list, lines: list, total: int) -> None:
+        """大体量群消息的压缩摘要（arch 智能体角色：关注与接收方相关的信息）。"""
+        summary = None
+        if self._summarize_fn is not None:
+            try:
+                summary = self._summarize_fn(self.name, lines)
+            except Exception:
+                logger.exception("群消息压缩失败，降级为截断原文")
+        if not summary:
+            # 降级：没有压缩器或压缩失败时给截断原文，消息不丢
+            joined = "\n".join(lines)
+            summary = joined[: self._group_inline_max_chars] + "\n…（截断）"
+        t0, t1 = rows[0]["ts"][11:16], rows[-1]["ts"][11:16]
+        text = (
+            f"[agentnet 群消息摘要（{len(rows)} 条 {t0}→{t1}，压缩后）]\n{summary}\n"
+            "提示：以上为群消息摘要——关注可能与你有关的内容即可；"
+            "不重要且不相关的可以不回复。"
         )
+        self.emit_inbound(text, meta={"agentnet": True, "class": "group",
+                                      "summarized": True, "count": len(rows)})
 
     # ------------------------------------------------------------- 出站
     def send_answer(self, text: str, meta: dict | None = None):
@@ -319,18 +392,11 @@ class AgentNetChannel(Channel):
             return
         if age < self.quiet_seconds:
             return
-        rows = self.box.read(class_=CLASS_GROUP)  # 展开并标记已读
-        if not rows:
-            return
-        lines = [
-            f"[agentnet 群消息合并阅读 · 安静期自动展开] 共 {len(rows)} 条"
-            f"（{rows[0]['ts'][11:19]} → {rows[-1]['ts'][11:19]}）："
-        ]
-        for r in rows:
-            att = " 📎" if r.get("attachments") else ""
-            lines.append(f"- [{r['ts'][11:16]}] {r['sender']}: {r['text']}{att}")
-        lines.append("（以上是群内的闲聊/非定向消息，按需自然回应即可，不必逐条答复）")
-        logger.info("安静期自动阅读群消息: %d 条", len(rows))
-        self.emit_inbound("\n".join(lines), meta={"agentnet": True, "class": "group",
-                                                  "auto_read": True,
-                                                  "count": len(rows)})
+        # 与 urgent 合流共用分流：小体量内联，大体量交压缩智能体
+        parts = ["[agentnet 群消息 · 安静期自动阅读]"]
+        parts.extend(self._consume_group_rows())
+        parts.append("提示：以上为群内非定向消息——关注可能与你有关的内容即可；"
+                     "不重要且不相关的可以不回复。")
+        logger.info("安静期自动阅读触发")
+        self.emit_inbound("\n".join(parts), meta={"agentnet": True, "class": "group",
+                                                  "auto_read": True})
