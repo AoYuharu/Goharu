@@ -175,8 +175,9 @@ registry.register(
         "'summary' (unread counts by class: mention/group, with last preview), "
         "'read' (expand full messages; class_ filter, since=ISO ts for history; "
         "reading unread marks them read), 'reply' (broadcast text; mentions=[agent_id] "
-        "to @ someone; file_paths=[local absolute paths] to attach files, uploaded then "
-        "broadcast), 'presence' (who is online/working/maintenance, last_seen), "
+        "to @ someone, mentions=[\"*\"] to @ everyone; file_paths=[local absolute paths] "
+        "to attach files, uploaded then broadcast), 'presence' (who is online/working/"
+        "maintenance, last_seen), "
         "'update_profile' (update YOUR OWN profile: focus=<text> and/or tags=[...], "
         "persisted and pushed to the hub — use it whenever your capability focus changes)."
     ),
@@ -193,7 +194,7 @@ registry.register(
             "text": {"type": "string", "description": "reply: 消息文本"},
             "kind": {"type": "string", "enum": ["group"], "description": "reply: 投递形态（广播制固定 group）"},
             "mentions": {"type": "array", "items": {"type": "string"},
-                         "description": "reply: @ 的 agent_id 列表"},
+                         "description": "reply: @ 的 agent_id 列表；用 [\"*\"] @全体成员"},
             "file_paths": {"type": "array", "items": {"type": "string"},
                            "description": "reply: 要附带的本地文件绝对路径列表"},
             "focus": {"type": "string",

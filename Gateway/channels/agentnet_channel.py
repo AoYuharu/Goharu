@@ -23,7 +23,7 @@ from typing import Optional
 from AgentNet.client import AgentNetClient
 from AgentNet.identity import Identity
 from AgentNet.messagebox import MessageBox
-from AgentNet.protocol import CLASS_DM, CLASS_GROUP
+from AgentNet.protocol import CLASS_DM, CLASS_GROUP, CLASS_MENTION
 from Gateway.channels.base import Channel
 from Gateway.channels.registry import register_channel
 
@@ -49,6 +49,10 @@ class AgentNetChannel(Channel):
         self._urgent_debounce = float(self.params.get("urgent_debounce_seconds", 1.2))
         # 群消息体量阈值：超过则交压缩智能体摘要，否则按时间序内联进上下文
         self._group_inline_max_chars = int(self.params.get("group_inline_max_chars", 1500))
+        # 关注期：被 @/私聊/主人说话后进入，期内所有新消息都唤醒（且续期）；
+        # 超时无消息自动退出，回到"@才醒 + 安静期自动阅读"
+        self.attention_seconds = float(self.params.get("attention_seconds", 300))
+        self._attentive_until = 0.0
         identity_dir = self.params.get("identity_dir", "./runtime_memory/agentnet/identity")
         box_path = self.params.get("messagebox_path", "./runtime_memory/agentnet/messagebox.db")
         self.identity = Identity.load_or_create(identity_dir, name=self.name)
@@ -120,7 +124,7 @@ class AgentNetChannel(Channel):
         self._client = AgentNetClient(
             self.identity, self.url, messagebox=self.box,
             state_provider=lambda: self._state_provider(),
-            on_urgent=self._on_urgent,
+            on_message=self._on_any_message,
             on_event=self._on_net_event,
             on_control=self._on_control,
             profile={
@@ -182,6 +186,31 @@ class AgentNetChannel(Channel):
             except Exception:
                 logger.exception("中控 %s 执行失败", action)
 
+    def _on_any_message(self, env: dict, class_: str) -> None:
+        """全量消息入口（client on_message）：入盒 + 关注期判定。
+
+        - mention/dm/主人消息 → 唤醒 + 进入关注期（续期）
+        - 关注期内的普通群消息 → 也唤醒（续期）
+        - 其余群消息 → 只入盒（摘要计数，安静期兜底阅读）
+        """
+        sender = env.get("from", "?")
+        payload = env.get("payload") or {}
+        if self.box is not None:
+            peer = env["to"] if env.get("kind") == CLASS_GROUP else sender
+            self.box.add(env.get("id"), class_, peer, sender,
+                         str(payload.get("text", "")), env.get("ts"),
+                         attachments=payload.get("attachments") or None)
+        is_owner = sender in self.owner_ids
+        in_attention = time.time() < self._attentive_until
+        urgent = (class_ in (CLASS_MENTION, CLASS_DM) or is_owner
+                  or (class_ == CLASS_GROUP and in_attention))
+        if not urgent:
+            return
+        # 已被唤醒的消息直接从收件箱标记已读（内容会进合并上下文）
+        self.box.mark_read_by_msg_id(env.get("id"))
+        self._attentive_until = time.time() + self.attention_seconds
+        self._on_urgent(env, class_)
+
     def _on_urgent(self, env: dict, class_: str) -> None:
         """mention/dm 到达：不逐条唤醒——去抖窗口内聚合，按时间序合并成一条进上下文。
 
@@ -219,16 +248,24 @@ class AgentNetChannel(Channel):
         if not items:
             return
         owners = [i for i in items if i["is_owner"]]
+        # 关注期内的普通群消息与 @消息分区展示，但同属一个 turn
+        directed = [i for i in items if i["class"] != CLASS_GROUP or i["is_owner"]]
+        attentive_chat = [i for i in items if i["class"] == CLASS_GROUP and not i["is_owner"]]
         t0, t1 = items[0]["ts"][11:19] or "?", items[-1]["ts"][11:19] or "?"
         parts = [
-            f"[agentnet 组网消息整理 · {len(items)} 条@消息"
-            f"{'（含主人指令，优先执行）' if owners else ''}（{t0} → {t1}）]",
-            "【@你的消息】（按时间顺序）",
+            f"[agentnet 组网消息整理 · {len(items)} 条"
+            f"{'（含主人指令，优先执行）' if owners else ''}（{t0} → {t1}）]"
         ]
-        for i in items:
-            who = f"{i['sender']}（主人）" if i["is_owner"] else i["sender"]
-            att = f" 📎{len(i['attachments'])}个附件" if i["attachments"] else ""
-            parts.append(f"- [{i['ts'][11:16] or '?'}] {who}: {i['text']}{att}")
+        if directed:
+            parts.append("【@你的消息】（按时间顺序）")
+            for i in directed:
+                who = f"{i['sender']}（主人）" if i["is_owner"] else i["sender"]
+                att = f" 📎{len(i['attachments'])}个附件" if i["attachments"] else ""
+                parts.append(f"- [{i['ts'][11:16] or '?'}] {who}: {i['text']}{att}")
+        if attentive_chat:
+            parts.append("【群消息（关注期内实时）】（按时间顺序）")
+            for i in attentive_chat:
+                parts.append(f"- [{i['ts'][11:16] or '?'}] {i['sender']}: {i['text']}")
         parts.extend(self._consume_group_rows())
         parts.append("提示：以上为组网消息合辑——关注可能与你有关的内容即可；"
                      "不重要且不相关的可以不回复。回复请用 serverMessageHandler(reply)。")

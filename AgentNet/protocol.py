@@ -30,6 +30,9 @@ CLASS_MENTION = "mention"
 CLASS_DM = "dm"
 CLASS_GROUP = "group"
 
+# mentions 通配：@全体成员
+MENTION_ALL = "*"
+
 # 投递形态
 KIND_DM = "dm"
 KIND_GROUP = "group"
@@ -84,9 +87,10 @@ def make_envelope(
 
 
 def classify(env: dict, my_id: str) -> str:
-    """端侧消息分类：群@我 > 私聊 > 群闲聊。"""
+    """端侧消息分类：群@我（或@全员）> 私聊 > 群闲聊。"""
     if env.get("kind") == KIND_GROUP:
-        if my_id in (env.get("mentions") or []):
+        mentions = env.get("mentions") or []
+        if my_id in mentions or MENTION_ALL in mentions:
             return CLASS_MENTION
         return CLASS_GROUP
     return CLASS_DM

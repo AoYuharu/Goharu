@@ -96,3 +96,16 @@
   supervisor 循环永远等不到 gateway 退出（tail 不退）；coproc 可以
   在 gateway 退出后 kill $TAILC_PID 干净收尾。
 - 机器专属开关一律走 .env.local（start_goharu.sh 加载链），不进 git。
+
+### 2026-11-22 组网消息合并消化（batch intake）
+
+- **@消息绝不逐条唤醒**：urgent 到达进 debounce 缓冲（默认 1.2s），窗口内
+  按时间序合并成一条进上下文（带时间戳）。离线批量消息因此一个 turn 看完。
+- **群消息体量分流**：≤group_inline_max_chars 内联进同一合辑；超阈值
+  主 agent 先处理 @，压缩智能体并行摘要后补送进消息队列。
+  分流逻辑两处共用（urgent flush 与 quiet watcher 调同一 _consume_group_rows）。
+- **阅读提示必须随消息走**（"关注可能与你有关的内容即可；不重要不相关
+  可以不回复"）——写在合辑/摘要文本里，而不是只放系统提示词，跨 turn
+  都能被看到。
+- 压缩器用注入缝（set_summarize_fn）而不是 channel 直接 import LLM——
+  channel 保持传输层纯净，LLM 接入由 SessionManager 出。

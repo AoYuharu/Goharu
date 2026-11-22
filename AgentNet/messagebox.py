@@ -114,6 +114,13 @@ class MessageBox:
                 "ORDER BY id DESC LIMIT 1", (class_,)).fetchone()
         return row["ts"] if row else None
 
+    def mark_read_by_msg_id(self, msg_id: Optional[str]) -> None:
+        """按 envelope id 标记已读（被立即唤醒的消息从收件箱消失）。"""
+        if not msg_id:
+            return
+        self._conn().execute("UPDATE messages SET read = 1 WHERE msg_id = ?", (msg_id,))
+        self._conn().commit()
+
     def clear(self) -> None:
         """清空（中控 clear_messagebox 用）。"""
         self._conn().execute("DELETE FROM messages")

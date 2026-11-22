@@ -237,6 +237,8 @@ class SessionManager:
                     "quiet_seconds": float(config.get("agentnet.quiet_seconds", 120)),
                     "group_inline_max_chars": int(
                         config.get("agentnet.group_inline_max_chars", 1500)),
+                    "attention_seconds": float(
+                        config.get("agentnet.attention_seconds", 300)),
                 })
                 session.attach_channel(ch)
                 ch.bind(session.enqueue)

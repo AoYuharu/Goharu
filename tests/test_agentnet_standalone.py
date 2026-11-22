@@ -59,6 +59,8 @@ def main():
         check("分类 group", classify(g, "agt_b") == "group")
         g["mentions"] = ["agt_b"]
         check("分类 mention", classify(g, "agt_b") == "mention")
+        g["mentions"] = ["*"]
+        check("分类 @全员", classify(g, "agt_anyone") == "mention")
         bad = dict(env)
         del bad["ts"]
         try:
@@ -318,10 +320,16 @@ async def channel_test(root: Path):
               inbound[1].text if ok else "")
         ch.owner_ids = set()
 
-        # group 无 @ → 静默入盒，不唤醒
+        # 对齐静默：清掉关注期并等 pending 去抖 flush 落地
+        ch.attention_seconds = 0
+        ch._attentive_until = 0
+        await asyncio.sleep(1.6)
+        base_inbound = len(inbound)
+
+        # group 无 @（且不在关注期）→ 静默入盒，不唤醒
         await client_x.send_message("grp:town", "群里闲聊", kind="group")
         await asyncio.sleep(0.6)
-        check("group 不唤醒", len(inbound) == 2)
+        check("group 不唤醒", len(inbound) == base_inbound)
         check("group 已入盒", ch.box.summary().get("group", {}).get("count") == 1)
 
         # 摘要便利贴
@@ -330,7 +338,9 @@ async def channel_test(root: Path):
 
         # 工具：summary / read / reply / presence
         s = json.loads(await agentnet_tools.serverMessageHandler(action="summary"))
-        check("工具 summary", s.get("ok") and s["unread"] >= 2, str(s)[:120])
+        # 唤醒即已读：mention/dm 在入盒时就被标记（内容已进合并上下文），
+        # 未读只剩未唤醒的群闲聊
+        check("唤醒消息不占未读", s.get("ok") and s["unread"] == 1, str(s)[:120])
         r = json.loads(await agentnet_tools.serverMessageHandler(
             action="read", class_="group"))
         check("工具 read 展开+标已读", r.get("ok") and r["count"] == 1
@@ -351,7 +361,7 @@ async def channel_test(root: Path):
         await asyncio.sleep(0.8)
         check("工具发过后 send_answer 被抑制", len(received_x) == 1
               and len(inbound) == incoming_before,
-              f"received={len(received_x)}")
+              f"received={len(received_x)} inbound_delta={len(inbound) - incoming_before}")
 
         # 无工具发送时 send_answer 正常中继（恢复目标态后验证）
         ch._reply_target = {"sender": id_x.agent_id}
@@ -438,6 +448,45 @@ async def channel_test(root: Path):
             (root / "ch_goharu" / "profile.json").read_text(encoding="utf-8"))
         check("档案落盘", prof_disk.get("focus") == "代码与组网协作"
               and "agentnet" in (prof_disk.get("tags") or []), str(prof_disk))
+
+        # ── 关注期模型 ──────────────────────────────────────────
+        ch.attention_seconds = 1.5
+        ch._attentive_until = 0
+        before = len(inbound)
+        await client_x.send_message("grp:town", "关注期外闲聊A", kind="group")
+        await asyncio.sleep(0.6)
+        check("关注期外群消息不唤醒", len(inbound) == before)
+
+        # @全员 → 唤醒并进入关注期
+        await client_x.send_message("grp:town", "@全员 集合", kind="group",
+                                    mentions=["*"])
+        ok = await wait(lambda: len(inbound) > before, label="mention-all")
+        check("@全员唤醒", ok and "全员 集合" in inbound[-1].text,
+              inbound[-1].text[:100] if ok else "")
+
+        # 关注期内：无@群消息也实时唤醒
+        mid = len(inbound)
+        await client_x.send_message("grp:town", "期内闲聊B", kind="group")
+        ok = await wait(lambda: len(inbound) > mid, label="attentive chat")
+        check("关注期内群消息实时唤醒", ok and "期内闲聊B" in inbound[-1].text
+              and "关注期内实时" in inbound[-1].text,
+              inbound[-1].text[:120] if ok else "")
+
+        # 主人消息（不带@）也唤醒
+        ch.owner_ids = {id_x.agent_id}
+        ch._attentive_until = 0  # 清关注期，验证主人消息本身的唤醒力
+        mid = len(inbound)
+        await client_x.send_message("grp:town", "主人随便说一句", kind="group")
+        ok = await wait(lambda: len(inbound) > mid, label="owner wake")
+        check("主人消息无@也唤醒", ok and "主人随便说一句" in inbound[-1].text)
+        ch.owner_ids = set()
+
+        # 关注期过期后回到静默
+        ch._attentive_until = 0
+        mid = len(inbound)
+        await client_x.send_message("grp:town", "过期后闲聊C", kind="group")
+        await asyncio.sleep(0.6)
+        check("关注期过期回静默", len(inbound) == mid)
     finally:
         agentnet_tools.set_agentnet_handle(None)
         ch.stop()

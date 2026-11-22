@@ -61,6 +61,7 @@ class AgentNetClient:
         messagebox: Optional[MessageBox] = None,
         state_provider: Optional[StateProvider] = None,
         on_urgent: Optional[OnUrgent] = None,
+        on_message: Optional[OnUrgent] = None,
         on_event: Optional[OnEvent] = None,
         on_control: Optional[Callable[[dict], Any]] = None,
         heartbeat_seconds: int = 30,
@@ -78,6 +79,9 @@ class AgentNetClient:
         self._profile = prof
         self._state_provider = state_provider or (lambda: "idle")
         self._on_urgent = on_urgent
+        # on_message：全量消息回调（env, class）——设置了就替代 on_urgent 的分类分发，
+        # 由宿主自行决定各类消息的处理（AgentNetChannel 的"关注期"模型靠它实现）
+        self._on_message = on_message
         self._on_event = on_event
         self._on_control = on_control
         self._heartbeat_seconds = heartbeat_seconds
@@ -174,6 +178,14 @@ class AgentNetClient:
 
     def _handle_message(self, env: dict) -> None:
         class_ = classify(env, self.identity.agent_id)
+        if self._on_message is not None:
+            # 全量回调模式：宿主自定各类消息处理（入盒也在宿主侧做）
+            try:
+                self._on_message(env, class_)
+                return
+            except Exception:
+                logger.exception("agentnet on_message 回调异常")
+                return
         if self.box is not None:
             peer = env["to"] if env.get("kind") == CLASS_GROUP else env["from"]
             payload = env.get("payload") or {}

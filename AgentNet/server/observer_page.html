@@ -235,6 +235,14 @@ function renderMentionRow(ids) {
     && (agentsData[id].name || '') !== 'owner');
   if (!others.length) { row.style.display = 'none'; return; }
   row.style.display = '';
+  // @全员（mentions=["*"]）
+  const allChip = el('button', 'mchip' + (mentionSel.has('*') ? ' on' : ''), '@全员');
+  allChip.onclick = () => {
+    mentionSel.has('*') ? mentionSel.delete('*') : mentionSel.add('*');
+    allChip.classList.toggle('on');
+    updateSendState();
+  };
+  row.appendChild(allChip);
   for (const id of others) {
     const a = agentsData[id];
     const c = el('button', 'mchip' + (mentionSel.has(id) ? ' on' : ''),

@@ -69,6 +69,7 @@ agentnet:
   - agt_43346c6e4ef29069
   quiet_seconds: 120           # 群内无@消息攒到安静期再合并导入的秒数
   group_inline_max_chars: 1500 # 群消息总字数超阈值则交压缩智能体摘要，否则内联进上下文
+  attention_seconds: 300       # 关注期：被@/私聊/主人说话后，期内所有新消息都唤醒（续期）
   focus: 编程与自动化（代码编辑、调试、系统操作）
   tags:
   - coding
