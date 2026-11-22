@@ -265,6 +265,9 @@ agent_delegate:
   max_history_turns: 3
 architect_hub:
   digest_window: 200
+  bootstrap:
+    enabled: true                  # 裸机首次部署：探测 + identity.yaml
+    identity_path: runtime_memory/identity.yaml
   guardian:
     not_ready_seconds: 600
   upgrade:

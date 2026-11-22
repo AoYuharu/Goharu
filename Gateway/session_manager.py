@@ -294,6 +294,17 @@ class SessionManager:
         except Exception as e:
             logger.warning("architect hero bridge wiring failed: %s", e)
 
+        # ── Bootstrap：裸机首次部署（identity 缺失才跑，daemon 线程）──
+        if config.get("architect_hub.bootstrap.enabled", True):
+            try:
+                from Architect.bootstrap import bootstrap_async
+                bootstrap_async(
+                    hub=get_default_hub(),
+                    config=dict(config.data) if hasattr(config, "data") else {},
+                )
+            except Exception as e:
+                logger.warning("bootstrap hook failed (non-fatal): %s", e)
+
     # ------------------------------------------------------------------
     # AgentNet 中控（观察台按钮 → hub control 消息 → agentnet channel）
     # ------------------------------------------------------------------

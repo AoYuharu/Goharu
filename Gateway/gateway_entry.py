@@ -51,6 +51,14 @@ lifecycle("════════ 新会话 ════════", f"Gatew
 CRASH_LOG = project_root / "runtime_memory" / "logs" / "gateway" / "crash.log"
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    """环境变量布尔覆盖（机器专属配置，如 haru 的 headless 守护）。"""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def write_json(obj: Dict[str, Any]) -> bool:
     """
     Write a JSON-RPC message to stdout.
@@ -981,7 +989,10 @@ def main():
                 break   # 代理连接失败（对端刚好退出）→ 继续尝试本地绑定
             candidate = TuiRpcServer(
                 rpc_port,
-                shutdown_on_detach=bool(config.get("gateway.tui_attach_shutdown", True)),
+                shutdown_on_detach=_env_flag(
+                    "GOHARU_TUI_ATTACH_SHUTDOWN",
+                    bool(config.get("gateway.tui_attach_shutdown", True)),
+                ),
             )
             if candidate.start():        # 绑定即胜出：我是唯一实例
                 rpc_server = candidate
