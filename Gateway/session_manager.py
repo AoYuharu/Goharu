@@ -235,6 +235,8 @@ class SessionManager:
                     "tags": config.get("agentnet.tags", []),
                     "owner_ids": list(config.get("agentnet.owner_ids") or []),
                     "quiet_seconds": float(config.get("agentnet.quiet_seconds", 120)),
+                    "group_inline_max_chars": int(
+                        config.get("agentnet.group_inline_max_chars", 1500)),
                 })
                 session.attach_channel(ch)
                 ch.bind(session.enqueue)
@@ -248,6 +250,7 @@ class SessionManager:
                 ch.set_can_auto_read(
                     lambda: not any(s._processing for s in self.sessions.values()))
                 ch.set_control_handler(self._agentnet_control)
+                ch.set_summarize_fn(self._agentnet_summarize)
                 session.memory.set_turn_extras_provider(ch.turn_extras)
                 logger.info("agentnet channel ready: %s → %s",
                             ch.identity.agent_id, ch.url)
@@ -335,6 +338,21 @@ class SessionManager:
         if action == "clear_messagebox":
             return "messagebox 已由 channel 清空"
         return f"未知动作: {action}"
+
+    def _agentnet_summarize(self, agent_name: str, lines: list) -> str:
+        """群消息压缩（arch 角色）：大体量群消息摘要，关注与接收方相关的信息。"""
+        from Agent.LargeLanguageModel import LargeLanguageModel
+        joined = "\n".join(lines)
+        prompt = (
+            f"你是 {agent_name} 的消息整理员。以下是它所在的智能体组网里错过的一批"
+            "群消息（格式 [时间] 发送者: 内容）。请压缩成简洁摘要：\n"
+            "1. 重点保留可能与该智能体相关/需要它关注/需要它行动的信息；\n"
+            "2. 无关闲聊一笔带过；\n"
+            "3. 保留关键时间点和发送者名字；\n"
+            "4. 中文输出，不超过 200 字。\n\n"
+            f"{joined}"
+        )
+        return LargeLanguageModel().query([{"role": "user", "content": prompt}])
 
     # ------------------------------------------------------------------
     # 路由

@@ -306,13 +306,14 @@ async def channel_test(root: Path):
         await client_x.send_message(id_g.agent_id, "私聊你一下", kind="dm")
         check("dm 唤醒入站", await wait(lambda: len(inbound) == 1, label="dm inbound"))
         if inbound:
-            check("入站标注私聊来源", "agentnet 私聊" in inbound[0].text, inbound[0].text)
+            check("入站为合并整理格式", "组网消息整理" in inbound[0].text
+                  and id_x.agent_id in inbound[0].text, inbound[0].text)
 
         # 主人身份识别：owner_ids 内的发送者 → 可信标注 + meta.from_owner
         ch.owner_ids = {id_x.agent_id}
         await client_x.send_message(id_g.agent_id, "我是主人", kind="dm")
         ok = await wait(lambda: len(inbound) == 2, label="owner inbound")
-        check("主人消息可信标注", ok and "主人指令" in inbound[1].text
+        check("主人消息可信标注", ok and "主人" in inbound[1].text
               and inbound[1].meta.get("from_owner") is True,
               inbound[1].text if ok else "")
         ch.owner_ids = set()
@@ -405,11 +406,23 @@ async def channel_test(root: Path):
         inbound_before = len(inbound)
         ch._maybe_auto_read()
         check("安静期合并阅读", ok and len(inbound) > inbound_before
-              and "合并阅读" in inbound[-1].text
+              and "安静期自动阅读" in inbound[-1].text
               and "安静期闲聊一" in inbound[-1].text
               and "安静期闲聊二" in inbound[-1].text,
               inbound[-1].text[:120] if inbound else "")
         check("合并阅读后群消息已读", ch.box.unread_count(class_="group") == 0)
+
+        # 大体量群消息 → 压缩智能体摘要后补送（不内联原文）
+        ch._group_inline_max_chars = 50
+        ch.set_summarize_fn(lambda name, lines: "压缩摘要：有人讨论了测试事项")
+        await client_x.send_message("grp:town", "这是一条很长的群消息，" * 20, kind="group")
+        ok = await wait(lambda: ch.box.unread_count(class_="group") > 0, label="big inbox")
+        await asyncio.sleep(0.6)
+        ch._maybe_auto_read()
+        ok = await wait(lambda: any("压缩摘要" in m.text for m in inbound),
+                        timeout=8, label="summary msg")
+        check("大体量群消息压缩摘要", ok, str([m.text[:60] for m in inbound][-2:]))
+        check("摘要含阅读提示", any("不重要且不相关" in m.text for m in inbound))
 
         # update_profile：工具更新档案 → 落盘 + hub presence 即时生效
         up = json.loads(await agentnet_tools.serverMessageHandler(
