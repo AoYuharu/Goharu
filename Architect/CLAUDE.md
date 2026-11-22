@@ -37,7 +37,7 @@ Architect/
    - ⑤ 定期轮询（首个拉式源）：`upgrader.GitUpdateSource` 定期 fetch
      `architect_hub.upgrade.{remote,branch}`（默认 origin/master =
      github.com/AoYuharu/Goharu）比对本地 HEAD，有新提交 → code_update 唤醒
-     → hub 路由到 `request_upgrade()`（staging 审计流），报告经 Hero 桥推送。
+     → hub 门控后进更新四态流（start_update），报告经 Hero 桥推送。
      调度循环：`hub.start_scheduler()`（守护线程，tick 由
      `wake.scheduler_interval_seconds` 控制，源自身按 check_interval 节流）。
      去重：同一远端 sha 只报一次（审计 FAIL 不反复骚扰）。
@@ -94,3 +94,20 @@ architect_hub:
 `tests/test_architect_hub_standalone.py`：digest 计数 / channel 插件喂数 /
 唤醒冷却与 pending 降级 / 审计管线（假 runner + 假 dispatch + 假 merge）。
 改动公共接口后必跑。
+
+## Bootstrap 首次部署（bootstrap.py + probe.py，2026-11-22）
+
+裸机部署时 gateway 启动钩子（session_manager）触发：`identity.yaml` 缺失才跑，
+daemon 线程不阻塞启动。流程：哑探测（probe.py 12 类，零 LLM）→ HaruNet 最小
+注册（register_fn 注入，失败降级 pending_retry）→ gaps 非空唤醒 Arch 补漏
+（reason="bootstrap"，Arch 写回 identity.yaml）→ 落盘即完成标记。
+
+- **探测纪律**：规则判断树 + 正则只做快路径，探不到进 gaps 给 Arch；
+  不在规则层堆发行版适配。
+- **编码教训（2026-11-22 实测）**：Windows 中文系统的系统工具输出是 GBK——
+  `_run` 必须 utf-8→gbk 解码链，且 ipconfig 字段名要中英双语正则
+  （"DNS 服务器"/"DNS Servers"、"默认网关"/"Default Gateway"）。
+- identity.yaml 结构：device/os/cpu/memory/gpu/storage/network/runtime/
+  services/peripherals/security/status + probed_at + gaps_pending + harunet。
+
+契约测试：`tests/test_bootstrap.py`（真实本机探测 + 编排 + 注册缝）。

@@ -49,10 +49,11 @@ def _which(name):
 
 
 def _ps(script, timeout=_CMD_TIMEOUT):
-    """Windows PowerShell 探测（-NoProfile 加速）。"""
+    """Windows PowerShell 探测（-NoProfile 加速）；结果去首尾空白。"""
     if not IS_WINDOWS:
         return None
-    return _run(["powershell", "-NoProfile", "-Command", script], timeout)
+    out = _run(["powershell", "-NoProfile", "-Command", script], timeout)
+    return out.strip() if out else None
 
 
 def _re1(pattern, text, flags=0):
@@ -256,9 +257,10 @@ def probe_network() -> dict:
     if IS_WINDOWS:
         out = _run(["ipconfig", "/all"], timeout=15)
         if out:
-            result["dns"] = re.findall(r"DNS [Ss]ervers[^\n]*:\s*([\d.]+)", out)
-            gw = _re1(r"Default Gateway[^\n]*:\s*([\d.]+)", out)
-            result["gateway"] = gw
+            # 中/英 Windows 字段名都匹配（"DNS 服务器" / "DNS Servers"）
+            result["dns"] = re.findall(r"DNS[^\n:：]*[:：]\s*([\d.]+)", out)
+            result["gateway"] = _re1(
+                r"(?:Default Gateway|默认网关)[^\n:：]*[:：]\s*([\d.]+)", out)
             result["interfaces"] = re.findall(
                 r"(?:adapter|适配器)\s+([^:]+):", out)[:8]
     else:

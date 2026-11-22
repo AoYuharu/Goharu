@@ -85,3 +85,14 @@
   "陌生人互相发现"；一切权限收敛到 owner 单点。
 - 写任何组网相关提示词/文档时用"同事（为同一主人工作）"而非
   "用户/他人"指代其他智能体。
+
+### 2026-11-22 HaruNet 常驻保障
+
+- **headless 守护三件套**：GOHARU_TUI_ATTACH_SHUTDOWN=0（env 覆盖
+  gateway.tui_attach_shutdown）+ supervisor 循环（coproc 持 stdin，
+  gateway 退出 5s 后自动拉起）+ 白名单 hub。缺一不可：
+  detach 开关防误杀，supervisor 防崩溃，hub 白名单防假身份。
+- **coproc 是持 stdin 的正确姿势**：`tail -f /dev/null |` 管道会让
+  supervisor 循环永远等不到 gateway 退出（tail 不退）；coproc 可以
+  在 gateway 退出后 kill $TAILC_PID 干净收尾。
+- 机器专属开关一律走 .env.local（start_goharu.sh 加载链），不进 git。
