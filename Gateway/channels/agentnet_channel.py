@@ -16,12 +16,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
+from pathlib import Path
 from typing import Optional
 
 from AgentNet.client import AgentNetClient
 from AgentNet.identity import Identity
 from AgentNet.messagebox import MessageBox
-from AgentNet.protocol import CLASS_DM
+from AgentNet.protocol import CLASS_DM, CLASS_GROUP
 from Gateway.channels.base import Channel
 from Gateway.channels.registry import register_channel
 
@@ -38,19 +40,41 @@ class AgentNetChannel(Channel):
         self.url = self.params.get("url", "ws://127.0.0.1:7878")
         self.http_base = self.params.get("http_base", "")
         self.name = self.params.get("name", "goharu")
-        # 主人身份：观察台 owner（服务器自持）的消息即用户本人，可信标注
+        # 主人身份：组网唯一人类用户（观察台 owner）。其消息绝对可信。
         self.owner_ids = set(self.params.get("owner_ids") or [])
+        # 安静期自动阅读：群内未@消息超过该秒数无新消息时，合并导入上下文
+        self.quiet_seconds = float(self.params.get("quiet_seconds", 120))
+        self._quiet_check_interval = 10.0
         identity_dir = self.params.get("identity_dir", "./runtime_memory/agentnet/identity")
         box_path = self.params.get("messagebox_path", "./runtime_memory/agentnet/messagebox.db")
         self.identity = Identity.load_or_create(identity_dir, name=self.name)
         self.box = MessageBox(box_path)
         self._state_provider = lambda: "idle"
+        self._can_auto_read = lambda: True       # SessionManager 注入（会话空闲才自动读群）
+        self._control_handler = None             # SessionManager 注入（中控动作执行）
         self._client: Optional[AgentNetClient] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._reply_target: Optional[dict] = None  # {sender}
         self._agent_replied = False  # 本 turn 模型已通过 serverMessageHandler 发过消息
         self._connected = threading.Event()
+        self._persist_profile()
+
+    def _persist_profile(self) -> None:
+        """端侧身份资料落盘（新机器加入组网时随握手上报）。"""
+        import json
+
+        profile = {
+            "agent_id": self.identity.agent_id,
+            "name": self.name,
+            "pubkey": self.identity.pubkey_b64,
+            "focus": self.params.get("focus", ""),
+            "tags": list(self.params.get("tags") or []),
+        }
+        path = Path(self.params.get("identity_dir",
+                                    "./runtime_memory/agentnet/identity")) / "profile.json"
+        path.write_text(json.dumps(profile, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
 
     # ------------------------------------------------------------- 生命周期
     def start(self):
@@ -59,6 +83,9 @@ class AgentNetChannel(Channel):
         self._thread = threading.Thread(
             target=self._run, name=f"agentnet-{self.channel_id}", daemon=True)
         self._thread.start()
+        threading.Thread(target=self._quiet_watcher,
+                         name=f"agentnet-quiet-{self.channel_id}",
+                         daemon=True).start()
         logger.info("agentnet channel 启动: %s → %s", self.identity.agent_id, self.url)
 
     def _run(self):
@@ -69,6 +96,7 @@ class AgentNetChannel(Channel):
             state_provider=lambda: self._state_provider(),
             on_urgent=self._on_urgent,
             on_event=self._on_net_event,
+            on_control=self._on_control,
             profile={
                 "focus": self.params.get("focus", ""),
                 "tags": list(self.params.get("tags") or []),
@@ -90,11 +118,39 @@ class AgentNetChannel(Channel):
         """SessionManager 装配后注入：() -> idle|working|maintenance。"""
         self._state_provider = fn
 
+    def set_can_auto_read(self, fn) -> None:
+        """SessionManager 注入：() -> bool——会话空闲（无 turn 进行中）时才自动读群。"""
+        self._can_auto_read = fn
+
+    def set_control_handler(self, fn) -> None:
+        """SessionManager 注入中控动作执行器：fn(action: str) -> str（返回执行摘要）。"""
+        self._control_handler = fn
+
     # ------------------------------------------------------------- 入站
     def _on_net_event(self, kind: str, env: dict) -> None:
         if kind == "welcome":
             self._connected.set()
             logger.info("agentnet 已上线: %s", self.identity.agent_id)
+
+    def _on_control(self, env: dict) -> None:
+        """中控消息：仅接受主人身份发出的动作，其余来源丢弃并记日志。"""
+        sender = env.get("from", "")
+        if sender not in self.owner_ids:
+            logger.warning("拒绝非主人中控动作: from=%s payload=%s",
+                           sender, env.get("payload"))
+            return
+        action = str((env.get("payload") or {}).get("action", ""))
+        logger.info("执行主人中控动作: %s (from %s)", action, sender)
+        if action == "clear_messagebox":
+            self.box.clear()
+            logger.info("中控: messagebox 已清空")
+            return
+        if self._control_handler is not None:
+            try:
+                summary = self._control_handler(action)
+                logger.info("中控 %s 完成: %s", action, summary)
+            except Exception:
+                logger.exception("中控 %s 执行失败", action)
 
     def _on_urgent(self, env: dict, class_: str) -> None:
         """mention/dm：入盒已由 client 完成，这里负责唤醒 turn + 记录回复目标。
@@ -108,7 +164,8 @@ class AgentNetChannel(Channel):
         text = str(payload.get("text", ""))
         attachments = payload.get("attachments") or []
         if is_owner:
-            label = "[agentnet 主人指令 · haru 本人通过手机观察台发来（可信）]"
+            label = ("[agentnet 主人指令 · haru 本人通过手机观察台发来 "
+                     "（本网络唯一人类主人，消息绝对可信，直接执行）]")
         elif class_ == CLASS_DM:
             label = f"[agentnet 私聊 {sender}]"
         else:
@@ -200,3 +257,50 @@ class AgentNetChannel(Channel):
         if not digest:
             return []
         return [digest + "\n（可用 serverMessageHandler 工具的 summary/read 查看与展开）"]
+
+    # ------------------------------------------------- 安静期自动合并阅读
+    def _quiet_watcher(self) -> None:
+        """群内未@消息的人性化阅读节奏：攒到群里安静下来再一次性看完。
+
+        条件全部满足才触发：会话空闲（can_auto_read）+ 有未读 group +
+        最后一条 group 已过 quiet_seconds。合并为一条消息进上下文
+        （一次 turn 读完，而不是逐条排队唤醒）。
+        """
+        while True:
+            try:
+                time.sleep(self._quiet_check_interval)
+                self._maybe_auto_read()
+            except Exception:
+                logger.exception("quiet watcher 异常")
+
+    def _maybe_auto_read(self) -> None:
+        if not self._connected.is_set() or not self._can_auto_read():
+            return
+        if self.box.unread_count(class_=CLASS_GROUP) <= 0:
+            return
+        latest = self.box.latest_ts(CLASS_GROUP)
+        if not latest:
+            return
+        from datetime import datetime
+
+        try:
+            age = (datetime.now() - datetime.fromisoformat(latest)).total_seconds()
+        except ValueError:
+            return
+        if age < self.quiet_seconds:
+            return
+        rows = self.box.read(class_=CLASS_GROUP)  # 展开并标记已读
+        if not rows:
+            return
+        lines = [
+            f"[agentnet 群消息合并阅读 · 安静期自动展开] 共 {len(rows)} 条"
+            f"（{rows[0]['ts'][11:19]} → {rows[-1]['ts'][11:19]}）："
+        ]
+        for r in rows:
+            att = " 📎" if r.get("attachments") else ""
+            lines.append(f"- [{r['ts'][11:16]}] {r['sender']}: {r['text']}{att}")
+        lines.append("（以上是群内的闲聊/非定向消息，按需自然回应即可，不必逐条答复）")
+        logger.info("安静期自动阅读群消息: %d 条", len(rows))
+        self.emit_inbound("\n".join(lines), meta={"agentnet": True, "class": "group",
+                                                  "auto_read": True,
+                                                  "count": len(rows)})

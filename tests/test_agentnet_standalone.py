@@ -381,6 +381,35 @@ async def channel_test(root: Path):
         rows_with_att = [m for m in box_x.read(since_ts="2000-01-01", mark_read=False)
                          if m.get("attachments")]
         check("附件入盒可读", bool(rows_with_att), str(row)[:120])
+
+        # 中控：owner 动作执行 / 非 owner 拒绝
+        ctrl_log = []
+        ch.set_control_handler(lambda a: ctrl_log.append(a) or "ok")
+        ch.owner_ids = {id_x.agent_id}
+        ch._on_control({"from": id_x.agent_id, "payload": {"action": "clear_memory"}})
+        check("主人中控动作执行", ctrl_log == ["clear_memory"], str(ctrl_log))
+        ch._on_control({"from": "agt_stranger", "payload": {"action": "clear_memory"}})
+        check("非主人中控被拒", ctrl_log == ["clear_memory"], str(ctrl_log))
+        ch.box.add("ctl1", "group", "grp:town", "agt_a", "x")
+        ch._on_control({"from": id_x.agent_id, "payload": {"action": "clear_messagebox"}})
+        check("中控清空收件箱", ch.box.unread_count() == 0)
+        ch.owner_ids = set()
+
+        # 安静期自动合并阅读：无@群消息攒到安静窗口 → 合并成一条进上下文
+        ch.quiet_seconds = 0.5
+        ch.set_can_auto_read(lambda: True)
+        await client_x.send_message("grp:town", "安静期闲聊一", kind="group")
+        await client_x.send_message("grp:town", "安静期闲聊二", kind="group")
+        ok = await wait(lambda: ch.box.unread_count(class_="group") >= 2, label="quiet inbox")
+        await asyncio.sleep(0.6)  # 超过 quiet_seconds
+        inbound_before = len(inbound)
+        ch._maybe_auto_read()
+        check("安静期合并阅读", ok and len(inbound) > inbound_before
+              and "合并阅读" in inbound[-1].text
+              and "安静期闲聊一" in inbound[-1].text
+              and "安静期闲聊二" in inbound[-1].text,
+              inbound[-1].text[:120] if inbound else "")
+        check("合并阅读后群消息已读", ch.box.unread_count(class_="group") == 0)
     finally:
         agentnet_tools.set_agentnet_handle(None)
         ch.stop()

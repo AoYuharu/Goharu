@@ -36,13 +36,15 @@ UPLOAD_TS_WINDOW = 300
 class ObserverServer:
     def __init__(self, message_log, presence, host: str = "0.0.0.0",
                  port: int = 6001, token: str = "",
-                 file_store=None, whitelist=None, on_send=None):
+                 file_store=None, whitelist=None, on_send=None,
+                 on_control=None):
         self.message_log = message_log
         self.presence = presence
         self.token = token or ""
         self.file_store = file_store
         self.whitelist = whitelist
         self.on_send = on_send  # hub.submit_owner_message(text, mentions, attachments)
+        self.on_control = on_control  # hub.submit_owner_control(target, action)
         self._httpd = ThreadingHTTPServer((host, port), self._make_handler())
         self._thread = None
 
@@ -125,6 +127,9 @@ class ObserverServer:
                     if url.path == "/api/send":
                         self._handle_send(qs)
                         return
+                    if url.path == "/api/control":
+                        self._handle_control(qs)
+                        return
                     if url.path == "/api/files":
                         self._handle_upload(qs)
                         return
@@ -132,6 +137,33 @@ class ObserverServer:
                 except Exception as e:
                     logger.exception("observer POST 失败: %s", url.path)
                     self._send(500, json.dumps({"ok": False, "error": str(e)}).encode())
+
+            def _handle_control(self, qs: dict):
+                """中控动作：清除目标智能体的会话/记忆（仅 token 持有人）。"""
+                if outer.on_control is None:
+                    self._send(503, b'{"ok":false,"error":"control disabled"}')
+                    return
+                if not outer.token or not self._authed(qs):
+                    self._send(403, b'{"ok":false,"error":"token required for control"}')
+                    return
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length <= 0 or length > 4096:
+                    self._send(413, b'{"ok":false,"error":"bad size"}')
+                    return
+                try:
+                    req = json.loads(self.rfile.read(length).decode("utf-8"))
+                except ValueError:
+                    self._send(400, b'{"ok":false,"error":"bad json"}')
+                    return
+                target = str(req.get("target") or "")
+                action = str(req.get("action") or "")
+                if action not in ("clear_context", "clear_memory", "clear_messagebox"):
+                    self._send(400, b'{"ok":false,"error":"unknown action"}')
+                    return
+                result = outer.on_control(target, action)
+                code = 200 if result.get("ok") else 500
+                self._send(code, json.dumps(result, ensure_ascii=False).encode("utf-8"))
+                logger.info("观察台中控: %s → %s", action, target)
 
             def _handle_send(self, qs: dict):
                 if outer.on_send is None:

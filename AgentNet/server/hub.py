@@ -303,6 +303,34 @@ class HubServer:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "msg_id": env["id"]}
 
+    def submit_owner_control(self, target: str, action: str) -> dict:
+        """观察台中控入口（HTTP 线程调用）：以 owner 身份给指定智能体发中控动作。"""
+        if self.loop is None:
+            return {"ok": False, "error": "hub 未就绪"}
+        if not self.whitelist.agent(target):
+            return {"ok": False, "error": f"目标不在白名单: {target}"}
+        env = make_envelope(
+            sender=self.owner.agent_id, to=target, type_="control",
+            payload={"action": action})
+        env["sig"] = self.owner.sign(canonical_bytes(env))
+
+        async def _deliver() -> dict:
+            # 中控消息不进消息流水（它是运维动作，不是聊天）；
+            # 但记一条系统流水便于观察台展示"中控动作已发出"
+            self.message_log.log(self.owner.agent_id, "中控", target, "control",
+                                 None, f"{action} → {target}", env.get("ts"))
+            return {"delivered": await self._send_to(target, env)}
+
+        try:
+            result = asyncio.run_coroutine_threadsafe(_deliver(), self.loop).result(timeout=10)
+        except Exception as e:
+            logger.warning("owner 中控投递失败: %s", e)
+            return {"ok": False, "error": str(e)}
+        if not result["delivered"]:
+            self.mailbox.put(target, env)
+            return {"ok": True, "msg_id": env["id"], "queued": True}
+        return {"ok": True, "msg_id": env["id"], "queued": False}
+
     # ---------------------------------------------------------- 连接生命周期
     async def handle(self, ws) -> None:
         agent_id = None
@@ -481,6 +509,7 @@ def main() -> None:
             file_store=server.files,
             whitelist=server.whitelist,
             on_send=server.submit_owner_message,
+            on_control=server.submit_owner_control,
         )
         observer.start()
     asyncio.run(server.serve())

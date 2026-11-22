@@ -227,13 +227,14 @@ class SessionManager:
                     # 环境变量优先：多机部署时机器专属身份名不必进 git
                     "name": os.environ.get("AGENTNET_NAME")
                     or config.get("agentnet.name", "goharu"),
-                    "owner_ids": list(config.get("agentnet.owner_ids") or []),
                     "identity_dir": config.get(
                         "agentnet.identity_dir", "./runtime_memory/agentnet/identity"),
                     "messagebox_path": config.get(
                         "agentnet.messagebox_path", "./runtime_memory/agentnet/messagebox.db"),
                     "focus": config.get("agentnet.focus", ""),
                     "tags": config.get("agentnet.tags", []),
+                    "owner_ids": list(config.get("agentnet.owner_ids") or []),
+                    "quiet_seconds": float(config.get("agentnet.quiet_seconds", 120)),
                 })
                 session.attach_channel(ch)
                 ch.bind(session.enqueue)
@@ -244,6 +245,9 @@ class SessionManager:
                 ch.set_state_provider(
                     lambda: "working" if any(s._processing for s in self.sessions.values())
                     else "idle")
+                ch.set_can_auto_read(
+                    lambda: not any(s._processing for s in self.sessions.values()))
+                ch.set_control_handler(self._agentnet_control)
                 session.memory.set_turn_extras_provider(ch.turn_extras)
                 logger.info("agentnet channel ready: %s → %s",
                             ch.identity.agent_id, ch.url)
@@ -289,6 +293,37 @@ class SessionManager:
                     get_default_hub().start_scheduler()
         except Exception as e:
             logger.warning("architect hero bridge wiring failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # AgentNet 中控（观察台按钮 → hub control 消息 → agentnet channel）
+    # ------------------------------------------------------------------
+
+    def _agentnet_control(self, action: str) -> str:
+        """主人中控动作执行（agentnet channel 在收到 owner control 后调用）。"""
+        logger.info("agentnet 中控执行: %s", action)
+        if action == "clear_context":
+            for s in self.sessions.values():
+                s.memory.clear_context()
+            return "全部会话历史已清空"
+        if action == "clear_memory":
+            from Memory.repositories.L1Repository import L1Repository
+            repo = L1Repository(self.memory.db)
+            atoms = repo.list_atoms(status="active")
+            for a in atoms:
+                repo.deactivate_atom(a["id"])
+            persona_path = self.memory.persona.persona_path
+            if persona_path.exists():
+                persona_path.unlink()
+            scene_files = self.memory.scene_files
+            scenes_deleted = 0
+            for sc in list(scene_files.list_scenes()):
+                if scene_files.delete_scene(sc["slug"]):
+                    scenes_deleted += 1
+            return (f"记忆已清空（L1 {len(atoms)} 条置 inactive、"
+                    f"persona 重置、scene {scenes_deleted} 个删除）")
+        if action == "clear_messagebox":
+            return "messagebox 已由 channel 清空"
+        return f"未知动作: {action}"
 
     # ------------------------------------------------------------------
     # 路由

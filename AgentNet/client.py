@@ -62,6 +62,7 @@ class AgentNetClient:
         state_provider: Optional[StateProvider] = None,
         on_urgent: Optional[OnUrgent] = None,
         on_event: Optional[OnEvent] = None,
+        on_control: Optional[Callable[[dict], Any]] = None,
         heartbeat_seconds: int = 30,
         reconnect_max_seconds: int = 60,
         profile: Optional[dict] = None,
@@ -78,6 +79,7 @@ class AgentNetClient:
         self._state_provider = state_provider or (lambda: "idle")
         self._on_urgent = on_urgent
         self._on_event = on_event
+        self._on_control = on_control
         self._heartbeat_seconds = heartbeat_seconds
         self._reconnect_max = reconnect_max_seconds
 
@@ -157,6 +159,12 @@ class AgentNetClient:
         t = env["type"]
         if t == "message":
             self._handle_message(env)
+        elif t == "control":
+            if self._on_control:
+                try:
+                    self._on_control(env)
+                except Exception:
+                    logger.exception("agentnet on_control 回调异常")
         elif t == "presence_state":
             if self._presence_waiter is not None and not self._presence_waiter.done():
                 self._presence_waiter.set_result(env["payload"].get("agents", {}))

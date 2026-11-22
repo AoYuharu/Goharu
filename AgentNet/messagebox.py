@@ -94,9 +94,30 @@ class MessageBox:
             p["last_ts"] = r["ts"]
         return out
 
-    def unread_count(self) -> int:
+    def unread_count(self, class_: Optional[str] = None) -> int:
+        if class_ is None:
+            return int(self._conn().execute(
+                "SELECT COUNT(*) c FROM messages WHERE read = 0").fetchone()["c"])
         return int(self._conn().execute(
-            "SELECT COUNT(*) c FROM messages WHERE read = 0").fetchone()["c"])
+            "SELECT COUNT(*) c FROM messages WHERE read = 0 AND class = ?",
+            (class_,)).fetchone()["c"])
+
+    def latest_ts(self, class_: Optional[str] = None) -> Optional[str]:
+        """某类最近一条未读消息的时间戳（安静期判断用）。"""
+        if class_ is None:
+            row = self._conn().execute(
+                "SELECT ts FROM messages WHERE read = 0 ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        else:
+            row = self._conn().execute(
+                "SELECT ts FROM messages WHERE read = 0 AND class = ? "
+                "ORDER BY id DESC LIMIT 1", (class_,)).fetchone()
+        return row["ts"] if row else None
+
+    def clear(self) -> None:
+        """清空（中控 clear_messagebox 用）。"""
+        self._conn().execute("DELETE FROM messages")
+        self._conn().commit()
 
     def read(
         self,
