@@ -10,7 +10,10 @@ models/
 Qwen2.5-7B-Instruct/
 *.zip
 *.log
+botpy.log*
 .pytest_cache/
+.cache/
+.playwright-mcp/
 
 # TypeScript TUI
 tui-ts/node_modules/
