@@ -25,7 +25,12 @@ if [ -z "$PY" ]; then err "需要 Python >= 3.10"; missing=1;
 elif ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)'; then
   err "Python 版本太旧，需要 >= 3.10"; missing=1
 fi
-if ! command -v node >/dev/null 2>&1; then err "需要 Node.js >= 18（TUI 构建）"; missing=1; fi
+if ! command -v node >/dev/null 2>&1; then
+  err "需要 Node.js >= 20（TUI 构建）"; missing=1
+else
+  nver="$(node --version 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+  if [ "${nver:-0}" -lt 20 ]; then err "Node.js 太旧（$(node --version)），需要 >= 20"; missing=1; fi
+fi
 
 if [ "$missing" = "1" ]; then
   echo "" >&2

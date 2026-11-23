@@ -24,7 +24,12 @@ if (-not $py) {
     $verOk = & $py -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>$null
     if ($LASTEXITCODE -ne 0) { $missing += "Python>=3.10  → winget install Python.Python.3.12"; $py = $null }
 }
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) { $missing += "Node.js>=18  → winget install OpenJS.NodeJS" }
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+    $missing += "Node.js>=20  → winget install OpenJS.NodeJS.LTS"
+} else {
+    $nv = (node --version) -replace '[^0-9].*$','' -replace '^v',''
+    if ([int]$nv -lt 20) { $missing += "Node.js>=20（当前 $(node --version)）  → winget install OpenJS.NodeJS.LTS" }
+}
 
 if ($missing.Count -gt 0) {
     Err "缺少依赖，请先安装（装完重跑本条命令）："

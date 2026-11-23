@@ -308,18 +308,23 @@ def step_check_env() -> bool:
             print("      Debian/Ubuntu: sudo apt install git   macOS: xcode-select --install / brew install git")
         ok = False
 
-    # Node / npm
+    # Node / npm（TUI 依赖 ink/string-width 用了 /v 正则旗标，需 Node >= 20）
     node = shutil.which("node")
     npm = shutil.which("npm")
-    if node and npm:
-        ver = subprocess.run(["node", "--version"], capture_output=True, text=True).stdout.strip()
-        info(f"Node {ver} + npm")
+    node_major = None
+    node_ver = ""
+    if node:
+        node_ver = subprocess.run(["node", "--version"], capture_output=True, text=True).stdout.strip()
+        mver = re.match(r"v?(\d+)", node_ver)
+        node_major = int(mver.group(1)) if mver else None
+    if node and npm and node_major and node_major >= 20:
+        info(f"Node {node_ver} + npm")
     else:
-        err("未找到 Node.js >= 18 / npm（TUI 构建需要）")
+        err(f"需要 Node.js >= 20（当前 {node_ver or '未安装'}；TUI 依赖 ink/string-width 的 /v 正则旗标）")
         if IS_WIN:
-            print("      安装: winget install OpenJS.NodeJS   或  https://nodejs.org")
+            print("      安装: winget install OpenJS.NodeJS.LTS   或  https://nodejs.org")
         else:
-            print("      安装: https://nodejs.org  或  nvm install --lts")
+            print("      安装: https://nodejs.org  或  nvm install 20")
         ok = False
 
     return ok

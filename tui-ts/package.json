@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "TypeScript TUI frontend for Goharu agent (replaces TUI/ Textual frontend)",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "tsx watch src/main.tsx",
     "build": "tsc",

@@ -38,7 +38,7 @@ Linux / macOS：
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/AoYuharu/Goharu/master/bootstrap.sh)"
 ```
 
-要求 git、Python ≥ 3.10、Node.js ≥ 18；缺失时引导程序会给出对应系统的安装命令。
+要求 git、Python ≥ 3.10、Node.js ≥ 20；缺失时引导程序会给出对应系统的安装命令。
 
 安装会注册全局命令 `goharu`：完成后新开一个终端，在任意目录输入 `goharu` 即启动。
 
