@@ -46,28 +46,30 @@
 
 ### 一键安装
 
-**Linux / macOS：**
+一条命令，进入交互式引导页——选模型厂商、粘贴密钥，一气呵成装完即用。
 
-```bash
-git clone https://github.com/AoYuharu/Goharu.git && cd Goharu
-./install.sh                  # 核心安装（轻量，FTS5+BM25 检索）
-./install.sh --with-embedding # 可选：语义检索增强（torch，>2GB）
-./install.sh --systemd        # 可选：注册 headless 常驻服务
+**Windows**（Win+R 粘贴回车，或在 PowerShell 窗口执行）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/AoYuharu/Goharu/master/bootstrap.ps1 | iex"
 ```
 
-**Windows：**
-
-```bat
-git clone https://github.com/AoYuharu/Goharu.git
-cd Goharu
-install.bat
-```
-
-安装后：编辑 `.env` 填入 LLM 密钥（`ANTHROPIC_API_KEY` 或 `ZHIPU_API_KEY`，任一 Anthropic 兼容端点），然后：
+**Linux / macOS**（粘贴到终端执行）：
 
 ```bash
-./start.sh        # Linux/macOS
-start.bat         # Windows
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/AoYuharu/Goharu/master/bootstrap.sh)"
+```
+
+引导程序会自动：检查依赖 → clone 仓库 → 让你选模型厂商并粘贴 API Key（不可见输入）→ 选检索模式 → 建 venv 装依赖 → 构建 TUI → 写入 `.env` 与 `config.yaml` → 装完即可启动。
+
+> 前置要求：git、Python ≥ 3.10、Node.js ≥ 18。引导程序会先检查，缺失时直接给出对应系统的安装命令。
+
+**已克隆仓库的老习惯**（等价，同样进入引导页）：
+
+```bash
+./install.sh        # Linux/macOS
+install.bat         # Windows
+# 或直接：python install.py
 ```
 
 **卸载：**
