@@ -524,6 +524,7 @@ def step_register_command() -> bool:
         content = (
             "@echo off\r\n"
             f'cd /d "{repo}"\r\n'
+            f'set "PYTHON={venv_py}"\r\n'
             f'"{venv_py}" "{os.path.join(repo, "run_tui_ts.py")}" %*\r\n'
         )
         with open(launcher, "w", encoding="utf-8", newline="") as f:
@@ -562,6 +563,8 @@ def step_register_command() -> bool:
         "# Goharu 全局启动器（install.py 生成）\n"
         f'GOHARU_HOME="{repo}"\n'
         'cd "$GOHARU_HOME" || exit 1\n'
+        # gateway 子进程要用 venv python（带依赖），否则落到系统 python3 崩在 import
+        f'export PYTHON="{venv_py}"\n'
         'set -a; [ -f "$GOHARU_HOME/.env" ] && . "$GOHARU_HOME/.env"; set +a\n'
         f'exec "{venv_py}" "$GOHARU_HOME/run_tui_ts.py" "$@"\n'
     )

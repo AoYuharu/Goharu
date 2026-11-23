@@ -20,6 +20,12 @@ DIST_ENTRY = PROJECT_ROOT / "tui-ts" / "dist" / "main.js"
 def main():
     os.chdir(PROJECT_ROOT)
 
+    # 把运行本启动器的 python（经 goharu 启动器即 venv python）传给 gateway 子进程：
+    # TUI 默认用 process.env.PYTHON ?? python3，若 PYTHON 未设会落到系统 python3，
+    # 缺 yaml 等依赖导致 gateway 在 import configurationLoader 阶段崩。
+    # setdefault：显式设置的 PYTHON（如 haru 的 start_goharu.sh）优先。
+    os.environ.setdefault("PYTHON", sys.executable)
+
     if shutil.which("node") is None:
         print("Error: node not found in PATH. Install Node.js >= 22.", file=sys.stderr)
         sys.exit(1)
