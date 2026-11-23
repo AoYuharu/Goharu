@@ -1,0 +1,64 @@
+name: install-test
+
+# 手动触发（Actions 页 → Run workflow）。不在每次 push 自动跑，避免白烧 CI。
+on:
+  workflow_dispatch:
+
+jobs:
+  install:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ── Linux：安装（向导输入序列：厂商1/密钥空/轻量1/运行方式1/不启动）──
+      - name: Install (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -e
+          printf '1\n\n1\n1\n\n' | python3 install.py
+          test -x venv/bin/python
+          test -f .env
+          test -x "$HOME/.local/bin/goharu"
+          venv/bin/python -c "import yaml,anthropic,openai,mcp"
+          echo "LINUX INSTALL OK"
+
+      - name: Uninstall (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          bash uninstall.sh --all
+          test ! -d venv
+          test ! -d tui-ts/node_modules
+          echo "LINUX UNINSTALL OK"
+
+      # ── Windows：安装（Windows 无 runmode 提示，输入序列少一项）──
+      - name: Install (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          @("1","","1","") | python install.py
+          if ($LASTEXITCODE -ne 0) { throw "install.py failed" }
+          if (-not (Test-Path "venv\Scripts\python.exe")) { throw "venv missing" }
+          if (-not (Test-Path ".env")) { throw ".env missing" }
+          if (-not (Test-Path "$HOME\.goharu\bin\goharu.cmd")) { throw "goharu.cmd missing" }
+          Write-Host "WINDOWS INSTALL OK"
+
+      - name: Uninstall (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          uninstall.bat /all
+          if exist venv ( exit /b 1 )
+          Write-Host "WINDOWS UNINSTALL OK"
