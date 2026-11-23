@@ -440,6 +440,76 @@ WantedBy=default.target
     return True
 
 
+def step_register_command() -> bool:
+    """注册全局 `goharu` 命令到 PATH，装完任意目录敲 `goharu` 即启动（无需再跑 start 脚本）。"""
+    title("注册全局命令 goharu")
+    repo = REPO_DIR
+    if IS_WIN:
+        bin_dir = os.path.join(os.path.expanduser("~"), ".goharu", "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        launcher = os.path.join(bin_dir, "goharu.cmd")
+        venv_py = os.path.join(repo, "venv", "Scripts", "python.exe")
+        # .cmd 用 CRLF，Windows 批处理才稳
+        content = (
+            "@echo off\r\n"
+            f'cd /d "{repo}"\r\n'
+            f'"{venv_py}" "{os.path.join(repo, "run_tui_ts.py")}" %*\r\n'
+        )
+        with open(launcher, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+        # 写入用户 PATH（走注册表，规避 setx 的 1024 截断 bug）
+        try:
+            import winreg
+
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_ALL_ACCESS)
+            try:
+                cur, _ = winreg.QueryValueEx(key, "Path")
+            except FileNotFoundError:
+                cur = ""
+            if bin_dir.lower() not in cur.lower():
+                winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, (cur + ";" + bin_dir) if cur else bin_dir)
+            winreg.CloseKey(key)
+            # 广播环境变更，让新终端立即拿到
+            try:
+                import ctypes
+
+                ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 0, 1000, None)
+            except Exception:
+                pass
+            info(f"已注册 goharu → {bin_dir}（已加入用户 PATH，新开终端生效）")
+        except Exception as e:
+            warn(f"写入 PATH 失败: {e}。请手动把 {bin_dir} 加入 PATH")
+            return False
+        return True
+
+    bin_dir = os.path.expanduser("~/.local/bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    launcher = os.path.join(bin_dir, "goharu")
+    venv_py = os.path.join(repo, "venv", "bin", "python")
+    content = (
+        "#!/usr/bin/env bash\n"
+        "# Goharu 全局启动器（install.py 生成）\n"
+        f'GOHARU_HOME="{repo}"\n'
+        'cd "$GOHARU_HOME" || exit 1\n'
+        'set -a; [ -f "$GOHARU_HOME/.env" ] && . "$GOHARU_HOME/.env"; set +a\n'
+        f'exec "{venv_py}" "$GOHARU_HOME/run_tui_ts.py" "$@"\n'
+    )
+    with open(launcher, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+    os.chmod(launcher, 0o755)
+    if bin_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        snippet = '\n# Goharu 全局命令\nexport PATH="$HOME/.local/bin:$PATH"\n'
+        for rc in (".bashrc", ".zshrc", ".profile"):
+            rcp = os.path.expanduser(f"~/{rc}")
+            if os.path.exists(rcp):
+                with open(rcp, "a", encoding="utf-8") as f:
+                    f.write(snippet)
+        info("已注册 goharu → ~/.local/bin（已写入 shell 配置，新开终端或 source 后生效）")
+    else:
+        info("已注册 goharu → ~/.local/bin")
+    return True
+
+
 # ── 主流程 ───────────────────────────────────────────────────────────
 def main() -> int:
     print(c("bold", c("magenta", r"""
@@ -470,9 +540,10 @@ def main() -> int:
     step_write_config(provider)
     if with_systemd:
         step_setup_systemd()
+    step_register_command()
 
     title("安装完成")
-    print(f"    启动: {c('green', 'start.bat')}（Windows）/ {c('green', './start.sh')}（Linux/macOS）")
+    print(f"    启动: 新开一个终端，输入 {c('green', 'goharu')}（任意目录均可）")
     if with_systemd and not IS_WIN:
         print(f"    守护: {c('green', 'systemctl --user start goharu')}")
     if not provider.get("key"):

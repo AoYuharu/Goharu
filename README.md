@@ -40,6 +40,8 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/AoYuharu/Goharu/master/b
 
 要求 git、Python ≥ 3.10、Node.js ≥ 18；缺失时引导程序会给出对应系统的安装命令。
 
+安装会注册全局命令 `goharu`：完成后新开一个终端，在任意目录输入 `goharu` 即启动。
+
 已克隆仓库则运行 `./install.sh`（Windows 用 `install.bat`），等价进入引导。
 
 卸载：`./uninstall.sh [--all|--purge]`（Windows 用 `uninstall.bat`）。
@@ -67,4 +69,4 @@ QQ / TUI 等通道插件 → Gateway（会话装配、路由、压缩阶梯）�
 
 ---
 
-**English.** Goharu is a dual-agent personal AI system for Windows/Linux. Hero is the conversational ReAct agent (QQ bot / terminal TUI, file & shell tools, L0→L3 memory pyramid). Arch is a backstage maintainer with a private memory tower: telemetry watch, self-healing, staged update audit, bare-metal probing. Install in one line via `bootstrap.sh` / `bootstrap.ps1`; any Anthropic-compatible endpoint works. Configuration lives in `config.yaml`.
+**English.** Goharu is a dual-agent personal AI system for Windows/Linux. Hero is the conversational ReAct agent (QQ bot / terminal TUI, file & shell tools, L0→L3 memory pyramid). Arch is a backstage maintainer with a private memory tower: telemetry watch, self-healing, staged update audit, bare-metal probing. Install in one line via `bootstrap.sh` / `bootstrap.ps1`; the installer registers a global `goharu` command so you can launch from anywhere. Any Anthropic-compatible endpoint works. Configuration lives in `config.yaml`.
