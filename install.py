@@ -23,8 +23,6 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
-import time
 
 IS_WIN = os.name == "nt"
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -147,18 +145,6 @@ def confirm(msg: str, default: bool = True) -> bool:
     return raw.lower() in ("y", "yes", "1", "true")
 
 
-def choose(msg: str, options: list[str], default: int = 0) -> int:
-    print(f"{c('cyan', '?')} {msg}")
-    for i, opt in enumerate(options, 1):
-        marker = ">" if i - 1 == default else " "
-        print(f"  {c('green', marker)} {c('bold', str(i))}. {opt}")
-    while True:
-        raw = ask(f"选择 (1-{len(options)})", str(default + 1))
-        if raw.isdigit() and 1 <= int(raw) <= len(options):
-            return int(raw) - 1
-        err("无效选择，请重试")
-
-
 def ask_secret(prompt: str) -> str:
     if not sys.stdin.isatty():
         # 非 TTY（管道/重定向/脚本化）：getpass 在 Windows 会读真实控制台而挂住，退化为明文输入
@@ -174,8 +160,95 @@ def ask_secret(prompt: str) -> str:
         raise SystemExit(0)
 
 
-# ── 长步骤执行（实时 spinner + 失败回显尾部）──────────────────────────
+# ── 方向键菜单（TTY 下 ↑↓ 选择 + 回车确认；非 TTY 退回数字输入）──────────
+def _read_key() -> str:
+    """跨平台读单键，归一化为 up/down/enter/ctrl-c/字符。返回 '' 表示无关键。"""
+    if IS_WIN:
+        import msvcrt
+
+        k = msvcrt.getwch()
+        if k in ("\x00", "\xe0"):  # 特殊键前缀
+            k2 = msvcrt.getwch()
+            return {"H": "up", "P": "down"}.get(k2, "")
+        if k in ("\r", "\n"):
+            return "enter"
+        if k == "\x03":
+            return "ctrl-c"
+        return k
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":  # 转义序列（方向键 \x1b[A / \x1b[B）
+            if sys.stdin.read(1) == "[":
+                return {"A": "up", "B": "down"}.get(sys.stdin.read(1), "")
+            return ""
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch == "\x03":
+            return "ctrl-c"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _menu_select(msg: str, options: list[str], default: int) -> int:
+    """TTY 方向键菜单：↑↓ 移动高亮、回车确认。用光标上移重绘实现，非全屏。"""
+    idx = default
+    n = len(options)
+    print(f"{c('cyan', '?')} {msg}  {c('dim', '（↑↓ 选择，回车确认）')}")
+    for _ in options:
+        print()  # 占位行
+
+    def render() -> None:
+        sys.stdout.write(f"\x1b[{n}A")  # 光标上移 n 行
+        for i, opt in enumerate(options):
+            sel = i == idx
+            marker = c("green", "❯") if sel else " "
+            line = f"{marker} {c('bold', opt) if sel else opt}"
+            sys.stdout.write("\x1b[2K" + line + "\n")  # 清行后重写
+        sys.stdout.flush()
+
+    render()
+    while True:
+        k = _read_key()
+        if k == "up":
+            idx = (idx - 1) % n
+        elif k == "down":
+            idx = (idx + 1) % n
+        elif k == "enter":
+            break
+        elif k == "ctrl-c":
+            print()
+            raise SystemExit(130)
+        render()
+    return idx
+
+
+def choose(msg: str, options: list[str], default: int = 0) -> int:
+    """选择菜单：TTY 用方向键，非 TTY（脚本/CI/管道）退回数字输入。"""
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return _menu_select(msg, options, default)
+    print(f"{c('cyan', '?')} {msg}")
+    for i, opt in enumerate(options, 1):
+        marker = ">" if i - 1 == default else " "
+        print(f"  {c('green', marker)} {c('bold', str(i))}. {opt}")
+    while True:
+        raw = ask(f"选择 (1-{len(options)})", str(default + 1))
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw) - 1
+        err("无效选择，请重试")
+
+
+# ── 长步骤执行（实时滚动显示输出 + 成功✓/失败✗）────────────────────────
 def run_step(label: str, cmd: str, cwd: str = REPO_DIR) -> bool:
+    """跑一个步骤：实时滚动回显子进程输出（缩进 dim），完成打 ✓，失败打 ✗ 并回显错误尾部。
+    pip/npm 的 Collecting/Downloading/Installing 行都会逐条可见。"""
+    print(f"{c('cyan', '  ▶')} {c('bold', label)}")
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -187,29 +260,22 @@ def run_step(label: str, cmd: str, cwd: str = REPO_DIR) -> bool:
         errors="replace",
     )
     tail: list[str] = []
-
-    def pump() -> None:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            tail.append(line.rstrip())
-            if len(tail) > 60:
-                tail.pop(0)
-
-    t = threading.Thread(target=pump, daemon=True)
-    t.start()
-    spinner = "|/-\\"
-    i = 0
-    while proc.poll() is None:
-        sys.stdout.write("\r  " + c("cyan", spinner[i % 4]) + "  " + label)
-        sys.stdout.flush()
-        i += 1
-        time.sleep(0.08)
-    t.join()
-    sys.stdout.write("\r" + " " * (len(label) + 12) + "\r")
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.rstrip()
+        if not line.strip():
+            continue
+        tail.append(line)
+        if len(tail) > 80:
+            tail.pop(0)
+        if "━" in line:  # pip 进度条刷屏行（块字符）跳过，避免刷屏
+            continue
+        print("    " + c("dim", line))
+    proc.wait()
     if proc.returncode != 0:
-        print(c("red", f"  ✗ {label}（exit {proc.returncode}）"))
+        err(f"{label} 失败（exit {proc.returncode}）")
         for line in tail[-12:]:
-            print("      " + c("dim", line))
+            print("      " + c("red", line))
         return False
     print(c("green", f"  ✓ {label}"))
     return True
@@ -325,14 +391,14 @@ def step_install_deps(with_embedding: bool) -> bool:
         info("venv 已存在，跳过创建")
 
     vp = _venv_py()
-    if not run_step("升级 pip", f"{vp} -m pip install --upgrade pip -q -i {PIP_MIRROR}"):
+    if not run_step("升级 pip", f"{vp} -m pip install --upgrade pip -q --progress-bar off -i {PIP_MIRROR}"):
         return False
-    if not run_step("安装核心依赖", f"{vp} -m pip install -r requirements.txt -q -i {PIP_MIRROR}"):
+    if not run_step("安装核心依赖", f"{vp} -m pip install --progress-bar off -r requirements.txt -i {PIP_MIRROR}"):
         return False
     if with_embedding:
         if not run_step(
             "安装 embedding 重依赖（torch 等，>2GB，请耐心）",
-            f"{vp} -m pip install -r requirements-embedding.txt -i {PIP_MIRROR}",
+            f"{vp} -m pip install --progress-bar off -r requirements-embedding.txt -i {PIP_MIRROR}",
         ):
             return False
     else:
@@ -543,7 +609,11 @@ def main() -> int:
     step_register_command()
 
     title("安装完成")
-    print(f"    启动: 新开一个终端，输入 {c('green', 'goharu')}（任意目录均可）")
+    if IS_WIN:
+        print(f"    启动: 新开一个终端，输入 {c('green', 'goharu')}（任意目录均可）")
+    else:
+        print(f"    启动: 当前终端先执行 {c('green', 'source ~/.bashrc')} 再敲 {c('green', 'goharu')}；")
+        print(f"          或直接重开一个终端敲 {c('green', 'goharu')}（PATH 已写入 shell 配置）")
     if with_systemd and not IS_WIN:
         print(f"    守护: {c('green', 'systemctl --user start goharu')}")
     if not provider.get("key"):
