@@ -327,4 +327,4 @@ channels:
   - Architect.channel
 gateway:
   rpc_port: 8791
-  tui_attach_shutdown: true
+  tui_attach_shutdown: false   # 关 TUI 不关网关（常驻守护；用 goharu gateway stop 显式停）

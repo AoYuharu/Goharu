@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -173,13 +174,23 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     Returns:
         JSON-RPC response or None for notifications
     """
-    global _manager
+    global _manager, _bg_reader_running
 
     method = request.get("method")
     params = request.get("params", {})
     req_id = request.get("id")
 
     try:
+        if method == "gateway.ping":
+            return {"jsonrpc": "2.0", "result": {
+                "ok": True, "pid": os.getpid(),
+                "daemon": "--daemon" in sys.argv,
+                "sessions": list(_manager.sessions) if _manager else [],
+            }, "id": req_id}
+        if method == "gateway.shutdown":
+            logger.info("gateway.shutdown requested via RPC")
+            _bg_reader_running = False   # 主循环退出 → finally 走完整收尾
+            return {"jsonrpc": "2.0", "result": {"shutting_down": True}, "id": req_id}
         if method == "agent.send_message":
             message = params.get("message", "")
             session_id = params.get("session_id", "default")
@@ -770,12 +781,20 @@ class TuiRpcServer:
                         continue
 
                     if method == "tui.shutdown":
+                        if self.shutdown_on_detach:
+                            self._send_line(conn, {
+                                "jsonrpc": "2.0", "result": {"shutting_down": True},
+                                "id": req.get("id")})
+                            logger.info("TuiRpcServer: shutdown requested by TUI")
+                            _bg_reader_running = False   # 主循环退出 → finally 走完整收尾
+                            return
+                        # 常驻模式：TUI 关闭只 detach，守护继续跑（连接随后由对端关闭 → finally 清理）
                         self._send_line(conn, {
-                            "jsonrpc": "2.0", "result": {"shutting_down": True},
+                            "jsonrpc": "2.0",
+                            "result": {"shutting_down": False, "detached": True},
                             "id": req.get("id")})
-                        logger.info("TuiRpcServer: shutdown requested by TUI")
-                        _bg_reader_running = False   # 主循环退出 → finally 走完整收尾
-                        return
+                        logger.info("TuiRpcServer: TUI detached (daemon stays alive)")
+                        continue
 
                     # 普通 RPC → 主循环 dispatch，应答经本 socket 回
                     _request_queue.put((req, lambda o, _c=conn: self._send_line(_c, o)))
@@ -961,7 +980,22 @@ def start_voice_http_server(port: int = 8999):
 
 def main():
     """Main entry point"""
-    global _manager
+    global _manager, _bg_reader_running
+
+    # --daemon：常驻守护模式（goharu gateway start）。不读 stdin，跑到
+    # SIGTERM/SIGINT 或 RPC gateway.shutdown 为止；TUI 断开不退出。
+    daemon_mode = "--daemon" in sys.argv
+    if daemon_mode:
+        def _on_term(signum, _frame):
+            global _bg_reader_running
+            logger.info("daemon: received signal %s, shutting down", signum)
+            _bg_reader_running = False
+        for _sig in ("SIGTERM", "SIGINT"):
+            if hasattr(signal, _sig):
+                try:
+                    signal.signal(getattr(signal, _sig), _on_term)
+                except Exception:
+                    pass
 
     rpc_port = int(config.get("gateway.rpc_port", 8791) or 0)
 
@@ -989,10 +1023,10 @@ def main():
                 break   # 代理连接失败（对端刚好退出）→ 继续尝试本地绑定
             candidate = TuiRpcServer(
                 rpc_port,
-                shutdown_on_detach=_env_flag(
+                shutdown_on_detach=(False if daemon_mode else _env_flag(
                     "GOHARU_TUI_ATTACH_SHUTDOWN",
-                    bool(config.get("gateway.tui_attach_shutdown", True)),
-                ),
+                    bool(config.get("gateway.tui_attach_shutdown", False)),
+                )),
             )
             if candidate.start():        # 绑定即胜出：我是唯一实例
                 rpc_server = candidate
@@ -1087,8 +1121,12 @@ def main():
         # Start background stdin reader —— 必须先于初始 token 统计：
         # 首次记忆检索要等 embedding 模型冷加载（实测可达 56s），若先算 token
         # 统计，TUI 刚发出来的 agent.get_history 等请求会在管道里晾到超时。
-        reader_thread = threading.Thread(target=_stdin_reader, daemon=True, name="stdin-reader")
-        reader_thread.start()
+        if daemon_mode:
+            _bg_reader_running = True   # 无 stdin reader：常驻直到 signal / RPC gateway.shutdown
+            logger.info("daemon mode: running without stdin reader")
+        else:
+            reader_thread = threading.Thread(target=_stdin_reader, daemon=True, name="stdin-reader")
+            reader_thread.start()
 
         # 若 TUI 在初始化完成前就已 attach（启动竞态窗口内），此时 channel
         # 才刚装配出来——补一次事件流改道
