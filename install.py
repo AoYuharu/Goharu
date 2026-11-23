@@ -584,6 +584,70 @@ def step_register_command() -> bool:
     return True
 
 
+def step_choose_channels() -> dict:
+    """可选：QQ Bot / HaruNet 组网 / 出站代理。都可跳过，跨平台（.env + config 文本写入）。"""
+    title("通道与代理（可选，都可跳过）")
+    out = {"qq": None, "harunet": None, "proxy": ""}
+    if confirm("配置 QQ Bot channel？", default=False):
+        app_id = ask("QQBOT_APP_ID")
+        secret = ask_secret("QQBOT_CLIENT_SECRET")
+        if app_id and secret:
+            out["qq"] = {"app_id": app_id, "secret": secret}
+        else:
+            warn("QQ app_id / secret 不全，跳过 QQ 配置")
+    if confirm("配置 HaruNet 组网？", default=False):
+        out["harunet"] = ask("HaruNet hub 地址", "ws://159.75.26.204:6000")
+    out["proxy"] = ask("出站代理地址（如 socks5://127.0.0.1:7890，留空跳过）")
+    return out
+
+
+def _set_env_line(lines: list, key: str, value: str) -> list:
+    out, found = [], False
+    for ln in lines:
+        if re.match(rf"^\s*{re.escape(key)}\s*=", ln):
+            out.append(f"{key}={value}")
+            found = True
+        else:
+            out.append(ln)
+    if not found:
+        out.append(f"{key}={value}")
+    return out
+
+
+def step_write_channels(ch: dict) -> None:
+    """把 QQ/HaruNet/代理 写入 .env 与 config.yaml（文本级，跨平台）。"""
+    # QQ → .env（channel qq_main 已在默认 config 里）
+    if ch.get("qq"):
+        env_path = os.path.join(REPO_DIR, ".env")
+        lines = (open(env_path, encoding="utf-8").read().splitlines()
+                 if os.path.exists(env_path) else [])
+        lines = _set_env_line(lines, "QQBOT_APP_ID", ch["qq"]["app_id"])
+        lines = _set_env_line(lines, "QQBOT_CLIENT_SECRET", ch["qq"]["secret"])
+        open(env_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+        info("已写入 QQ Bot 凭据到 .env")
+    cfg_path = os.path.join(REPO_DIR, "config.yaml")
+    if not os.path.exists(cfg_path):
+        return
+    txt = open(cfg_path, encoding="utf-8").read()
+    changed = False
+    # HaruNet → agentnet.url（config 里唯一 ws:// 的那行）
+    if ch.get("harunet"):
+        t2 = re.sub(r"(?m)^(\s*url:\s*)ws://\S+",
+                    lambda m: m.group(1) + ch["harunet"], txt, count=1)
+        if t2 != txt:
+            txt, changed = t2, True
+            info(f"agentnet.url → {ch['harunet']}")
+    # 代理 → network.proxy.url（4 空格缩进、空引号的那行）
+    if ch.get("proxy"):
+        t2 = re.sub(r'(?m)^(    url:\s*)""',
+                    lambda m: m.group(1) + '"' + ch["proxy"] + '"', txt, count=1)
+        if t2 != txt:
+            txt, changed = t2, True
+            info(f"network.proxy.url → {ch['proxy']}")
+    if changed:
+        open(cfg_path, "w", encoding="utf-8").write(txt)
+
+
 # ── 主流程 ───────────────────────────────────────────────────────────
 def main() -> int:
     print(c("bold", c("magenta", r"""
@@ -601,6 +665,7 @@ def main() -> int:
         return 1
 
     provider = step_choose_provider()
+    channels = step_choose_channels()
     with_embedding = step_choose_embedding()
     with_systemd = step_choose_runmode()
 
@@ -612,6 +677,7 @@ def main() -> int:
         warn("TUI 构建失败，可稍后手动: cd tui-ts && npm install && npm run build")
 
     step_write_config(provider)
+    step_write_channels(channels)
     if with_systemd:
         step_setup_systemd()
     step_register_command()

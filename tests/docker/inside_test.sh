@@ -17,8 +17,8 @@ check "$([ -f "$GH_DIR/run_tui_ts.py" ] && echo 1 || echo '')" "clone 含 run_tu
 
 echo "== [2] 跑交互式安装向导（脚本化输入：DeepSeek / 不填key / 轻量 / TUI / 不立即启动）=="
 cd "$GH_DIR"
-# 引导输入序列：厂商=1(DeepSeek) · 密钥=空 · 检索=1(轻量) · 运行方式=1(TUI) · 立即启动=空(否)
-printf '1\n\n1\n1\n\n' | python3 install.py > /tmp/install.log 2>&1
+# 引导输入序列：厂商=1(DeepSeek) · 密钥=空 · QQ=空(跳过) · HaruNet=空(跳过) · 代理=空(跳过) · 检索=1(轻量) · 运行方式=1(TUI) · 立即启动=空(否)
+printf '1\n\n\n\n\n1\n1\n\n' | python3 install.py > /tmp/install.log 2>&1
 INSTALL_RC=$?
 tail -n 6 /tmp/install.log
 check "$([ "$INSTALL_RC" = "0" ] && echo 1 || echo '')" "install.py 退出码 0"
