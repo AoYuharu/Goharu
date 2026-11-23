@@ -70,7 +70,7 @@ def _rpc(method: str, params: dict | None = None, timeout: float = 3.0):
 
 def _ping():
     """探活：返回 gateway.ping 的 result，或 None。"""
-    return _rpc("gateway.ping", timeout=1.5)
+    return _rpc("gateway.ping", timeout=3.0)
 
 
 def _alive() -> bool:

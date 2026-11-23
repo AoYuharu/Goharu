@@ -1168,6 +1168,11 @@ def main():
             response = dispatch(request)
             if response is not None:
                 if not reply(response):
+                    if daemon_mode:
+                        # 守护模式：客户端断开是常态（TUI detach / CLI 探活超时关连接），
+                        # 单个 reply 失败绝不能让守护退出——记日志继续服务。
+                        logger.warning("reply failed (client gone) — daemon keeps running")
+                        continue
                     log_crash("Failed to write response (broken pipe)")
                     sys.exit(0)
 
