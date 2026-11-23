@@ -40,7 +40,18 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/AoYuharu/Goharu/master/b
 
 要求 git、Python ≥ 3.10、Node.js ≥ 20；缺失时引导程序会给出对应系统的安装命令。
 
-安装会注册全局命令 `goharu`：完成后新开一个终端，在任意目录输入 `goharu` 即启动。
+安装会注册全局命令 `goharu`（新开终端生效）：
+
+```bash
+goharu                      # 确保网关在跑（没起就后台拉起守护）→ 起 TUI attach
+goharu gateway start        # 后台拉起网关守护（幂等）
+goharu gateway stop         # 停网关
+goharu gateway restart      # 重启网关
+goharu gateway status       # 探活（pid / 是否守护 / sessions）
+goharu gateway log [N]      # 看守护日志末尾 N 行
+```
+
+关 TUI **不会**关网关（常驻守护）；要停用 `goharu gateway stop`。安装向导里可选配置 QQ Bot / HaruNet 组网 / 出站代理（都可跳过）。
 
 已克隆仓库则运行 `./install.sh`（Windows 用 `install.bat`），等价进入引导。
 
