@@ -27,8 +27,8 @@ if (-not $py) {
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
     $missing += "Node.js>=20  → winget install OpenJS.NodeJS.LTS"
 } else {
-    $nv = (node --version) -replace '[^0-9].*$','' -replace '^v',''
-    if ([int]$nv -lt 20) { $missing += "Node.js>=20（当前 $(node --version)）  → winget install OpenJS.NodeJS.LTS" }
+    $nv = [int]((((node --version) 2>$null) -replace '^v','') -split '\.')[0]
+    if ($nv -lt 20) { $missing += "Node.js>=20（当前 $(node --version)）  → winget install OpenJS.NodeJS.LTS" }
 }
 
 if ($missing.Count -gt 0) {
