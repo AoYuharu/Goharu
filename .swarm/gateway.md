@@ -114,7 +114,8 @@
 
 - **关注期（拟人化）**：被 @/私聊/主人消息唤醒 → 进入 N 秒关注期（续期），
   期内所有新消息都唤醒；超时无消息回"@才醒"。主人不带 @ 的消息也必须唤醒
-  （唯一主人 = 人类发言天然高优先级）。
+  （唯一主人 = 人类发言天然高优先级）。〔**已修订**：2026-11-23 折中方案3——
+  主人不@的群消息改为短安静期兜底阅读，见下条。〕
 - **回声循环是组网原生风险**：两个 agent 互相看到对方回答 → 互相唤醒 →
   "我不用回复"这句话本身又被广播成新消息。三层刹车：
   ①同事触发的 turn 不自动中继（必须显式用 reply 工具）
@@ -124,3 +125,105 @@
   到达时重置或 turn 中 flush 重置都会把 dedupe 打穿：turn 中到来的同事
   消息触发 flush → 重置 → send_answer 又中继一遍 = 双广播。判据用
   can_auto_read()（=会话空闲），它是注入的、不需要 channel 感知 session 内部。
+
+### 2026-11-23 关注机制折中方案3（主人不@不立即唤醒）
+
+- **最终拍板**：主人不@的群消息**不再立即唤醒全体**（撤销前条"主人恒醒"），
+  改为短安静期兜底——新增 `owner_quiet_seconds`（默认 15，`quiet_seconds` 仍 120），
+  `_maybe_auto_read` 发现未读主人群消息时用 15s 阈值快速合并阅读；
+  @某智能体仍秒回并进关注期。主人的 DM/@ 照旧立即唤醒（CLASS_DM/CLASS_MENTION）。
+- **教训：信任标注必须随阅读路径走，不能只在唤醒路径**——主人消息改走
+  安静期自动阅读后，原来 urgent 合辑里的"（含主人指令，优先执行）"表头
+  会丢，只剩裸 sender。因此 `_consume_group_rows`（分流内联）必须给主人
+  sender 加"（主人）"标记，`_maybe_auto_read` 的表头也要按 `owner_latest`
+  补"（含主人指令，优先执行）"。任何"消息换了一条进上下文的路"都要复查
+  信任/优先级标记是否跟着走。
+- **便利**：`MessageBox.latest_ts_from(senders, class_)` 用于查"最近一条来自
+  指定发送者的未读消息时间戳"——主人快速阅读的判据，避免为看一眼而把消息
+  标已读。
+
+### 2026-11-23 关注期/空闲状态透出观察台
+
+- **链路**：channel `_attentive_until` → client `attentive_provider` →
+  presence_update 加 `attentive` 字段 → hub `Presence.set_state` 落盘 →
+  `/api/presence` → 页面 chips/列表/详情三处展示。
+- **翻转才推**（`_report_presence_if_changed`）：进入关注期在
+  `_on_any_message` 即时推；超时退出挂在 quiet watcher tick 上检测。
+  续期不重复推——bool 没变就 no-op，防刷。心跳（30s）带同字段兜底。
+- **坑：页面 HTML 是模块加载时一次性读入**（`observer.py:30` PAGE 常量），
+  改了 observer_page.html 必须重启 poharu-hub 才生效，不是刷新页面就行。
+- 状态机 `state`（idle/working/maintenance）与 `attentive` 正交：
+  工作中也可能在关注期，两列分开展示。
+
+### 2026-11-23 群体意识：@对象标注 + 主人@别人不当重点
+
+- **事故**：主人@A，B 也回复。根因是 `_flush_urgent` 分区
+  `directed = class != GROUP or is_owner`——主人@别人的群消息被当
+  "你被点名，需处理或回应"重点塞给 B，且 `auto_relay=bool(owners)`
+  把 B 的回答广播回网。修复：directed 只收真正 @我/DM 的消息；
+  主人群消息独立成【主人消息 · 群体动态】区，逐条标注
+  `@的是谁（不是你）`；auto_relay 改为仅 `owner_directed`（@我/DM）为真。
+- **数据底座**：mentions 全链路落库——envelope → messagebox.add(mentions)
+  （新列，带 ALTER 迁移）→ read() 返回；urgent item 带 mentions；
+  presence_state 广播维护 `_peer_names`（id→name），标注显示名字。
+- **提示词纪律**：表头"含主人指令，优先执行"已证明会诱导旁观者行动，
+  一律降级为"含主人消息"；凡"优先执行"类措辞只允许出现在确认@我的场景。
+- **观察台媒体内联**：renderMsg 按扩展名分 img/video/附件三类
+  （IMG_EXTS/VIDEO_EXTS 常量）；`_serve_file` 对媒体用 mimetypes
+  guess_type + Content-Disposition inline（原来统一 octet-stream +
+  attachment，<video> 无法播）。
+
+### 2026-11-23 中控改名链路
+
+- **hub 权威源**：presence 名字以**白名单**为准（`_handshake` 不采用
+  hello 的 name）——`submit_owner_control(rename)` 同步改白名单
+  （`ensure_agent` 复用）+ `Presence.rename` + `_broadcast_presence`，
+  再发 control 消息让目标 agent 自己改端侧身份。agent 重连后
+  `set_online` 读白名单新名，闭环。
+- **端侧持久化**：`_apply_rename` 改 `self.name`/identity/params 并
+  `_persist_profile()`；`_restore_saved_profile` 里 profile 名改为
+  **优先于** config（与 focus/tags 一致）——`self.name or saved` 的
+  写法会让重启后 config 默认值顶掉主人改过的名字。
+- **提示词名字行**：session_manager 的 `_agentnet_turn_extras` 每轮
+  注入"你在组网中的名字是「X」"（走 extra_reminders 便利贴，不动
+  静态前缀，零缓存代价）；改名后下一条消息即生效。
+- **坑：submit_owner_control 不能在事件循环线程内直接调**——内部
+  `run_coroutine_threadsafe(...).result()` 阻塞调用线程，测试里调用
+  线程就是 loop 线程会自锁超时（TimeoutError str 为空串，极难排查）。
+  生产无碍（observer 在 HTTP 线程调用）。测试须
+  `asyncio.to_thread(hub.submit_owner_control, ...)`。
+- **观察台详情页滚动**：`#agentDetail` 容器必须是限高 flex 列
+  （`flex:1; min-height:0; display:flex; flex-direction:column`），
+  否则内层 `.detail` 的 overflow-y 永远不生效，内容被裁切无法下滑。
+- **待答卡片区（Phase 3）**：AskUser/高危确认走 hub 挂起表——agent 发
+  `type_"ask"` 信封（验签）→ `hub.pending_asks` → 观察台轮询
+  `GET /api/requests` → 主人 `POST /api/answer`（强制 token）→
+  `submit_answer` pop 后构造 control 信封（`answer` / `confirm_result`
+  +approved）回送。channel 覆写 `ask_questions`/`confirm_request` 先
+  `_set_ask_pending`（保留网内文本作答兜底）再推观察台，推失败
+  `super()` 退化文本。答案契约严格对齐 `_dispatch_answer`：单问单选=
+  label 字符串；多问/含多选=JSON `{"answers":[{question,answer}]}`。
+- **坑：观察台 2s 轮询抢输入焦点**：`renderPresence` → `showAgent`
+  重建 `detailBody.innerHTML`，手机软键盘刚弹出就被收回。守卫：
+  `document.activeElement` 在详情页内（INPUT）时跳过重建。待答卡片
+  同理——`askCards` 按 request_id 增量挂卡，已存在的不重建。
+- **坑：附件"传不了大文件"三重根因**：observer `read()` 整收 body
+  （内存爆）+ 25MB 硬上限 + client `read_bytes()` 全量进内存 +
+  urlopen timeout=60。改法：双方 1MB 分块流式（client http.client
+  +先扫一遍算 sha 签名；server tempfile 落盘 +边读边哈希 +
+  `FileStore.commit` 同卷 os.replace），上限提到 2GB。签名内容不变
+  （agent_id\nts\nsha256hex），新旧端兼容。
+- **坑（复发）：scp 多文件单目标目录会把全部文件丢进同一目录**——
+  带不同子路径的文件必须分次 scp 或逐文件给完整远端路径；scp 后
+  一律 md5sum 双侧比对 + `mv` 归位检查。
+- **安全策略上观察台**：规则在每台设备自己的 config.yaml（`tools.security`），
+  天然按设备独立。链路：详情页「安全策略」区（数据来自 profile.security
+  快照，channel 启动时上报）→ POST /api/control action=security（清单限
+  100 条×200 字符）→ hub extra 载荷透传 → channel `apply_rules` 运行时
+  生效 + 经 config_proxy  duck-type（有 set/save 才写盘，纯 dict 配置只改
+  运行时）→ `_report_profile` 回推新快照。snapshot/apply_rules 在
+  Tools/security.py，Tools 不 import Checkpoint 的同款解耦思路。
+- **坑：多 AgentNetClient 同身份并发连接**——hub `_online[agent_id]=ws`
+  覆盖式登记不踢旧线，临时客户端（测试/脚本）退出时把仍在用的原连接
+  标离线，原连接不断不重连 → 幽灵离线。修复方向（待做）：注册新连接时
+  主动 close 旧 ws，让旧端 connect_forever 感知断开立即重连。

@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 PAGE = (Path(__file__).with_name("observer_page.html")).read_text(encoding="utf-8")
 
-UPLOAD_MAX_BYTES = 25 * 1024 * 1024
+UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024   # 2GB（流式落盘，不进内存）
 UPLOAD_TS_WINDOW = 300
 
 
@@ -37,14 +37,16 @@ class ObserverServer:
     def __init__(self, message_log, presence, host: str = "0.0.0.0",
                  port: int = 6001, token: str = "",
                  file_store=None, whitelist=None, on_send=None,
-                 on_control=None):
+                 on_control=None, pending_asks=None, on_answer=None):
         self.message_log = message_log
         self.presence = presence
         self.token = token or ""
         self.file_store = file_store
         self.whitelist = whitelist
         self.on_send = on_send  # hub.submit_owner_message(text, mentions, attachments)
-        self.on_control = on_control  # hub.submit_owner_control(target, action)
+        self.on_control = on_control  # hub.submit_owner_control(target, action, name)
+        self.pending_asks = pending_asks  # hub.pending_asks_snapshot() -> list
+        self.on_answer = on_answer  # hub.submit_answer(request_id, answer) -> dict
         self._httpd = ThreadingHTTPServer((host, port), self._make_handler())
         self._thread = None
 
@@ -87,6 +89,10 @@ class ObserverServer:
                         data = {"agents": outer.presence.snapshot()}
                         self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"))
                         return
+                    if url.path == "/api/requests":
+                        data = {"requests": outer.pending_asks() if outer.pending_asks else []}
+                        self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"))
+                        return
                     if url.path == "/api/messages":
                         rows = outer.message_log.recent(
                             limit=int(qs.get("limit", ["100"])[0]),
@@ -111,11 +117,18 @@ class ObserverServer:
                 if p is None:
                     self._send(404, b'{"ok":false,"error":"file not found"}')
                     return
+                import mimetypes
+
+                mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
+                inline = mime.startswith(("image/", "video/", "audio/"))
                 data = p.read_bytes()
                 self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Disposition",
-                                 f"attachment; filename*=UTF-8''{file_id}")
+                self.send_header("Content-Type", mime)
+                if inline:
+                    self.send_header("Content-Disposition", "inline")
+                else:
+                    self.send_header("Content-Disposition",
+                                     f"attachment; filename*=UTF-8''{file_id}")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -126,6 +139,9 @@ class ObserverServer:
                 try:
                     if url.path == "/api/send":
                         self._handle_send(qs)
+                        return
+                    if url.path == "/api/answer":
+                        self._handle_answer(qs)
                         return
                     if url.path == "/api/control":
                         self._handle_control(qs)
@@ -157,13 +173,63 @@ class ObserverServer:
                     return
                 target = str(req.get("target") or "")
                 action = str(req.get("action") or "")
-                if action not in ("clear_context", "clear_memory", "clear_messagebox"):
+                if action not in ("clear_context", "clear_memory", "clear_messagebox",
+                                  "rename", "security"):
                     self._send(400, b'{"ok":false,"error":"unknown action"}')
                     return
-                result = outer.on_control(target, action)
+                name = str(req.get("name") or "").strip() or None
+                if action == "rename" and not name:
+                    self._send(400, b'{"ok":false,"error":"name required for rename"}')
+                    return
+                extra = None
+                if action == "security":
+                    # 规则清单透传（端侧应用 + 写回各自 config.yaml）；allow_confirmation
+                    # 为可选三态开关。校验宽松但限量，防超大载荷。
+                    extra = {}
+                    for key in ("dangerous_commands", "require_confirmation"):
+                        if key in req:
+                            val = req[key]
+                            if (not isinstance(val, list) or len(val) > 100
+                                    or any(not isinstance(x, str) or len(x) > 200
+                                           for x in val)):
+                                self._send(400, b'{"ok":false,"error":"bad rules list"}')
+                                return
+                            extra[key] = val
+                    if "allow_confirmation" in req:
+                        extra["allow_confirmation"] = bool(req["allow_confirmation"])
+                    if not extra:
+                        self._send(400, b'{"ok":false,"error":"no security fields"}')
+                        return
+                result = outer.on_control(target, action, name=name, extra=extra)
                 code = 200 if result.get("ok") else 500
                 self._send(code, json.dumps(result, ensure_ascii=False).encode("utf-8"))
                 logger.info("观察台中控: %s → %s", action, target)
+
+            def _handle_answer(self, qs: dict):
+                """观察台作答：把答案回送给挂起询问的发起智能体（须 token）。"""
+                if outer.on_answer is None:
+                    self._send(503, b'{"ok":false,"error":"answer disabled"}')
+                    return
+                if not outer.token or not self._authed(qs):
+                    self._send(403, b'{"ok":false,"error":"token required for answer"}')
+                    return
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length <= 0 or length > 65536:
+                    self._send(413, b'{"ok":false,"error":"bad size"}')
+                    return
+                try:
+                    req = json.loads(self.rfile.read(length).decode("utf-8"))
+                except ValueError:
+                    self._send(400, b'{"ok":false,"error":"bad json"}')
+                    return
+                request_id = str(req.get("request_id") or "")
+                if not request_id:
+                    self._send(400, b'{"ok":false,"error":"request_id required"}')
+                    return
+                result = outer.on_answer(request_id, req.get("answer"))
+                code = 200 if result.get("ok") else 500
+                self._send(code, json.dumps(result, ensure_ascii=False).encode("utf-8"))
+                logger.info("观察台作答: %s", request_id)
 
             def _handle_send(self, qs: dict):
                 if outer.on_send is None:
@@ -215,17 +281,39 @@ class ObserverServer:
                 if length <= 0 or length > UPLOAD_MAX_BYTES:
                     self._send(413, b'{"ok":false,"error":"bad size"}')
                     return
-                body = self.rfile.read(length)
+                # 流式落盘：1MB 分块读 body 进临时文件，边读边算 sha256——
+                # 2GB 附件也不进内存（旧实现 read() 整收，25MB 上限即因此而来）
                 import hashlib
+                import tempfile
 
-                signed = f"{agent_id}\n{ts_raw}\n{hashlib.sha256(body).hexdigest()}".encode()
+                tmp = tempfile.NamedTemporaryFile(
+                    mode="wb", delete=False, dir=str(outer.file_store.dir),
+                    prefix=".upload_", suffix=".part")
+                sha = hashlib.sha256()
+                remaining = length
+                try:
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise ConnectionError("body truncated")
+                        tmp.write(chunk)
+                        sha.update(chunk)
+                        remaining -= len(chunk)
+                    tmp.close()
+                except Exception:
+                    tmp.close()
+                    Path(tmp.name).unlink(missing_ok=True)
+                    raise
+                signed = f"{agent_id}\n{ts_raw}\n{sha.hexdigest()}".encode()
                 if not Identity.verify(record["pubkey"], signed, sig):
+                    Path(tmp.name).unlink(missing_ok=True)
                     self._send(403, b'{"ok":false,"error":"bad signature"}')
                     return
                 name = unquote(self.headers.get("X-Filename", "") or
                                qs.get("name", ["file"])[0])
-                meta = outer.file_store.save(name, body)
-                logger.info("附件上传: %s ← %s (%d bytes)", meta["id"], agent_id, len(body))
+                meta = outer.file_store.commit(name, Path(tmp.name),
+                                               sha.hexdigest(), length)
+                logger.info("附件上传: %s ← %s (%d bytes)", meta["id"], agent_id, length)
                 self._send(200, json.dumps(meta, ensure_ascii=False).encode("utf-8"))
 
         return Handler

@@ -17,7 +17,6 @@ import logging
 import platform
 import time
 import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -41,6 +40,7 @@ logger = logging.getLogger(__name__)
 OnUrgent = Callable[[dict, str], Any]           # (envelope, class) mention/dm 立即唤醒
 OnEvent = Callable[[str, dict], Any]            # 通用事件（welcome/presence_state/...）
 StateProvider = Callable[[], str]               # 返回 idle|working|maintenance
+AttentiveProvider = Callable[[], bool]          # 返回是否在关注期（观察台展示用）
 
 
 def default_device_profile() -> dict:
@@ -60,6 +60,7 @@ class AgentNetClient:
         url: str,
         messagebox: Optional[MessageBox] = None,
         state_provider: Optional[StateProvider] = None,
+        attentive_provider: Optional[AttentiveProvider] = None,
         on_urgent: Optional[OnUrgent] = None,
         on_message: Optional[OnUrgent] = None,
         on_event: Optional[OnEvent] = None,
@@ -78,6 +79,7 @@ class AgentNetClient:
         prof.setdefault("device", default_device_profile())
         self._profile = prof
         self._state_provider = state_provider or (lambda: "idle")
+        self._attentive_provider = attentive_provider or (lambda: False)
         self._on_urgent = on_urgent
         # on_message：全量消息回调（env, class）——设置了就替代 on_urgent 的分类分发，
         # 由宿主自行决定各类消息的处理（AgentNetChannel 的"关注期"模型靠它实现）
@@ -230,30 +232,67 @@ class AgentNetClient:
         """上传附件到 hub HTTP 端点，返回 {id, name, size, sha256, url}。
 
         鉴权：ed25519 签名头（不占用 WS 通道）。需 http_base 已配置。
+        流式发送：1MB 分块 + 先扫一遍算 sha256，2GB 级文件不占内存。
         """
         if not self.http_base:
             raise RuntimeError("未配置 http_base，无法上传附件")
         p = Path(path).expanduser()
-        data = await asyncio.to_thread(p.read_bytes)
-        sha = hashlib.sha256(data).hexdigest()
+        size = p.stat().st_size
+
+        def _sha256_file() -> str:
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+
+        sha = await asyncio.to_thread(_sha256_file)
         ts = str(int(time.time()))
         signed = f"{self.identity.agent_id}\n{ts}\n{sha}".encode()
-        url = f"{self.http_base}/api/files?name={urllib.parse.quote(p.name)}"
-        req = urllib.request.Request(url, data=data, method="POST", headers={
-            "X-Agent-Id": self.identity.agent_id,
-            "X-Timestamp": ts,
-            "X-Signature": self.identity.sign(signed),
-            "X-Filename": urllib.parse.quote(p.name),
-            "Content-Type": "application/octet-stream",
-        })
+        parsed = urllib.parse.urlparse(self.http_base)
+        target = f"{parsed.path.rstrip('/')}/api/files?name={urllib.parse.quote(p.name)}"
 
         def _do() -> dict:
-            import json
+            import http.client
+            import json as _json
 
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+            conn = http.client.HTTPConnection(
+                parsed.hostname, parsed.port or 80, timeout=180)
+            try:
+                conn.putrequest("POST", target)
+                conn.putheader("X-Agent-Id", self.identity.agent_id)
+                conn.putheader("X-Timestamp", ts)
+                conn.putheader("X-Signature", self.identity.sign(signed))
+                conn.putheader("X-Filename", urllib.parse.quote(p.name))
+                conn.putheader("Content-Type", "application/octet-stream")
+                conn.putheader("Content-Length", str(size))
+                conn.endheaders()
+                with open(p, "rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        conn.send(chunk)
+                resp = conn.getresponse()
+                body = resp.read()
+                if resp.status != 200:
+                    raise RuntimeError(
+                        f"上传失败 HTTP {resp.status}: {body[:200]!r}")
+                return _json.loads(body.decode("utf-8"))
+            finally:
+                conn.close()
 
         return dict(await asyncio.to_thread(_do))
+
+    async def submit_ask(self, request_id: str, kind: str, data: dict,
+                         ttl: int = 400) -> None:
+        """把交互式提问/高危确认登记到 hub 挂起表（观察台渲染按钮作答）。
+
+        fire-and-forget：不等待应答（应答经 control 信封异步回送）。
+        """
+        env = make_envelope(
+            sender=self.identity.agent_id, to="server", type_="ask",
+            payload={"request_id": request_id, "kind": kind, "data": data,
+                     "ttl": int(ttl)})
+        env["sig"] = self.identity.sign(canonical_bytes(env))
+        await self._send(env)
 
     async def query_presence(self, timeout: float = 10) -> dict:
         """查状态机快照：{agent_id: {state, last_seen, name}}。"""
@@ -279,13 +318,23 @@ class AgentNetClient:
             payload={"profile": self._profile}))
 
     # ------------------------------------------------------------- 心跳
+    def _presence_payload(self) -> dict:
+        return {"state": self._state_provider(),
+                "attentive": bool(self._attentive_provider())}
+
+    async def push_presence(self) -> None:
+        """立即上报当前状态（心跳之外的即时推送——关注期进出等状态翻转）。"""
+        await self._send(make_envelope(
+            sender=self.identity.agent_id, to="server", type_="presence_update",
+            payload=self._presence_payload()))
+
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self._heartbeat_seconds)
             try:
                 await self._send(make_envelope(
                     sender=self.identity.agent_id, to="server", type_="presence_update",
-                    payload={"state": self._state_provider()}))
+                    payload=self._presence_payload()))
             except Exception as e:
                 logger.warning("agentnet 心跳失败: %s", e)
                 return

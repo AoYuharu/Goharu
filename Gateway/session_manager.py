@@ -235,6 +235,8 @@ class SessionManager:
                     "tags": config.get("agentnet.tags", []),
                     "owner_ids": list(config.get("agentnet.owner_ids") or []),
                     "quiet_seconds": float(config.get("agentnet.quiet_seconds", 120)),
+                    "owner_quiet_seconds": float(
+                        config.get("agentnet.owner_quiet_seconds", 15)),
                     "group_inline_max_chars": int(
                         config.get("agentnet.group_inline_max_chars", 1500)),
                     "attention_seconds": float(
@@ -255,7 +257,13 @@ class SessionManager:
                     lambda: not any(s._processing for s in self.sessions.values()))
                 ch.set_control_handler(self._agentnet_control)
                 ch.set_summarize_fn(self._agentnet_summarize)
-                session.memory.set_turn_extras_provider(ch.turn_extras)
+                def _agentnet_turn_extras():
+                    # 名字身份行常驻（改名后下一条消息即生效）+ messagebox 摘要
+                    line = (f"你在智能体组网中的名字是「{ch.name}」——主人和同事用"
+                            "这个名字称呼/@你，自我介绍时也用它。")
+                    return [line] + ch.turn_extras()
+
+                session.memory.set_turn_extras_provider(_agentnet_turn_extras)
                 logger.info("agentnet channel ready: %s → %s",
                             ch.identity.agent_id, ch.url)
                 lifecycle("启动: AgentNet channel", f"{ch.identity.agent_id} → {ch.url}")

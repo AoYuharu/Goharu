@@ -32,6 +32,8 @@
     background: var(--panel2); border: 1px solid var(--line); border-radius: 999px;
     padding: 3px 10px; font-size: 12px; color: var(--text); }
   .chip .st { color: var(--dim); font-size: 11px; }
+  .attBadge { color: var(--accent); font-size: 11px; background: rgba(122,162,247,.12);
+    border-radius: 6px; padding: 0 6px; line-height: 17px; flex: 0 0 auto; }
   .dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; display: inline-block; }
   .dot.idle { background: var(--green); } .dot.working { background: var(--yellow);
     animation: pulse 1.2s infinite; } .dot.maintenance { background: var(--orange); }
@@ -63,6 +65,8 @@
   .att { display: inline-flex; gap: 4px; background: var(--panel2); border: 1px solid var(--line);
     border-radius: 8px; padding: 3px 9px; color: var(--accent); font-size: 12px;
     text-decoration: none; }
+  .attMedia { display: block; max-width: 100%; max-height: 320px; border-radius: 10px;
+    border: 1px solid var(--line); background: #000; }
   .empty { text-align: center; color: var(--dim); padding: 56px 0; font-size: 13px; }
 
   #newpill { position: fixed; left: 50%; transform: translateX(-50%);
@@ -105,6 +109,8 @@
   .drawerHead h2 { font-size: 15px; margin: 0; font-weight: 650; }
   .drawerHead .cnt { color: var(--dim); font-size: 12px; margin-left: auto; }
   .agentList, .detail { flex: 1; overflow-y: auto; padding-top: 8px; }
+  /* 详情页容器必须是限高 flex 列，内层 .detail 的 overflow-y 才会生效 */
+  #agentDetail { flex: 1; min-height: 0; display: flex; flex-direction: column; }
   .agentItem { display: flex; align-items: center; gap: 10px; padding: 10px 6px;
     border-radius: 12px; }
   .agentItem:active { background: var(--panel2); }
@@ -132,9 +138,85 @@
   .ctrlHint { color: var(--dim); font-size: 11px; margin-top: 10px; line-height: 1.5; }
   .ctrlBtn.warn { color: var(--red); border-color: rgba(247,118,142,.5); }
   .ctrlBtn:disabled { opacity: .4; }
+  .renameRow { display: flex; gap: 8px; margin-top: 8px; }
+  .renameRow input { flex: 1; min-width: 0; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px;
+    font: inherit; outline: none; }
+  .renameRow input:focus { border-color: var(--accent2); }
+  .renameBtn { flex: 0 0 auto; padding: 0 16px; border: 1px solid var(--line);
+    border-radius: 12px; background: var(--accent); color: #0e1017; font-weight: 700; }
+
+  /* ── 安全策略区 ───────────────────────────────────── */
+  .secGroup { margin-top: 6px; }
+  .secLabel { font-size: 12px; font-weight: 650; margin: 8px 0 4px; display: flex;
+    align-items: center; gap: 6px; }
+  .secLabel .dotR { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+  .dotR.blk { background: var(--red); } .dotR.cnf { background: var(--yellow); }
+  .secChips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .secChip { display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
+    font-family: ui-monospace, Consolas, monospace; background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 3px 4px 3px 8px; }
+  .secChip button { border: 0; background: transparent; color: var(--dim);
+    cursor: pointer; font-size: 13px; padding: 0 4px; line-height: 1; }
+  .secChip button:active { color: var(--red); }
+  .secAdd { display: flex; gap: 6px; margin-top: 6px; }
+  .secAdd input { flex: 1; min-width: 0; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 7px 10px;
+    font: inherit; font-size: 12px; outline: none; }
+  .secAdd input:focus { border-color: var(--accent2); }
+  .secAdd button { flex: 0 0 auto; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--panel2); color: var(--text); padding: 0 12px; font-size: 12px; }
+  .secToggle { display: flex; align-items: center; gap: 8px; margin-top: 10px;
+    font-size: 13px; }
+  .secToggle input { width: 18px; height: 18px; accent-color: var(--accent); }
+  .secSave { width: 100%; margin-top: 10px; padding: 10px 0; border: 0;
+    border-radius: 10px; background: var(--accent); color: #0e1017;
+    font-weight: 700; font: inherit; cursor: pointer; }
+  .secSave:disabled { opacity: .45; }
+  .secHint { color: var(--dim); font-size: 11px; margin-top: 6px; line-height: 1.5; }
+  .secWarn { color: var(--orange); font-size: 11px; margin-top: 6px; line-height: 1.5; }
   .msg.control { background: transparent; border-style: dashed; text-align: center;
     color: var(--dim); font-size: 12px; padding: 5px 10px; }
   .msg.control .who { color: var(--dim); font-weight: 500; }
+
+  /* ── 待答卡片（AskUser / 高危确认）────────────────── */
+  #askDock { position: sticky; top: 0; z-index: 20; }
+  .askCard { background: var(--panel); border: 1px solid var(--accent2);
+    border-radius: var(--radius); padding: 10px 12px; margin-bottom: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,.35); }
+  .askCard.confirm { border-color: rgba(247,118,142,.6); }
+  .askHead { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .askKind { font-size: 11px; font-weight: 700; border-radius: 6px; padding: 1px 8px;
+    color: #0e1017; background: var(--accent); }
+  .askCard.confirm .askKind { background: var(--red); }
+  .askWho { font-weight: 650; color: var(--accent); }
+  .askTtl { margin-left: auto; color: var(--dim); font-size: 11px; }
+  .askQ { font-size: 14px; font-weight: 600; margin: 8px 0 6px; white-space: pre-wrap;
+    word-break: break-word; }
+  .askCmd { font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 6px 8px; margin: 6px 0; white-space: pre-wrap; word-break: break-all;
+    color: var(--orange); }
+  .askDesc { color: var(--dim); font-size: 12px; margin: 4px 0; white-space: pre-wrap; }
+  .optRow { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0; }
+  .optBtn { flex: 1 1 40%; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 8px;
+    font-size: 13px; cursor: pointer; }
+  .optBtn.on { color: var(--accent); border-color: var(--accent2);
+    background: rgba(122,162,247,.12); }
+  .askInput { width: 100%; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 9px 10px;
+    font: inherit; outline: none; margin: 4px 0; }
+  .askInput:focus { border-color: var(--accent2); }
+  .askSubmit { width: 100%; margin-top: 6px; padding: 10px 0; border: 0;
+    border-radius: 10px; background: var(--accent); color: #0e1017;
+    font-weight: 700; font: inherit; cursor: pointer; }
+  .askSubmit:disabled { opacity: .45; }
+  .askSubmit.deny { background: var(--panel2); color: var(--red);
+    border: 1px solid rgba(247,118,142,.5); }
+  .askBtns { display: flex; gap: 10px; margin-top: 8px; }
+  .askBtns .askSubmit { margin-top: 0; }
+  .askHint { color: var(--dim); font-size: 11px; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -150,7 +232,7 @@
   <div class="tab on" data-f="all">全部</div>
   <div class="tab" data-f="mention">@ 提及</div>
 </div>
-<main id="feed"><div class="empty">暂无消息</div></main>
+<main id="feed"><div id="askDock"></div><div class="empty">暂无消息</div></main>
 <div id="newpill">↓ 新消息</div>
 
 <section id="composer">
@@ -177,6 +259,8 @@
 <script>
 const TOKEN = new URLSearchParams(location.search).get('token') || '';
 const q = s => TOKEN ? s + (s.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN) : s;
+const IMG_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'avif', 'svg']);
+const VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'm4v', 'mkv']);
 let lastId = 0, filter = 'all', follow = true, agentsData = {}, mentionSel = new Set();
 const feed = document.getElementById('feed');
 const pill = document.getElementById('newpill');
@@ -221,6 +305,7 @@ function renderPresence(agents) {
     chip.appendChild(el('span', 'dot ' + stateOf(a)));
     chip.appendChild(el('span', '', a.name || id));
     chip.appendChild(el('span', 'st', STATE_ZH[stateOf(a)] || ''));
+    if (a.online && a.attentive) chip.appendChild(el('span', 'attBadge', '👁 关注中'));
     box.appendChild(chip);
   }
   document.getElementById('sub').textContent = online + '/' + ids.length + ' 在线';
@@ -228,7 +313,14 @@ function renderPresence(agents) {
   renderMentionRow(ids);
   if (drawer.classList.contains('on')) {
     if (document.getElementById('agentDetail').style.display === 'none') renderAgentList();
-    else { const id = document.getElementById('detailBody').dataset.aid; if (id) showAgent(id); }
+    else {
+      const id = document.getElementById('detailBody').dataset.aid;
+      // 详情页内有输入焦点（如改名框）时不重建 innerHTML——重建会抢焦点，
+      // 手机上表现为软键盘刚弹出就被收回（2s 轮询必现）
+      const ae = document.activeElement;
+      if (id && !(ae && ae.tagName === 'INPUT' &&
+                  document.getElementById('detailBody').contains(ae))) showAgent(id);
+    }
   }
 }
 
@@ -291,8 +383,23 @@ function renderMsg(m) {
   if ((m.attachments || []).length) {
     const atts = el('div', 'atts');
     for (const a of m.attachments) {
+      const ext = ((a.name || '').split('.').pop() || '').toLowerCase();
+      const src = q(a.url || '');
+      if (IMG_EXTS.has(ext)) {
+        const img = document.createElement('img');
+        img.src = src; img.alt = a.name || 'image'; img.loading = 'lazy';
+        img.className = 'attMedia';
+        atts.appendChild(img);
+        continue;
+      }
+      if (VIDEO_EXTS.has(ext)) {
+        const v = document.createElement('video');
+        v.src = src; v.controls = true; v.className = 'attMedia';
+        atts.appendChild(v);
+        continue;
+      }
       const link = document.createElement('a');
-      link.href = q(a.url || '');
+      link.href = src;
       link.textContent = '📎 ' + (a.name || 'file') + ' (' + fmtSize(a.size) + ')';
       link.target = '_blank';
       link.rel = 'noopener';
@@ -397,6 +504,7 @@ function renderAgentList() {
     const n = el('div', 'n');
     n.appendChild(el('span', 'dot ' + stateOf(a)));
     n.appendChild(el('span', '', a.name || id));
+    if (a.online && a.attentive) n.appendChild(el('span', 'attBadge', '👁 关注中'));
     info.appendChild(n);
     const focus = a.profile && a.profile.focus ? ' · ' + a.profile.focus : '';
     info.appendChild(el('div', 's', agentSub(a) + focus));
@@ -419,6 +527,9 @@ function showAgent(id) {
   body.appendChild(big);
   body.appendChild(el('div', 'section', '状态'));
   body.appendChild(kv('当前', STATE_ZH[stateOf(a)]));
+  body.appendChild(kv('关注期', (a.online && a.attentive)
+    ? '👁 关注中（被@后实时接收群消息）'
+    : '未关注（仅 @我 / 私聊才唤醒，群消息安静期合并阅读）'));
   if (a.online && a.online_since)
     body.appendChild(kv('已在线时长', fmtDur(Date.now() - new Date(a.online_since).getTime())));
   else body.appendChild(kv('上次在线', fmtTs(a.last_seen)));
@@ -433,6 +544,21 @@ function showAgent(id) {
   body.appendChild(kv('Python', dev.python || '—'));
   body.appendChild(el('div', 'section', '身份'));
   body.appendChild(kv('agent_id', id));
+  // 改名：立即全网生效（白名单 + 各端身份 + 提示词名字行）
+  const rn = el('div', 'renameRow');
+  const rnInput = document.createElement('input');
+  rnInput.value = a.name || '';
+  rnInput.maxLength = 32;
+  rnInput.placeholder = '新的智能体名字';
+  const rnBtn = el('button', 'renameBtn', '改名');
+  rnBtn.onclick = () => sendRename(id, rnInput.value, rnBtn);
+  rnInput.onkeydown = e => { if (e.key === 'Enter') rnBtn.onclick(); };
+  rn.appendChild(rnInput);
+  rn.appendChild(rnBtn);
+  body.appendChild(rn);
+  // 安全策略：硬黑名单/需确认两清单查看与编辑（数据来自 profile 快照，
+  // 中控保存后agent写回自己设备的 config.yaml 并即时生效）
+  body.appendChild(buildSecuritySection(id, p.security));
   // 中控区固定在详情页最下方：滑到底即可操作
   const ctrl = el('div', 'ctrlSection');
   ctrl.appendChild(el('div', 'section', '⚙ 中控操作（管理员）'));
@@ -450,6 +576,134 @@ function showAgent(id) {
   ctrl.appendChild(el('div', 'ctrlHint',
     '以上操作直接作用于该智能体，不可撤销。目标离线时会自动排队，上线后执行。'));
   body.appendChild(ctrl);
+}
+
+function buildSecuritySection(agentId, sec) {
+  const wrap = el('div', 'ctrlSection');
+  wrap.appendChild(el('div', 'section', '🛡 安全策略（危险命令黑白名单）'));
+  if (!sec) {
+    wrap.appendChild(el('div', 'secHint',
+      '该智能体未上报安全规则（旧版本 agent，升级上线后此处可查看与编辑）。'));
+    return wrap;
+  }
+  const lists = {
+    dangerous_commands: {label: '硬黑名单（直接拒绝，无确认机会）', cls: 'blk'},
+    require_confirmation: {label: '需确认（弹批准框，你点允许才执行）', cls: 'cnf'},
+  };
+  for (const [key, meta] of Object.entries(lists)) {
+    const g = el('div', 'secGroup');
+    const lab = el('div', 'secLabel');
+    lab.appendChild(el('span', 'dotR ' + meta.cls));
+    lab.appendChild(document.createTextNode(meta.label));
+    g.appendChild(lab);
+    const chips = el('div', 'secChips');
+    chips.dataset.secKey = key;
+    for (const pat of (sec[key] || [])) chips.appendChild(makeSecChip(pat));
+    g.appendChild(chips);
+    const add = el('div', 'secAdd');
+    const inp = document.createElement('input');
+    inp.placeholder = '新增匹配规则（如 sudo / rm -rf / regex:^mkfs）';
+    inp.maxLength = 200;
+    const btn = el('button', '', '添加');
+    const commit = () => {
+      const v = inp.value.trim();
+      if (!v) return;
+      const exist = [...chips.querySelectorAll('.secChip span')]
+        .map(s => s.textContent);
+      if (!exist.includes(v)) chips.appendChild(makeSecChip(v));
+      inp.value = '';
+    };
+    btn.onclick = commit;
+    inp.onkeydown = e => { if (e.key === 'Enter') commit(); };
+    add.appendChild(inp);
+    add.appendChild(btn);
+    g.appendChild(add);
+    wrap.appendChild(g);
+  }
+  const tg = el('label', 'secToggle');
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = sec.allow_confirmation !== false;
+  cb.id = 'secAllowCnf';
+  tg.appendChild(cb);
+  tg.appendChild(document.createTextNode('启用「需确认」弹窗（关闭则需确认命令也按拒绝处理）'));
+  wrap.appendChild(tg);
+  const save = el('button', 'secSave', '保存安全策略');
+  save.onclick = () => sendSecurity(agentId, save);
+  wrap.appendChild(save);
+  wrap.appendChild(el('div', 'secHint',
+    '保存后即时生效，并写回该智能体设备的 config.yaml（重启不丢）。'
+    + '匹配语法：整词 / 多词包含 / regex: 前缀正则。'));
+  wrap.appendChild(el('div', 'secWarn',
+    '⚠ 从硬黑名单移除高危命令（如 rm -rf、format）意味着 agent 可无确认执行，请谨慎。'));
+  return wrap;
+}
+
+function makeSecChip(pat) {
+  const chip = el('span', 'secChip');
+  chip.appendChild(el('span', '', pat));
+  const x = el('button', '', '✕');
+  x.onclick = () => chip.remove();
+  chip.appendChild(x);
+  return chip;
+}
+
+async function sendSecurity(agentId, btn) {
+  const collect = key => [...document.querySelectorAll(
+    `.secChips[data-sec-key="${key}"] .secChip span`)]
+    .map(s => s.textContent).filter(Boolean);
+  const payload = {
+    target: agentId, action: 'security',
+    dangerous_commands: collect('dangerous_commands'),
+    require_confirmation: collect('require_confirmation'),
+    allow_confirmation: document.getElementById('secAllowCnf').checked,
+  };
+  if (!confirm('确定保存安全策略？即时生效并写回该设备 config.yaml。')) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Token': TOKEN },
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) {
+      alert(`已保存${j.queued ? '（目标离线，已排队）' : ''}`);
+      poll();
+    } else {
+      alert('保存失败: ' + (j.error || r.status));
+    }
+  } catch (e) {
+    alert('网络错误: ' + e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function sendRename(agentId, newName, btn) {
+  newName = (newName || '').trim();
+  const oldName = (agentsData[agentId] || {}).name || agentId;
+  if (!newName) { alert('名字不能为空'); return; }
+  if (newName === oldName) { alert('名字未变化'); return; }
+  if (!confirm(`确定把 ${oldName} 改名为「${newName}」？全网立即生效。`)) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Token': TOKEN },
+      body: JSON.stringify({ target: agentId, action: 'rename', name: newName }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) {
+      alert(`已改名（目标${j.queued ? '离线，已排队' : '已通知'}）`);
+    } else {
+      alert('改名失败: ' + (j.error || r.status));
+    }
+  } catch (e) {
+    alert('改名请求失败: ' + e);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function sendControl(agentId, action, label, btn) {
@@ -485,6 +739,152 @@ document.getElementById('menuBtn').onclick = openDrawer;
 mask.onclick = closeDrawer;
 document.getElementById('backBtn').onclick = showList;
 
+/* ── 待答卡片：AskUser 问题 / 高危命令确认 ─────────── */
+const askCards = {};   // request_id → card 元素（已存在则保留，避免抢输入焦点）
+
+function renderAsks(requests) {
+  const dock = document.getElementById('askDock');
+  const seen = new Set();
+  for (const r of requests || []) {
+    const rid = r.request_id;
+    if (!rid) continue;
+    seen.add(rid);
+    if (askCards[rid]) continue;
+    const card = r.kind === 'confirm' ? buildConfirmCard(r) : buildQuestionCard(r);
+    askCards[rid] = card;
+    dock.appendChild(card);
+  }
+  for (const rid of Object.keys(askCards)) {
+    if (!seen.has(rid)) { askCards[rid].remove(); delete askCards[rid]; }
+  }
+}
+
+async function submitAnswer(rid, answer, card) {
+  card.querySelectorAll('button').forEach(b => b.disabled = true);
+  try {
+    const r = await fetch(q('/api/answer'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Token': TOKEN },
+      body: JSON.stringify({ request_id: rid, answer }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) {
+      if (askCards[rid]) { askCards[rid].remove(); delete askCards[rid]; }
+    } else {
+      alert('提交失败: ' + (j.error || r.status));
+      card.querySelectorAll('button').forEach(b => b.disabled = false);
+    }
+  } catch (e) {
+    alert('网络错误: ' + e);
+    card.querySelectorAll('button').forEach(b => b.disabled = false);
+  }
+}
+
+function askHead(r, kindLabel) {
+  const head = el('div', 'askHead');
+  head.appendChild(el('span', 'askKind', kindLabel));
+  head.appendChild(el('span', 'askWho', r.agent_name || r.agent_id || '?'));
+  if (r.expires_in != null)
+    head.appendChild(el('span', 'askTtl', Math.max(0, Math.round(r.expires_in)) + 's'));
+  return head;
+}
+
+function buildConfirmCard(r) {
+  const d = r.data || {};
+  const card = el('div', 'askCard confirm');
+  card.appendChild(askHead(r, '高危命令'));
+  card.appendChild(el('div', 'askQ', '该智能体请求执行高危命令，是否批准？'));
+  if (d.cmd) card.appendChild(el('div', 'askCmd', d.cmd));
+  if (d.description) card.appendChild(el('div', 'askDesc', d.description));
+  const btns = el('div', 'askBtns');
+  const ok = el('button', 'askSubmit', '✔ 允许执行');
+  ok.onclick = () => submitAnswer(r.request_id, true, card);
+  const no = el('button', 'askSubmit deny', '✘ 拒绝');
+  no.onclick = () => submitAnswer(r.request_id, false, card);
+  btns.appendChild(ok); btns.appendChild(no);
+  card.appendChild(btns);
+  return card;
+}
+
+function buildQuestionCard(r) {
+  const qs = (r.data && r.data.questions) || [];
+  const batch = qs.length > 1 || qs.some(x => x.multi_select);
+  const card = el('div', 'askCard');
+  card.appendChild(askHead(r, '提问'));
+  // 单问单选：点选项即答；其余（多选/文本/批量）本地收集后统一提交
+  if (qs.length === 1 && !qs[0].multi_select && (qs[0].options || []).length) {
+    card.appendChild(el('div', 'askQ', qs[0].question));
+    const row = el('div', 'optRow');
+    for (const o of qs[0].options) {
+      const label = (o && typeof o === 'object') ? (o.label || '') : String(o);
+      if (!label) continue;
+      const b = el('button', 'optBtn', label);
+      b.onclick = () => submitAnswer(r.request_id, label, card);
+      row.appendChild(b);
+    }
+    card.appendChild(row);
+    return card;
+  }
+  const answers = new Array(qs.length).fill(null);
+  qs.forEach((qq, i) => {
+    card.appendChild(el('div', 'askQ', (qs.length > 1 ? (i + 1) + '. ' : '') + qq.question));
+    const labels = (qq.options || []).map(o =>
+      (o && typeof o === 'object') ? (o.label || '') : String(o)).filter(Boolean);
+    if (qq.multi_select) {
+      const row = el('div', 'optRow');
+      answers[i] = [];
+      labels.forEach(lb => {
+        const b = el('button', 'optBtn', lb);
+        b.onclick = () => {
+          const arr = answers[i];
+          const at = arr.indexOf(lb);
+          at >= 0 ? arr.splice(at, 1) : arr.push(lb);
+          b.classList.toggle('on');
+        };
+        row.appendChild(b);
+      });
+      card.appendChild(row);
+    } else if (labels.length) {
+      const row = el('div', 'optRow');
+      labels.forEach(lb => {
+        const b = el('button', 'optBtn', lb);
+        b.onclick = () => {
+          answers[i] = lb;
+          row.querySelectorAll('.optBtn').forEach(x => x.classList.remove('on'));
+          b.classList.add('on');
+        };
+        row.appendChild(b);
+      });
+      card.appendChild(row);
+    } else {
+      const inp = document.createElement('input');
+      inp.className = 'askInput';
+      inp.placeholder = '输入回答…';
+      inp.oninput = () => { answers[i] = inp.value; };
+      card.appendChild(inp);
+    }
+  });
+  const sub = el('button', 'askSubmit', '提交回答');
+  sub.onclick = () => {
+    for (let i = 0; i < qs.length; i++) {
+      const a = answers[i];
+      const empty = a == null || a === '' || (Array.isArray(a) && !a.length);
+      if (empty) { alert('还有问题未作答'); return; }
+    }
+    if (batch) {
+      submitAnswer(r.request_id, JSON.stringify({
+        answers: qs.map((qq, i) => ({ question: qq.question || '', answer: answers[i] })),
+      }), card);
+    } else {
+      submitAnswer(r.request_id, answers[0], card);
+    }
+  };
+  card.appendChild(sub);
+  card.appendChild(el('div', 'askHint',
+    batch ? '多选可点多个选项，答完所有题后点「提交回答」' : '作答后点「提交回答」'));
+  return card;
+}
+
 /* ── 轮询 ─────────────────────────────────────────── */
 async function poll() {
   try {
@@ -496,6 +896,8 @@ async function poll() {
     append(ms);
     const pr = await fetch(q('/api/presence'));
     if (pr.ok) renderPresence((await pr.json()).agents || {});
+    const ar = await fetch(q('/api/requests'));
+    if (ar.ok) renderAsks((await ar.json()).requests || []);
   } catch (err) {
     document.getElementById('sub').textContent = '连接断开，重试中…';
   }

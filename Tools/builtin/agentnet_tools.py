@@ -136,7 +136,9 @@ async def serverMessageHandler(
                 return _json({"ok": False, "error": "agentnet 未连接"})
             # async handler 跑在宿主事件循环上——必须 wrap_future 等待，
             # 阻塞式 .result() 会冻住循环（含同进程的 hub）
-            msg_id = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=10)
+            # 带附件时上传是流式 POST，公网链路大文件要几分钟，10s 必超时
+            reply_timeout = 1800 if file_paths else 10
+            msg_id = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=reply_timeout)
             return _json({"ok": True, "msg_id": msg_id})
         if action == "presence":
             fut = h.net_presence_fut()

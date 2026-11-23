@@ -9,6 +9,7 @@ hub 回环（握手白名单/dm/group/mention 分类/离线 mailbox/状态机/�
 import asyncio
 import base64
 import json
+import os
 import shutil
 import socket
 import sys
@@ -117,6 +118,32 @@ def main():
         # ------------------------------------------------- 7. 观察台指令
         print("\n[7] 观察台输入框（owner 身份广播）")
         asyncio.run(send_test(root))
+
+        # ------------------------------------------------- 8. 待答卡片区
+        print("\n[8] AskUser/高危确认观察台链路")
+        asyncio.run(ask_test(root))
+
+        # ------------------------------------------------- 9. 大附件流式上传
+        print("\n[9] >25MB 附件流式上传（2GB 上限）")
+        asyncio.run(big_upload_test(root))
+
+        # ------------------------------------------------- 10. 页面静态标记
+        print("\n[10] 观察台页面 Phase3 标记")
+        page = (Path(__file__).resolve().parent.parent
+                / "AgentNet" / "server" / "observer_page.html").read_text(encoding="utf-8")
+        check("页面含待答卡片区", "askDock" in page and "/api/requests" in page)
+        check("页面含确认卡片", "confirm_result" in page or "高危命令" in page)
+        check("页面含键盘焦点守卫", "activeElement" in page)
+        check("页面含安全策略区", "buildSecuritySection" in page
+              and "action: 'security'" in page)
+
+        # ------------------------------------------- 11. 安全规则中控链路
+        print("\n[11] 安全策略观察台链路")
+        asyncio.run(security_control_test(root))
+
+        # ------------------------------------------------- 12. security 单测
+        print("\n[12] CommandSecurityChecker.apply_rules")
+        security_unit_test()
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -404,6 +431,33 @@ async def channel_test(root: Path):
         ch.box.add("ctl1", "group", "grp:town", "agt_a", "x")
         ch._on_control({"from": id_x.agent_id, "payload": {"action": "clear_messagebox"}})
         check("中控清空收件箱", ch.box.unread_count() == 0)
+
+        # 改名：owner control rename → 端侧身份即时更新 + 落盘
+        ch._on_control({"from": id_x.agent_id,
+                        "payload": {"action": "rename", "name": "goharu-pc"}})
+        check("中控改名端侧生效", ch.name == "goharu-pc"
+              and ch.identity.name == "goharu-pc", ch.name)
+        prof = json.loads((root / "ch_goharu" / "profile.json")
+                          .read_text(encoding="utf-8"))
+        check("改名落盘", prof.get("name") == "goharu-pc", str(prof))
+        ch.name = "goharu"            # 模拟重启后 config 默认值装配
+        ch._restore_saved_profile()   # profile.json 的自更新名字必须赢过 config
+        check("重启后 profile 名优先于 config", ch.name == "goharu-pc", ch.name)
+
+        # hub 侧权威改名（观察台 /api/control 走的就是这条路）：
+        # 白名单 + presence 立即生效并广播，各端 _peer_names 随之更新
+        # 注意：submit_owner_control 内部 run_coroutine_threadsafe(...).result()
+        # 会阻塞调用线程——测试的调用线程就是事件循环线程，必须放线程里跑
+        res = await asyncio.to_thread(hub.submit_owner_control, id_g.agent_id,
+                                      "rename", "goharu-final")
+        wl_name = (hub.whitelist.agent(id_g.agent_id) or {}).get("name")
+        pv_name = (hub.presence.snapshot().get(id_g.agent_id) or {}).get("name")
+        check("hub 改名白名单生效", bool(res.get("ok")) and wl_name == "goharu-final",
+              f"{res} wl={wl_name}")
+        check("hub 改名 presence 生效", pv_name == "goharu-final", str(pv_name))
+        ok = await wait(lambda: ch._peer_names.get(id_g.agent_id) == "goharu-final",
+                        label="peer name broadcast")
+        check("改名广播刷新 peer names", ok, str(ch._peer_names))
         ch.owner_ids = set()
 
         # 安静期自动合并阅读：无@群消息攒到安静窗口 → 合并成一条进上下文
@@ -433,6 +487,7 @@ async def channel_test(root: Path):
                         timeout=8, label="summary msg")
         check("大体量群消息压缩摘要", ok, str([m.text[:60] for m in inbound][-2:]))
         check("摘要含阅读提示", any("不重要且不相关" in m.text for m in inbound))
+        ch._group_inline_max_chars = 1500
 
         # update_profile：工具更新档案 → 落盘 + hub presence 即时生效
         up = json.loads(await agentnet_tools.serverMessageHandler(
@@ -461,7 +516,8 @@ async def channel_test(root: Path):
         await client_x.send_message("grp:town", "@全员 集合", kind="group",
                                     mentions=["*"])
         ok = await wait(lambda: len(inbound) > before, label="mention-all")
-        check("@全员唤醒", ok and "全员 集合" in inbound[-1].text,
+        check("@全员唤醒", ok and "全员 集合" in inbound[-1].text
+              and "⚡重点" in inbound[-1].text,
               inbound[-1].text[:100] if ok else "")
 
         # 关注期内：无@群消息也实时唤醒
@@ -469,17 +525,90 @@ async def channel_test(root: Path):
         await client_x.send_message("grp:town", "期内闲聊B", kind="group")
         ok = await wait(lambda: len(inbound) > mid, label="attentive chat")
         check("关注期内群消息实时唤醒", ok and "期内闲聊B" in inbound[-1].text
-              and "关注期内实时" in inbound[-1].text,
+              and "关注期内顺带接收" in inbound[-1].text,
               inbound[-1].text[:120] if ok else "")
 
-        # 主人消息（不带@）也唤醒
+        # 主人消息（不带@）折中方案3：不立即唤醒，但短安静期快速兜底阅读
         ch.owner_ids = {id_x.agent_id}
-        ch._attentive_until = 0  # 清关注期，验证主人消息本身的唤醒力
+        ch._attentive_until = 0  # 清关注期，验证主人消息本身不再立即唤醒
+        ch.owner_quiet_seconds = 0.5
+        ch.quiet_seconds = 60  # 普通安静期拉长，确保触发靠的是 owner_quiet_seconds
         mid = len(inbound)
         await client_x.send_message("grp:town", "主人随便说一句", kind="group")
-        ok = await wait(lambda: len(inbound) > mid, label="owner wake")
-        check("主人消息无@也唤醒", ok and "主人随便说一句" in inbound[-1].text)
+        await asyncio.sleep(0.3)  # 未到短安静期：仍静默入盒
+        check("主人消息无@不立即唤醒", len(inbound) == mid,
+              f"inbound_delta={len(inbound) - mid}")
+        check("主人消息已入盒", ch.box.unread_count(class_="group") >= 1)
+        await asyncio.sleep(0.4)  # 超过 owner_quiet_seconds
+        ch._maybe_auto_read()
+        check("主人消息短安静期快速阅读", len(inbound) > mid
+              and "主人随便说一句" in inbound[-1].text
+              and "（主人）" in inbound[-1].text
+              and "含主人消息" in inbound[-1].text,
+              inbound[-1].text[:200] if len(inbound) > mid else "")
         ch.owner_ids = set()
+        ch.owner_quiet_seconds = 15
+        ch.quiet_seconds = 0.5
+
+        # ── 群体意识：主人@别的智能体 → 旁观标注 + 不自动中继 ──────────
+        ch.owner_ids = {id_x.agent_id}
+        ch._peer_names[id_x.agent_id] = "haru-box"
+        ch.attention_seconds = 60
+        ch._attentive_until = time.time() + 60   # 关注期内，主人群消息会实时进来
+        mid = len(inbound)
+        await client_x.send_message("grp:town", "haru-box 看一下这个问题", kind="group",
+                                    mentions=[id_x.agent_id])
+        ok = await wait(lambda: len(inbound) > mid, label="owner@other")
+        check("主人@别人 → 群体动态分区", ok
+              and "主人消息 · 群体动态" in inbound[-1].text
+              and "⚡重点" not in inbound[-1].text,
+              inbound[-1].text[:200] if ok else "")
+        check("主人@别人 → 标注@对象", ok
+              and "specifically sent for @haru-box, Not For You" in inbound[-1].text
+              and "helpful or necessary to participate" in inbound[-1].text,
+              inbound[-1].text[:250] if ok else "")
+        mid_recv = len(received_x)
+        ch.send_answer("我旁观的结论")
+        await asyncio.sleep(0.5)
+        check("主人@别人 → 旁观回答不自动中继", len(received_x) == mid_recv,
+              f"received={len(received_x)}")
+
+        # 同事群消息也带@对象标注
+        mid = len(inbound)
+        await client_x.send_message("grp:town", "补充一点背景", kind="group",
+                                    mentions=[id_x.agent_id])
+        ok = await wait(lambda: len(inbound) > mid, label="peer@other")
+        check("同事@别人 → 群消息标注", ok
+              and "specifically sent for @haru-box, Not For You" in inbound[-1].text,
+              inbound[-1].text[:250] if ok else "")
+
+        # ── 三态 reminder 全覆盖：@我 → 必须回复；无@ → 广播择优参与 ──────
+        mid = len(inbound)
+        await client_x.send_message("grp:town", "goharu 汇报一下进度", kind="group",
+                                    mentions=[ch.identity.agent_id])
+        ok = await wait(lambda: len(inbound) > mid, label="owner@me")
+        check("主人@我 → reply reminder", ok
+              and "specifically sent for you, you need to reply it"
+              in inbound[-1].text,
+              inbound[-1].text[:250] if ok else "")
+        mid = len(inbound)
+        await client_x.send_message("grp:town", "大家今晚例行同步一下", kind="group")
+        ok = await wait(lambda: len(inbound) > mid, label="owner broadcast")
+        check("主人无@ → 广播 reminder", ok
+              and "broadcast message sent from user" in inbound[-1].text
+              and "helpful or necessary to reply" in inbound[-1].text,
+              inbound[-1].text[:250] if ok else "")
+
+        # mentions 落盒可读（安静期自动阅读路径用）
+        ch.box.add("m_note1", "group", "grp:town", id_x.agent_id, "落盒标注",
+                   mentions=[id_x.agent_id])
+        row_note = [r for r in ch.box.read(since_ts="2000-01-01", mark_read=False)
+                    if r.get("msg_id") == "m_note1"]
+        check("mentions 入盒可读", bool(row_note)
+              and row_note[0].get("mentions") == [id_x.agent_id],
+              str(row_note)[:120])
+        ch.owner_ids = set()
+        ch._attentive_until = 0
 
         # 关注期过期后回到静默
         ch._attentive_until = 0
@@ -514,6 +643,18 @@ async def channel_test(root: Path):
         await asyncio.sleep(1.6)
         check("乒乓刹车生效", ok1 and len(inbound) == mid2,
               f"woke_first={ok1} delta={len(inbound) - mid2}")
+
+        # 关注期状态上报观察台：进入/退出翻转即推 presence（hub 存 attentive 字段）
+        ch._attentive_until = time.time() + 60
+        ch._report_presence_if_changed()
+        ok = await wait(lambda: hub.presence.snapshot()[id_g.agent_id].get("attentive")
+                        is True, label="attentive on")
+        check("关注期进入上报观察台", ok, str(hub.presence.snapshot()[id_g.agent_id]))
+        ch._attentive_until = 0
+        ch._report_presence_if_changed()
+        ok = await wait(lambda: hub.presence.snapshot()[id_g.agent_id].get("attentive")
+                        is False, label="attentive off")
+        check("关注期退出上报观察台", ok, str(hub.presence.snapshot()[id_g.agent_id]))
     finally:
         agentnet_tools.set_agentnet_handle(None)
         ch.stop()
@@ -693,6 +834,29 @@ async def send_test(root: Path):
         ms = await asyncio.to_thread(get_msgs)
         owners = [m for m in ms.get("messages", []) if m.get("sender_name") == "haru"]
         check("观察台流水展示 owner 消息", bool(owners), str(ms)[:200])
+
+        # 关注期状态透出：/api/presence 带 attentive 字段，客户端推送后可见
+        def get_presence():
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{oport}/api/presence?token=testtok",
+                    timeout=5) as r:
+                return json.loads(r.read().decode("utf-8"))
+
+        pr = await asyncio.to_thread(get_presence)
+        agent_p = pr.get("agents", {}).get(a.agent_id, {})
+        check("presence 含关注期字段", "attentive" in agent_p
+              and agent_p.get("attentive") is False, str(agent_p)[:160])
+        ca._attentive_provider = lambda: True
+        await ca.push_presence()
+        att = None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            pr = await asyncio.to_thread(get_presence)
+            att = pr.get("agents", {}).get(a.agent_id, {}).get("attentive")
+            if att is True:
+                break
+            await asyncio.sleep(0.05)
+        check("观察台 API 透出关注中", att is True, str(att))
     finally:
         await ca.close()
         ta.cancel()
@@ -702,6 +866,331 @@ async def send_test(root: Path):
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+
+
+async def ask_test(root: Path):
+    """AskUser/高危确认全链路：客户端 submit_ask → hub 挂起表 →
+    观察台 GET /api/requests 轮询 → POST /api/answer → control 信封回送端侧。"""
+    import urllib.error
+    import urllib.request
+
+    from AgentNet.client import AgentNetClient
+    from AgentNet.server.hub import HubServer
+    from AgentNet.server.observer import ObserverServer
+
+    port, oport = free_port(), free_port()
+    a = Identity.load_or_create(root / "ask_a", name="alpha")
+    wl_path = root / "wl_ask.json"
+    wl_path.write_text(json.dumps({
+        "agents": {a.agent_id: {"name": "alpha", "pubkey": a.pubkey_b64}},
+        "groups": {}}), encoding="utf-8")
+    hub = HubServer("127.0.0.1", port, wl_path, root / "hub_state_ask")
+    obs = ObserverServer(hub.message_log, hub.presence, host="127.0.0.1", port=oport,
+                         token="asktok", file_store=hub.files, whitelist=hub.whitelist,
+                         pending_asks=hub.pending_asks_snapshot, on_answer=hub.submit_answer)
+    obs.start()
+    serve_task = asyncio.create_task(hub.serve())
+    await asyncio.sleep(0.3)
+
+    controls = []
+    ca = AgentNetClient(a, f"ws://127.0.0.1:{port}", heartbeat_seconds=3600,
+                        on_control=lambda e: controls.append(e))
+    ta = asyncio.create_task(ca.connect_forever())
+
+    def get_requests():
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{oport}/api/requests?token=asktok", timeout=5) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def post_answer(payload: dict, token: str = "asktok"):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{oport}/api/answer",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Token": token})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read().decode("utf-8"))
+            except Exception:
+                return e.code, {}
+
+    try:
+        check("ask 端上线", await wait_conn(ca), str(ca.connected))
+
+        # 提问登记 → 观察台可见
+        await ca.submit_ask("q-1", "question",
+                            {"questions": [{"question": "选哪个？",
+                                            "options": ["甲", "乙"], "multi_select": False}]})
+        rows = None
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            rows = (await asyncio.to_thread(get_requests)).get("requests", [])
+            if rows:
+                break
+            await asyncio.sleep(0.05)
+        check("提问入挂起表", bool(rows), str(rows))
+        if rows:
+            check("挂起表带智能体名", rows[0].get("agent_name") == "alpha", str(rows[0]))
+            check("挂起表带过期倒计时", rows[0].get("expires_in") is not None, str(rows[0]))
+
+        # 无 token 作答被拒
+        status, _ = await asyncio.to_thread(post_answer, {"request_id": "q-1", "answer": "甲"}, "")
+        check("无 token 作答被拒", status == 403, str(status))
+
+        # 作答 → control 回送
+        status, j = await asyncio.to_thread(post_answer, {"request_id": "q-1", "answer": "甲"})
+        check("作答提交成功", status == 200 and j.get("ok"), f"{status} {j}")
+        deadline = time.time() + 8
+        while time.time() < deadline and not controls:
+            await asyncio.sleep(0.05)
+        check("答案 control 回送", bool(controls), str(controls))
+        if controls:
+            check("answer 动作载荷", controls[-1]["payload"].get("action") == "answer"
+                  and controls[-1]["payload"].get("answer") == "甲"
+                  and controls[-1]["payload"].get("request_id") == "q-1",
+                  str(controls[-1]["payload"]))
+        check("作答后挂起表清空",
+              not (await asyncio.to_thread(get_requests)).get("requests"), "")
+
+        # 高危确认：answer=true → confirm_result approved
+        controls.clear()
+        await ca.submit_ask("c-1", "confirm",
+                            {"confirm_id": "c-1", "cmd": "rm -rf /tmp/x",
+                             "description": "测试命令", "timeout": 300})
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            rows = (await asyncio.to_thread(get_requests)).get("requests", [])
+            if rows:
+                break
+            await asyncio.sleep(0.05)
+        check("确认入挂起表", bool(rows) and rows[0].get("kind") == "confirm", str(rows))
+        status, j = await asyncio.to_thread(post_answer, {"request_id": "c-1", "answer": True})
+        check("确认作答成功", status == 200 and j.get("ok"), f"{status} {j}")
+        deadline = time.time() + 8
+        while time.time() < deadline and not controls:
+            await asyncio.sleep(0.05)
+        check("confirm_result 回送", bool(controls)
+              and controls[-1]["payload"].get("action") == "confirm_result"
+              and controls[-1]["payload"].get("approved") is True
+              and controls[-1]["payload"].get("confirm_id") == "c-1",
+              str(controls[-1]["payload"] if controls else ""))
+
+        # 未登记 request_id 作答 → 报错不炸
+        status, j = await asyncio.to_thread(post_answer, {"request_id": "nope", "answer": 1})
+        check("未知 request_id 优雅报错", status == 500 and not j.get("ok", True), f"{status} {j}")
+    finally:
+        await ca.close()
+        ta.cancel()
+        serve_task.cancel()
+        for t in (ta, serve_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+async def big_upload_test(root: Path):
+    """30MB 文件（旧 25MB 上限之上）流式上传：验签、sha、下载回读一致。"""
+    import hashlib
+    import urllib.request
+
+    from AgentNet.client import AgentNetClient
+    from AgentNet.server.hub import HubServer
+    from AgentNet.server.observer import ObserverServer
+
+    port, oport = free_port(), free_port()
+    a = Identity.load_or_create(root / "big_a", name="alpha")
+    wl_path = root / "wl_big.json"
+    wl_path.write_text(json.dumps({
+        "agents": {a.agent_id: {"name": "alpha", "pubkey": a.pubkey_b64}},
+        "groups": {}}), encoding="utf-8")
+    hub = HubServer("127.0.0.1", port, wl_path, root / "hub_state_big")
+    obs = ObserverServer(hub.message_log, hub.presence, host="127.0.0.1", port=oport,
+                         file_store=hub.files, whitelist=hub.whitelist)
+    obs.start()
+    serve_task = asyncio.create_task(hub.serve())
+    await asyncio.sleep(0.3)
+
+    ca = AgentNetClient(a, f"ws://127.0.0.1:{port}", heartbeat_seconds=3600,
+                        http_base=f"http://127.0.0.1:{oport}")
+    ta = asyncio.create_task(ca.connect_forever())
+
+    try:
+        check("大文件端上线", await wait_conn(ca), str(ca.connected))
+        src = root / "big.bin"
+        payload = os.urandom(30 * 1024 * 1024)
+        src.write_bytes(payload)
+        expect_sha = hashlib.sha256(payload).hexdigest()
+        meta = await ca.upload_file(str(src))
+        check("30MB 上传成功（越过旧 25MB 上限）",
+              meta.get("size") == len(payload), str(meta)[:200])
+        check("sha256 一致", meta.get("sha256") == expect_sha)
+        check("内容寻址 id", (meta.get("id") or "").startswith(expect_sha[:16]))
+
+        got = await asyncio.to_thread(
+            urllib.request.urlopen, f"http://127.0.0.1:{oport}{meta['url']}", timeout=10)
+        check("下载内容一致", got.read() == payload)
+    finally:
+        await ca.close()
+        ta.cancel()
+        serve_task.cancel()
+        for t in (ta, serve_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+async def wait_conn(client, timeout: float = 8) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if client.connected:
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+async def security_control_test(root: Path):
+    """安全策略中控：观察台 POST /api/control action=security →
+    载荷原样投递目标智能体（端侧 apply_rules 写回各自 config，由端侧负责）。"""
+    import urllib.error
+    import urllib.request
+
+    from AgentNet.client import AgentNetClient
+    from AgentNet.server.hub import HubServer
+    from AgentNet.server.observer import ObserverServer
+
+    port, oport = free_port(), free_port()
+    a = Identity.load_or_create(root / "sec_a", name="alpha")
+    wl_path = root / "wl_sec.json"
+    wl_path.write_text(json.dumps({
+        "agents": {a.agent_id: {"name": "alpha", "pubkey": a.pubkey_b64}},
+        "groups": {}}), encoding="utf-8")
+    hub = HubServer("127.0.0.1", port, wl_path, root / "hub_state_sec")
+    obs = ObserverServer(hub.message_log, hub.presence, host="127.0.0.1", port=oport,
+                         token="sectok", file_store=hub.files, whitelist=hub.whitelist,
+                         on_control=hub.submit_owner_control)
+    obs.start()
+    serve_task = asyncio.create_task(hub.serve())
+    await asyncio.sleep(0.3)
+
+    controls = []
+    ca = AgentNetClient(a, f"ws://127.0.0.1:{port}", heartbeat_seconds=3600,
+                        on_control=lambda e: controls.append(e))
+    ta = asyncio.create_task(ca.connect_forever())
+
+    def post_control(payload: dict, token: str = "sectok"):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{oport}/api/control",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Token": token})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read().decode("utf-8"))
+            except Exception:
+                return e.code, {}
+
+    try:
+        check("security 端上线", await wait_conn(ca), str(ca.connected))
+
+        status, j = await asyncio.to_thread(post_control, {
+            "target": a.agent_id, "action": "security",
+            "dangerous_commands": ["rm -rf", "format"],
+            "require_confirmation": ["sudo", "del"],
+            "allow_confirmation": True})
+        check("安全策略下发成功", status == 200 and j.get("ok"), f"{status} {j}")
+        deadline = time.time() + 8
+        while time.time() < deadline and not controls:
+            await asyncio.sleep(0.05)
+        check("规则 control 回送", bool(controls), str(controls))
+        if controls:
+            p = controls[-1]["payload"]
+            check("规则载荷完整", p.get("action") == "security"
+                  and p.get("dangerous_commands") == ["rm -rf", "format"]
+                  and p.get("require_confirmation") == ["sudo", "del"]
+                  and p.get("allow_confirmation") is True,
+                  str(p))
+
+        # 非 list 载荷 → 400；空载荷 → 400
+        status, _ = await asyncio.to_thread(post_control, {
+            "target": a.agent_id, "action": "security",
+            "dangerous_commands": "rm -rf"})
+        check("非法规则清单被拒", status == 400, str(status))
+        status, _ = await asyncio.to_thread(post_control, {
+            "target": a.agent_id, "action": "security"})
+        check("空规则载荷被拒", status == 400, str(status))
+
+        # 未知动作仍被拒
+        status, _ = await asyncio.to_thread(post_control, {
+            "target": a.agent_id, "action": "reboot_everything"})
+        check("未知动作被拒", status == 400, str(status))
+    finally:
+        await ca.close()
+        ta.cancel()
+        serve_task.cancel()
+        for t in (ta, serve_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+def security_unit_test():
+    """CommandSecurityChecker.apply_rules：运行时即时生效 + 配置对象有
+    set/save 时写回（persisted=True），纯 dict 配置只改运行时。"""
+    from Tools.config_proxy import reset_config, set_config
+    from Tools.security import get_security_checker
+    import Tools.security as sec_mod
+
+    try:
+        # 纯 dict 注入（外部 harness 视角）：只改运行时
+        set_config({"tools": {"security": {
+            "enabled": True, "allow_confirmation": True,
+            "dangerous_commands": ["shutdown"], "require_confirmation": ["del"]}}})
+        sec_mod._checker_instance = None
+        chk = get_security_checker()
+        check("快照字段齐", chk.snapshot()["dangerous_commands"] == ["shutdown"],
+              str(chk.snapshot()))
+        r = chk.apply_rules(dangerous_commands=["rm -rf"],
+                            require_confirmation=["sudo"], allow_confirmation=False)
+        check("运行时即时生效", chk.dangerous_commands == ["rm -rf"]
+              and chk.require_confirmation == ["sudo"]
+              and chk.allow_confirmation is False, str(chk.snapshot()))
+        check("纯 dict 配置不写盘", r.get("persisted") is False, str(r))
+        check("分类随新规则变", chk.classify_command("sudo rm -rf /x") == "blocked"
+              and chk.classify_command("ls") == "safe", "")
+
+        # 带 set/save 的配置对象（Goharu 全局 Configuration 视角）：写回
+        class _FakeCfg:
+            def __init__(self):
+                self.store = {"tools.security.dangerous_commands": ["shutdown"]}
+                self.saved = False
+
+            def get(self, key, default=None):
+                return self.store.get(key, default)
+
+            def set(self, key, value):
+                self.store[key] = value
+
+            def save(self):
+                self.saved = True
+
+        fake = _FakeCfg()
+        set_config(fake)
+        sec_mod._checker_instance = None
+        chk2 = get_security_checker()
+        r2 = chk2.apply_rules(dangerous_commands=["format"])
+        check("set/save 配置写盘", r2.get("persisted") is True and fake.saved
+              and fake.store["tools.security.dangerous_commands"] == ["format"],
+              str(fake.store))
+    finally:
+        reset_config()
+        sec_mod._checker_instance = None
 
 
 if __name__ == "__main__":

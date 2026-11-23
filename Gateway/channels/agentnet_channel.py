@@ -44,6 +44,8 @@ class AgentNetChannel(Channel):
         self.owner_ids = set(self.params.get("owner_ids") or [])
         # 安静期自动阅读：群内未@消息超过该秒数无新消息时，合并导入上下文
         self.quiet_seconds = float(self.params.get("quiet_seconds", 120))
+        # 主人消息快速兜底：主人不@的群消息不立即唤醒，但安静期缩短到该秒数
+        self.owner_quiet_seconds = float(self.params.get("owner_quiet_seconds", 15))
         self._quiet_check_interval = 10.0
         # 合并消化：urgent 到达后去抖窗口（离线批量消息会在这个窗口内聚合成一条）
         self._urgent_debounce = float(self.params.get("urgent_debounce_seconds", 1.2))
@@ -53,9 +55,12 @@ class AgentNetChannel(Channel):
         # 超时无消息自动退出，回到"@才醒 + 安静期自动阅读"
         self.attention_seconds = float(self.params.get("attention_seconds", 300))
         self._attentive_until = 0.0
+        self._attentive_reported = False  # 上次上报的关注期状态（翻转才推，防刷）
         # 乒乓刹车：连续 N 轮纯同事对话（无主人参与）后，同事闲聊不再唤醒
         self._agent_pingpong_limit = int(self.params.get("agent_pingpong_limit", 3))
         self._agent_streak = 0
+        # 群体意识：peer agent_id → 名字（presence_state 广播维护，用于@对象标注）
+        self._peer_names: dict = {}
         identity_dir = self.params.get("identity_dir", "./runtime_memory/agentnet/identity")
         box_path = self.params.get("messagebox_path", "./runtime_memory/agentnet/messagebox.db")
         self.identity = Identity.load_or_create(identity_dir, name=self.name)
@@ -93,7 +98,9 @@ class AgentNetChannel(Channel):
         if saved.get("tags"):
             self.params["tags"] = saved["tags"]
         if saved.get("name"):
-            self.name = self.name or saved["name"]
+            # 与 focus/tags 一致：自我更新的档案优先于 config 装配值——
+            # 主人改过的名字重启后必须保留，不能被 config 默认值顶回去
+            self.name = saved["name"]
 
     def _persist_profile(self) -> None:
         """端侧身份资料落盘（新机器加入组网时随握手上报）。"""
@@ -108,6 +115,13 @@ class AgentNetChannel(Channel):
         }
         self._profile_path().write_text(
             json.dumps(profile, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    def _apply_rename(self, name: str) -> None:
+        """应用新名字：运行时身份 + 落盘。hub 侧白名单/presence 由 hub 自己改。"""
+        self.name = name
+        self.identity.name = name     # client 持有同一 Identity 引用，握手即用新名
+        self.params["name"] = name
+        self._persist_profile()
 
     # ------------------------------------------------------------- 生命周期
     def start(self):
@@ -124,15 +138,22 @@ class AgentNetChannel(Channel):
     def _run(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        try:
+            from Tools.security import get_security_checker
+            security = get_security_checker().snapshot()
+        except Exception:
+            security = None   # 无 Tools 环境（纯 AgentNet 测试）不上报
         self._client = AgentNetClient(
             self.identity, self.url, messagebox=self.box,
             state_provider=lambda: self._state_provider(),
+            attentive_provider=lambda: time.time() < self._attentive_until,
             on_message=self._on_any_message,
             on_event=self._on_net_event,
             on_control=self._on_control,
             profile={
                 "focus": self.params.get("focus", ""),
                 "tags": list(self.params.get("tags") or []),
+                "security": security,
             },
             http_base=self.http_base,
         )
@@ -163,11 +184,84 @@ class AgentNetChannel(Channel):
         """SessionManager 注入压缩器（arch 角色）：fn(agent_name, lines) -> str。"""
         self._summarize_fn = fn
 
+    # ------------------------------------------------- 关注期状态上报（观察台）
+    def _push_presence_async(self) -> None:
+        """关注期/状态翻转即时上报 hub（fire-and-forget，不阻塞当前线程）。"""
+        if not self._client or not self._loop or not self._connected.is_set():
+            return
+
+        def _swallow(f) -> None:
+            try:
+                f.exception()
+            except Exception:
+                pass
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._client.push_presence(), self._loop)
+            fut.add_done_callback(_swallow)
+        except Exception:
+            logger.warning("即时 presence 上报失败", exc_info=True)
+
+    def _report_presence_if_changed(self) -> None:
+        """关注期状态翻转（进入/退出）时推一次 presence——观察台实时可见。"""
+        attentive = time.time() < self._attentive_until
+        if attentive == self._attentive_reported:
+            return
+        self._attentive_reported = attentive
+        logger.info("关注期状态翻转: attentive=%s", attentive)
+        self._push_presence_async()
+
     # ------------------------------------------------------------- 入站
     def _on_net_event(self, kind: str, env: dict) -> None:
         if kind == "welcome":
             self._connected.set()
             logger.info("agentnet 已上线: %s", self.identity.agent_id)
+        elif kind == "presence_state":
+            agents = (env.get("payload") or {}).get("agents") or {}
+            for aid, info in agents.items():
+                name = (info or {}).get("name")
+                if aid and name:
+                    self._peer_names[aid] = str(name)
+
+    def _fmt_mentions(self, mentions: list) -> str:
+        """mentions（agent_id 列表）→ '@名字1 @名字2'（名字缺失用短 id）。"""
+        out = []
+        for m in mentions or []:
+            out.append("@" + self._peer_names.get(m, str(m)[:8]))
+        return " ".join(out)
+
+    # 每条群消息必跟的 reminder（主人要求英文原句，三态全覆盖）：
+    # @我 → 必须回复；@别人 → 明确旁观 + 确有帮助再轻参与；无@ → 广播择优参与
+    _NOTE_FOR_ME = "This Message is specifically sent for you, you need to reply it"
+    _NOTE_BROADCAST = ("This is a broadcast message sent from user, react to it "
+                       "and participate in the current talking only if you could "
+                       "confirm that you are helpful or necessary to reply")
+
+    def _note_for_other(self, mentions: list) -> str:
+        return ("This Message is specifically sent for "
+                f"{self._fmt_mentions(mentions)}, Not For You. "
+                "But You can do some slight thinking or analysis if you confirm "
+                "that you are helpful or necessary to participate in their "
+                "conversation.")
+
+    def _mention_note(self, mentions: list) -> str:
+        """群消息 @对象 reminder（每条必跟）：@我 → 必须回复；@别人 → 明确旁观；
+        无@（同事线路防御）→ 广播。"""
+        if not mentions:
+            return self._NOTE_BROADCAST
+        if self.identity.agent_id in mentions:
+            return self._NOTE_FOR_ME
+        return self._note_for_other(mentions)
+
+    def _owner_line_note(self, mentions: list) -> str:
+        """主人群消息 reminder（每条必跟）：@我 → 必须回复；无@ → 广播；
+        @别人 → 明确旁观。"""
+        if not mentions:
+            return self._NOTE_BROADCAST
+        if self.identity.agent_id in mentions:
+            return self._NOTE_FOR_ME
+        return self._note_for_other(mentions)
 
     def _on_control(self, env: dict) -> None:
         """中控消息：仅接受主人身份发出的动作，其余来源丢弃并记日志。"""
@@ -182,6 +276,50 @@ class AgentNetChannel(Channel):
             self.box.clear()
             logger.info("中控: messagebox 已清空")
             return
+        if action == "rename":
+            # 主人改名：端侧身份即时更新 + 落盘（重启后 profile 名优先于 config）
+            new_name = str((env.get("payload") or {}).get("name", "")).strip()
+            if not new_name:
+                logger.warning("中控 rename 缺少 name，忽略")
+                return
+            self._apply_rename(new_name)
+            logger.info("中控: 已改名为 %s", new_name)
+            return
+        if action == "security":
+            # 观察台改安全规则：运行时即时生效 + 尽力写回 config.yaml，
+            # 新规则快照随 profile 上报（观察台详情页"安全策略"区展示它）
+            payload = env.get("payload") or {}
+            from Tools.security import get_security_checker
+            result = get_security_checker().apply_rules(
+                dangerous_commands=payload.get("dangerous_commands"),
+                require_confirmation=payload.get("require_confirmation"),
+                allow_confirmation=payload.get("allow_confirmation"))
+            logger.info("中控: 安全策略已更新（persisted=%s）", result.get("persisted"))
+            self._report_profile()
+            return
+        if action == "answer":
+            # 观察台作答回送：解开挂起的 AskUser
+            rid = str((env.get("payload") or {}).get("request_id", ""))
+            resolve = getattr(self, "_resolve_answer", None)
+            if rid and resolve is not None:
+                try:
+                    resolve(rid, (env.get("payload") or {}).get("answer"))
+                    logger.info("中控: AskUser 已作答 %s", rid)
+                except Exception:
+                    logger.exception("中控 answer 解析失败: %s", rid)
+            return
+        if action == "confirm_result":
+            # 观察台高危命令批准回送：解开挂起的确认
+            cid = str((env.get("payload") or {}).get("confirm_id", ""))
+            resolve = getattr(self, "_resolve_confirmation", None)
+            if cid and resolve is not None:
+                try:
+                    resolve(cid, bool((env.get("payload") or {}).get("approved")))
+                    logger.info("中控: 高危命令 %s → %s",
+                                cid, "批准" if (env.get("payload") or {}).get("approved") else "拒绝")
+                except Exception:
+                    logger.exception("中控 confirm_result 解析失败: %s", cid)
+            return
         if self._control_handler is not None:
             try:
                 summary = self._control_handler(action)
@@ -192,9 +330,10 @@ class AgentNetChannel(Channel):
     def _on_any_message(self, env: dict, class_: str) -> None:
         """全量消息入口（client on_message）：入盒 + 关注期判定。
 
-        - mention/dm/主人消息 → 唤醒 + 进入关注期（续期）
+        - mention/dm → 唤醒 + 进入关注期（续期）
         - 关注期内的普通群消息 → 也唤醒（续期）
-        - 其余群消息 → 只入盒（摘要计数，安静期兜底阅读）
+        - 其余群消息（含主人不@的群消息）→ 只入盒（摘要计数，安静期兜底阅读；
+          主人消息走更短的 owner_quiet_seconds 快速阅读）
         """
         sender = env.get("from", "?")
         payload = env.get("payload") or {}
@@ -202,12 +341,13 @@ class AgentNetChannel(Channel):
             peer = env["to"] if env.get("kind") == CLASS_GROUP else sender
             self.box.add(env.get("id"), class_, peer, sender,
                          str(payload.get("text", "")), env.get("ts"),
-                         attachments=payload.get("attachments") or None)
+                         attachments=payload.get("attachments") or None,
+                         mentions=env.get("mentions") or None)
         is_owner = sender in self.owner_ids
         in_attention = time.time() < self._attentive_until
         if is_owner:
             self._agent_streak = 0   # 主人说话重置乒乓计数
-        urgent = (class_ in (CLASS_MENTION, CLASS_DM) or is_owner
+        urgent = (class_ in (CLASS_MENTION, CLASS_DM)
                   or (class_ == CLASS_GROUP and in_attention))
         # 乒乓刹车：关注期内的同事普通群聊，连续 N 轮无主人参与后不再唤醒
         if urgent and not is_owner and class_ == CLASS_GROUP:
@@ -220,6 +360,7 @@ class AgentNetChannel(Channel):
         # 已被唤醒的消息直接从收件箱标记已读（内容会进合并上下文）
         self.box.mark_read_by_msg_id(env.get("id"))
         self._attentive_until = time.time() + self.attention_seconds
+        self._report_presence_if_changed()   # 进关注期 → 即时上报观察台
         self._on_urgent(env, class_)
 
     def _on_urgent(self, env: dict, class_: str) -> None:
@@ -237,6 +378,7 @@ class AgentNetChannel(Channel):
             "class": class_,
             "text": str(payload.get("text", "")),
             "attachments": payload.get("attachments") or [],
+            "mentions": env.get("mentions") or [],
             "ts": env.get("ts") or "",
         }
         with self._urgent_lock:
@@ -265,35 +407,52 @@ class AgentNetChannel(Channel):
         if not items:
             return
         owners = [i for i in items if i["is_owner"]]
-        # 关注期内的普通群消息与 @消息分区展示，但同属一个 turn
-        directed = [i for i in items if i["class"] != CLASS_GROUP or i["is_owner"]]
+        # 三类分区：真正@我/私聊我的 = 重点；主人在群里说话 = 群体动态（旁观）；
+        # 同事群聊 = 关注期内顺带接收
+        directed = [i for i in items if i["class"] != CLASS_GROUP]
+        owner_chat = [i for i in items if i["class"] == CLASS_GROUP and i["is_owner"]]
         attentive_chat = [i for i in items if i["class"] == CLASS_GROUP and not i["is_owner"]]
         t0, t1 = items[0]["ts"][11:19] or "?", items[-1]["ts"][11:19] or "?"
         parts = [
             f"[agentnet 组网消息整理 · {len(items)} 条"
-            f"{'（含主人指令，优先执行）' if owners else ''}（{t0} → {t1}）]"
+            f"{'（含主人消息）' if owners else ''}（{t0} → {t1}）]"
         ]
         if directed:
-            parts.append("【@你的消息】（按时间顺序）")
+            parts.append("【@你的消息 · ⚡重点】你被点名，已进入关注期，需处理或回应"
+                         "（按时间顺序）：")
             for i in directed:
                 who = f"{i['sender']}（主人）" if i["is_owner"] else i["sender"]
                 att = f" 📎{len(i['attachments'])}个附件" if i["attachments"] else ""
-                parts.append(f"- [{i['ts'][11:16] or '?'}] {who}: {i['text']}{att}")
+                parts.append(f"- [{i['ts'][11:16] or '?'}] {who}: {i['text']}{att}"
+                             f"【{self._NOTE_FOR_ME}】")
+        if owner_chat:
+            parts.append("【主人消息 · 群体动态】主人在群里说话，留意是否在和你交流"
+                         "（按时间顺序）：")
+            for i in owner_chat:
+                parts.append(f"- [{i['ts'][11:16] or '?'}] {i['sender']}（主人）"
+                             f"{self._owner_line_note(i['mentions'])}: {i['text']}")
         if attentive_chat:
-            parts.append("【群消息（关注期内实时）】（按时间顺序）")
+            parts.append("【群消息 · 关注期内顺带接收】你在关注期所以能实时看到，"
+                         "留意与你相关的内容即可（按时间顺序）：")
             for i in attentive_chat:
-                parts.append(f"- [{i['ts'][11:16] or '?'}] {i['sender']}: {i['text']}")
+                parts.append(f"- [{i['ts'][11:16] or '?'}] {i['sender']}"
+                             f"{self._mention_note(i['mentions'])}: {i['text']}")
         parts.extend(self._consume_group_rows())
-        parts.append("提示：以上为组网消息合辑——关注可能与你有关的内容即可；"
-                     "不重要且不相关的可以不回复。回复请用 serverMessageHandler(reply)。")
+        parts.append("提示：三类消息区别对待——【@你的消息】是重点（被点名，"
+                     "需处理或回应）；【主人消息·群体动态】和【关注期内群消息】是"
+                     "旁观察看：主人在和别的智能体对话、或话题与你无关时，不要插话"
+                     "不要回复，看完即可。回复请用 serverMessageHandler(reply)。")
         if not owners:
             parts.append("（同事消息：只有确实需要回应或行动时才用 reply 回复；"
                          "不要发送纯确认/待命/寒暄类消息，避免与同事形成反弹循环。）")
-        # 自动中继策略：只有主人触发的 turn 才把回答自动广播回网；
-        # 纯同事触发的 turn 必须用 reply 工具显式回应——防止"我不回复"被中继成新消息
+        # 自动中继策略：只有主人直接@我/私聊我触发的 turn 才把回答自动广播回网；
+        # 主人在群里和别人说话（群体动态）不自动中继——旁观智能体的内心戏
+        # 绝不能让全网看到；纯同事触发的 turn 必须用 reply 工具显式回应
+        owner_directed = any(i["is_owner"] and i["class"] != CLASS_GROUP
+                             for i in items)
         with self._urgent_lock:
             if self._reply_target is not None:
-                self._reply_target["auto_relay"] = bool(owners)
+                self._reply_target["auto_relay"] = owner_directed
         first_owner = owners[0] if owners else None
         meta = {"agentnet": True, "class": items[0]["class"],
                 "sender": (first_owner or items[-1])["sender"],
@@ -309,7 +468,15 @@ class AgentNetChannel(Channel):
         rows = self.box.read(class_=CLASS_GROUP)  # 取出并标记已读
         if not rows:
             return []
-        lines = [f"- [{r['ts'][11:16]}] {r['sender']}: {r['text']}" for r in rows]
+        def _note(r: dict) -> str:
+            if r["sender"] in self.owner_ids:
+                return self._owner_line_note(r.get("mentions") or [])
+            return self._mention_note(r.get("mentions") or [])
+
+        lines = [f"- [{r['ts'][11:16]}] {r['sender']}"
+                 f"{'（主人）' if r['sender'] in self.owner_ids else ''}"
+                 f"{_note(r)}: {r['text']}"
+                 for r in rows]
         total = sum(len(l) for l in lines)
         if total <= self._group_inline_max_chars:
             return [f"【群消息】（{len(rows)} 条，按时间顺序）"] + lines
@@ -407,6 +574,22 @@ class AgentNetChannel(Channel):
             return None
         return asyncio.run_coroutine_threadsafe(self._client.query_presence(), self._loop)
 
+    def _report_profile(self) -> None:
+        """把最新 profile（含安全规则快照）上报 hub：更新内存档案并触发广播。"""
+        if not self._client or not self._loop or not self._connected.is_set():
+            return
+        try:
+            from Tools.security import get_security_checker
+            self._client._profile["security"] = get_security_checker().snapshot()
+        except Exception:
+            pass
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._client.update_profile(), self._loop).result(timeout=10)
+            logger.info("profile 已上报 hub（含安全规则快照）")
+        except Exception:
+            logger.exception("profile 上报 hub 失败")
+
     def net_update_profile_fut(self, focus: str | None = None, tags: list | None = None):
         """更新自己的档案（focus/tags）并上报 hub；同时落盘 profile.json。"""
         if focus is not None:
@@ -418,6 +601,48 @@ class AgentNetChannel(Channel):
             return None
         return asyncio.run_coroutine_threadsafe(
             self._client.update_profile(focus=focus, tags=tags), self._loop)
+
+    # ------------------------------------------------- 观察台交互（AskUser/高危确认）
+    def _push_ask(self, request_id: str, kind: str, data: dict) -> bool:
+        """登记到 hub 挂起表（观察台渲染按钮作答）。失败返回 False，调用方退化文本。"""
+        if not self._client or not self._loop or not self._connected.is_set():
+            return False
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._client.submit_ask(request_id, kind, data), self._loop)
+            fut.result(timeout=10)
+            return True
+        except Exception:
+            logger.exception("组网询问登记 hub 失败，退化文本问答")
+            return False
+
+    def ask_questions(self, request_id: str, questions: list, meta: dict | None = None):
+        """AskUser 提问：推观察台按钮面板；同时保留本地挂起（网内文本作答仍可消费）。"""
+        modes = []
+        for q in questions:
+            labels = [o.get("label", "") if isinstance(o, dict) else str(o)
+                       for o in (q.get("options") or [])]
+            labels = [l for l in labels if l]
+            modes.append("multi" if q.get("multi_select") else ("single" if labels else "text"))
+        self._set_ask_pending(request_id, questions, modes, meta)
+        if self._push_ask(request_id, "question", {"questions": questions}):
+            logger.info("AskUser 已推观察台: %s (%d 题)", request_id, len(questions))
+            return
+        super().ask_questions(request_id, questions, meta)
+
+    def confirm_request(self, confirm_id: str, command: str,
+                        description: str = "", timeout: int = 300):
+        """高危命令确认：推观察台允许/拒绝按钮；失败退化文本 y/n。"""
+        self._pending_confirm = {
+            "id": str(confirm_id),
+            "expires": time.time() + max(10, int(timeout or 300)) + 30,
+        }
+        if self._push_ask(str(confirm_id), "confirm",
+                          {"confirm_id": str(confirm_id), "cmd": command,
+                           "description": description, "timeout": int(timeout or 300)}):
+            logger.info("高危确认已推观察台: %s", confirm_id)
+            return
+        super().confirm_request(confirm_id, command, description, timeout)
 
     # ------------------------------------------------------------- 便利贴
     def turn_extras(self) -> list[str]:
@@ -432,13 +657,15 @@ class AgentNetChannel(Channel):
         """群内未@消息的人性化阅读节奏：攒到群里安静下来再一次性看完。
 
         条件全部满足才触发：会话空闲（can_auto_read）+ 有未读 group +
-        最后一条 group 已过 quiet_seconds。合并为一条消息进上下文
-        （一次 turn 读完，而不是逐条排队唤醒）。
+        最后一条 group 已过安静期（主人消息用更短的 owner_quiet_seconds）。
+        合并为一条消息进上下文（一次 turn 读完，而不是逐条排队唤醒）。
         """
         while True:
             try:
                 time.sleep(self._quiet_check_interval)
                 self._maybe_auto_read()
+                # 关注期超时退场检测：翻转即推给 hub（观察台实时可见）
+                self._report_presence_if_changed()
             except Exception:
                 logger.exception("quiet watcher 异常")
 
@@ -447,22 +674,32 @@ class AgentNetChannel(Channel):
             return
         if self.box.unread_count(class_=CLASS_GROUP) <= 0:
             return
-        latest = self.box.latest_ts(CLASS_GROUP)
-        if not latest:
-            return
         from datetime import datetime
 
+        # 主人消息快速兜底：有未读主人群消息时用更短的安静期（主人不@不立即
+        # 唤醒，但约 owner_quiet_seconds 内合并阅读），否则用普通安静期
+        owner_latest = self.box.latest_ts_from(self.owner_ids, CLASS_GROUP)
+        if owner_latest:
+            latest = owner_latest
+            threshold = self.owner_quiet_seconds
+        else:
+            latest = self.box.latest_ts(CLASS_GROUP)
+            threshold = self.quiet_seconds
+        if not latest:
+            return
         try:
             age = (datetime.now() - datetime.fromisoformat(latest)).total_seconds()
         except ValueError:
             return
-        if age < self.quiet_seconds:
+        if age < threshold:
             return
         # 与 urgent 合流共用分流：小体量内联，大体量交压缩智能体
-        parts = ["[agentnet 群消息 · 安静期自动阅读]"]
+        owner_flag = "（含主人消息）" if owner_latest else ""
+        parts = [f"[agentnet 群消息 · 安静期自动阅读{owner_flag}]"]
         parts.extend(self._consume_group_rows())
-        parts.append("提示：以上为群内非定向消息——关注可能与你有关的内容即可；"
-                     "不重要且不相关的可以不回复。")
+        parts.append("提示：以上为群内非定向消息——注意每条@的是谁：主人在和别的"
+                     "智能体对话、或话题与你无关时，旁观即可不要插话；确实与你"
+                     "相关或被问到时才用 serverMessageHandler(reply) 回复。")
         logger.info("安静期自动阅读触发")
         self.emit_inbound("\n".join(parts), meta={"agentnet": True, "class": "group",
                                                   "auto_read": True})

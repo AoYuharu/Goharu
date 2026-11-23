@@ -2,9 +2,12 @@
 安全命令检查模块
 用于拦截危险的系统命令，防止意外的破坏性操作
 """
+import logging
 import re
 from typing import Tuple, Optional
 from Tools.config_proxy import get_config
+
+logger = logging.getLogger(__name__)
 
 
 class CommandSecurityChecker:
@@ -16,6 +19,47 @@ class CommandSecurityChecker:
         self.allow_confirmation = self.security_config.get("allow_confirmation", False)
         self.dangerous_commands = self.security_config.get("dangerous_commands", [])
         self.require_confirmation = self.security_config.get("require_confirmation", [])
+
+    def snapshot(self) -> dict:
+        """当前规则快照（观察台 profile 上报 + 中控回显用）。"""
+        return {"enabled": self.enabled,
+                "allow_confirmation": self.allow_confirmation,
+                "dangerous_commands": list(self.dangerous_commands),
+                "require_confirmation": list(self.require_confirmation)}
+
+    def apply_rules(self, dangerous_commands: Optional[list] = None,
+                    require_confirmation: Optional[list] = None,
+                    allow_confirmation: Optional[bool] = None) -> dict:
+        """观察台中控改规则：运行时即时生效，配置对象支持 set/save 时写回
+        config.yaml（重启不丢）；外部 harness 的纯 dict 配置只改运行时。"""
+        if dangerous_commands is not None:
+            self.dangerous_commands = [str(x) for x in dangerous_commands]
+        if require_confirmation is not None:
+            self.require_confirmation = [str(x) for x in require_confirmation]
+        if allow_confirmation is not None:
+            self.allow_confirmation = bool(allow_confirmation)
+        persisted = False
+        cfg = get_config()
+        if hasattr(cfg, "set") and hasattr(cfg, "save"):
+            try:
+                if dangerous_commands is not None:
+                    cfg.set("tools.security.dangerous_commands",
+                            list(self.dangerous_commands))
+                if require_confirmation is not None:
+                    cfg.set("tools.security.require_confirmation",
+                            list(self.require_confirmation))
+                if allow_confirmation is not None:
+                    cfg.set("tools.security.allow_confirmation",
+                            self.allow_confirmation)
+                cfg.save()
+                persisted = True
+            except Exception:
+                logger.exception("安全规则写回 config.yaml 失败（仅运行时生效）")
+        logger.info("安全规则已更新: 硬黑名单=%d 条, 需确认=%d 条, allow_confirmation=%s"
+                    "（persisted=%s）",
+                    len(self.dangerous_commands), len(self.require_confirmation),
+                    self.allow_confirmation, persisted)
+        return {"persisted": persisted, **self.snapshot()}
 
     def classify_command(self, cmd: str) -> str:
         """三态分类：'safe' | 'blocked'（硬黑名单）| 'confirm'（需用户确认）。

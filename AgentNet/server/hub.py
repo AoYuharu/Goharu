@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -112,6 +113,7 @@ class Presence:
             "state": "idle", "online": True,
             "last_seen": now_ts(), "name": name,
             "online_since": now_ts(),
+            "attentive": False,
             "profile": profile if profile is not None else (prev.get("profile") or {}),
         }
         self._persist()
@@ -131,10 +133,22 @@ class Presence:
             self._table[agent_id]["last_seen"] = now_ts()
             self._persist()
 
-    def set_state(self, agent_id: str, state: str) -> bool:
+    def rename(self, agent_id: str, name: str) -> bool:
+        """主人中控改名：状态机表同步更新并广播（白名单由调用方改）。"""
+        if agent_id not in self._table or not name:
+            return False
+        self._table[agent_id]["name"] = name
+        self._table[agent_id]["last_seen"] = now_ts()
+        self._persist()
+        return True
+
+    def set_state(self, agent_id: str, state: str,
+                  attentive: Optional[bool] = None) -> bool:
         if agent_id not in self._table or state not in RUNTIME_STATES:
             return False
         self._table[agent_id]["state"] = state
+        if attentive is not None:
+            self._table[agent_id]["attentive"] = bool(attentive)
         self._table[agent_id]["last_seen"] = now_ts()
         self._persist()
         return True
@@ -268,6 +282,18 @@ class FileStore:
         return {"id": file_id, "name": display_name, "size": len(data),
                 "sha256": sha, "url": f"/files/{file_id}"}
 
+    def commit(self, name: str, tmp_path: Path, sha256_hex: str, size: int) -> dict:
+        """流式上传入库：tmp 文件已写完且 sha 已算好，同卷原子改名（2GB 不进内存）。"""
+        display_name = (Path(str(name or "file")).name or "file")[:120]
+        file_id = f"{sha256_hex[:16]}_{self._safe_name(display_name)}"
+        path = self.dir / file_id
+        if path.exists():
+            Path(tmp_path).unlink(missing_ok=True)
+        else:
+            os.replace(str(tmp_path), str(path))
+        return {"id": file_id, "name": display_name, "size": int(size),
+                "sha256": sha256_hex, "url": f"/files/{file_id}"}
+
     def path(self, file_id: str) -> Optional[Path]:
         if not file_id or "/" in file_id or "\\" in file_id or file_id.startswith("."):
             return None
@@ -286,6 +312,8 @@ class HubServer:
         self.mailbox = Mailbox(state_dir / "mailbox.db")
         self.message_log = MessageLog(state_dir / "messages.db")
         self.files = FileStore(state_dir / "files")
+        # 挂起的询问/确认（agent→server "ask" 信封存入，观察台 /api/answer 回送）
+        self.pending_asks: dict[str, dict] = {}
         self._online: dict[str, Any] = {}  # agent_id -> websocket
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         # 用户本体身份：观察台输入框以该身份广播（服务器自持私钥，自动进白名单）
@@ -312,22 +340,45 @@ class HubServer:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "msg_id": env["id"]}
 
-    def submit_owner_control(self, target: str, action: str) -> dict:
-        """观察台中控入口（HTTP 线程调用）：以 owner 身份给指定智能体发中控动作。"""
+    def submit_owner_control(self, target: str, action: str,
+                             name: Optional[str] = None,
+                             extra: Optional[dict] = None) -> dict:
+        """观察台中控入口（HTTP 线程调用）：以 owner 身份给指定智能体发中控动作。
+
+        rename 额外做服务端权威更新：白名单 + presence 立即改名并广播全网，
+        同时给目标智能体发 control 消息让它更新自己的端侧身份。
+        security 等动作携带 extra 载荷原样透传给目标智能体。"""
         if self.loop is None:
             return {"ok": False, "error": "hub 未就绪"}
         if not self.whitelist.agent(target):
             return {"ok": False, "error": f"目标不在白名单: {target}"}
+        if action == "rename":
+            name = (name or "").strip()
+            if not name or len(name) > 32:
+                return {"ok": False, "error": "名字须为 1-32 个字符"}
+            record = self.whitelist.agent(target) or {}
+            if record.get("pubkey"):
+                self.whitelist.ensure_agent(target, name, record["pubkey"])
+        payload: dict = {"action": action}
+        if name:
+            payload["name"] = name
+        if extra:
+            payload.update(extra)
         env = make_envelope(
             sender=self.owner.agent_id, to=target, type_="control",
-            payload={"action": action})
+            payload=payload)
         env["sig"] = self.owner.sign(canonical_bytes(env))
 
         async def _deliver() -> dict:
             # 中控消息不进消息流水（它是运维动作，不是聊天）；
             # 但记一条系统流水便于观察台展示"中控动作已发出"
             self.message_log.log(self.owner.agent_id, "中控", target, "control",
-                                 None, f"{action} → {target}", env.get("ts"))
+                                 None, f"{action}{' ' + name if name else ''} → {target}",
+                                 env.get("ts"))
+            if action == "rename":
+                # 服务端权威改名：presence 落盘 + 全网广播（各端 _peer_names 随之更新）
+                self.presence.rename(target, name)
+                await self._broadcast_presence()
             return {"delivered": await self._send_to(target, env)}
 
         try:
@@ -339,6 +390,46 @@ class HubServer:
             self.mailbox.put(target, env)
             return {"ok": True, "msg_id": env["id"], "queued": True}
         return {"ok": True, "msg_id": env["id"], "queued": False}
+
+    # ---------------------------------------------------------- 挂起询问（观察台作答）
+    def pending_asks_snapshot(self) -> list[dict]:
+        """观察台轮询用：未过期挂起询问/确认列表（公共视图，不含签名等）。"""
+        now = time.time()
+        for rid in [k for k, v in self.pending_asks.items() if v["expires"] < now]:
+            del self.pending_asks[rid]
+        return [
+            {"request_id": v["request_id"], "kind": v["kind"],
+             "agent_id": v["agent_id"], "agent_name": v["agent_name"],
+             "data": v["data"], "expires_in": int(v["expires"] - now)}
+            for v in self.pending_asks.values()
+        ]
+
+    def submit_answer(self, request_id: str, answer) -> dict:
+        """观察台作答（HTTP 线程调用）：control 信封回送目标智能体并放行其工具线程。"""
+        pending = self.pending_asks.pop(request_id, None)
+        if pending is None:
+            return {"ok": False, "error": "请求不存在或已过期"}
+        if pending["kind"] == "confirm":
+            payload = {"action": "confirm_result",
+                       "confirm_id": (pending["data"] or {}).get("confirm_id", request_id),
+                       "approved": bool(answer)}
+        else:
+            payload = {"action": "answer", "request_id": request_id, "answer": answer}
+        env = make_envelope(
+            sender=self.owner.agent_id, to=pending["agent_id"],
+            type_="control", payload=payload)
+        env["sig"] = self.owner.sign(canonical_bytes(env))
+        if pending["agent_id"] not in self._online:
+            self.mailbox.put(pending["agent_id"], env)
+            return {"ok": True, "queued": True}
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._send_to(pending["agent_id"], env), self.loop).result(timeout=10)
+        except Exception as e:
+            logger.warning("答案回送失败: %s", e)
+            return {"ok": False, "error": str(e)}
+        logger.info("答案已回送: %s → %s", request_id, pending["agent_id"])
+        return {"ok": True}
 
     # ---------------------------------------------------------- 连接生命周期
     async def handle(self, ws) -> None:
@@ -423,8 +514,10 @@ class HubServer:
             return
         t = env["type"]
         if t == "presence_update":
-            state = (env.get("payload") or {}).get("state", "idle")
-            if self.presence.set_state(sender, state):
+            p_payload = env.get("payload") or {}
+            state = p_payload.get("state", "idle")
+            attentive = p_payload.get("attentive")
+            if self.presence.set_state(sender, state, attentive):
                 await self._broadcast_presence()
             return
         if t == "presence_query":
@@ -448,6 +541,31 @@ class HubServer:
                 logger.info("档案更新: %s → focus=%s tags=%s", sender,
                             profile.get("focus", ""), profile.get("tags", []))
                 await self._broadcast_presence()
+            return
+        if t == "ask":
+            # 智能体的交互式提问/高危确认（AskUser / confirm）→ 存挂起表，
+            # 观察台轮询 /api/requests 渲染按钮，主人作答经 /api/answer 回送
+            record = self.whitelist.agent(sender)
+            if record is None or not Identity.verify(
+                    record["pubkey"], canonical_bytes(env), env.get("sig", "")):
+                logger.warning("ask 验签失败 from=%s", sender)
+                return
+            p = env.get("payload") or {}
+            request_id = str(p.get("request_id") or "")
+            kind = str(p.get("kind") or "question")
+            if not request_id or kind not in ("question", "confirm"):
+                return
+            ttl = float(p.get("ttl") or 400)
+            self.pending_asks[request_id] = {
+                "request_id": request_id,
+                "kind": kind,
+                "agent_id": sender,
+                "agent_name": record.get("name", sender),
+                "data": p.get("data") or {},
+                "ts": time.time(),
+                "expires": time.time() + min(max(ttl, 30), 1800),
+            }
+            logger.info("挂起询问登记: %s %s from=%s", kind, request_id, sender)
             return
         if t == "message":
             # 验签（防冒充）；白名单公钥
@@ -536,6 +654,8 @@ def main() -> None:
             whitelist=server.whitelist,
             on_send=server.submit_owner_message,
             on_control=server.submit_owner_control,
+            pending_asks=server.pending_asks_snapshot,
+            on_answer=server.submit_answer,
         )
         observer.start()
     asyncio.run(server.serve())

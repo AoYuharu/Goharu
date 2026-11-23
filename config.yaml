@@ -68,6 +68,7 @@ agentnet:
   owner_ids:
   - agt_43346c6e4ef29069
   quiet_seconds: 120           # 群内无@消息攒到安静期再合并导入的秒数
+  owner_quiet_seconds: 15      # 主人不@的群消息不立即唤醒，但安静期缩短到该秒数快速兜底阅读
   group_inline_max_chars: 1500 # 群消息总字数超阈值则交压缩智能体摘要，否则内联进上下文
   attention_seconds: 300       # 关注期：被@/私聊/主人说话后，期内所有新消息都唤醒（续期）
   agent_pingpong_limit: 3      # 乒乓刹车：连续 N 轮纯同事对话（无主人参与）后不再唤醒
@@ -209,12 +210,12 @@ tools:
     - fdisk
     - mkfs
     - dd
-    - sudo
     - runas
     - killall
     - pkill
     - nmap
     require_confirmation:
+    - sudo
     - del
     - rmdir
     - taskkill

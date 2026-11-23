@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS messages (
     sender TEXT NOT NULL,
     text TEXT NOT NULL,
     attachments TEXT NOT NULL DEFAULT '[]',
+    mentions TEXT NOT NULL DEFAULT '[]',
     ts TEXT NOT NULL,
     read INTEGER NOT NULL DEFAULT 0
 );
@@ -50,6 +51,9 @@ class MessageBox:
             if "attachments" not in cols:
                 conn.execute("ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
                 conn.commit()
+            if "mentions" not in cols:
+                conn.execute("ALTER TABLE messages ADD COLUMN mentions TEXT NOT NULL DEFAULT '[]'")
+                conn.commit()
         logger.info("MessageBox 初始化: %s", self._path)
 
     def _conn(self) -> sqlite3.Connection:
@@ -63,14 +67,16 @@ class MessageBox:
     # ------------------------------------------------------------------ 写
     def add(self, msg_id: Optional[str], class_: str, peer: str,
             sender: str, text: str, ts: Optional[str] = None,
-            attachments: Optional[list] = None) -> bool:
+            attachments: Optional[list] = None,
+            mentions: Optional[list] = None) -> bool:
         """入盒。msg_id 重复（重连重投）返回 False 不重复入账。"""
         try:
             self._conn().execute(
-                "INSERT INTO messages(msg_id, class, peer, sender, text, ts, attachments)"
-                " VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO messages(msg_id, class, peer, sender, text, ts, attachments, mentions)"
+                " VALUES (?,?,?,?,?,?,?,?)",
                 (msg_id, class_, peer, sender, text, ts or now_ts(),
-                 json.dumps(attachments or [], ensure_ascii=False)),
+                 json.dumps(attachments or [], ensure_ascii=False),
+                 json.dumps(mentions or [], ensure_ascii=False)),
             )
             self._conn().commit()
             return True
@@ -114,6 +120,22 @@ class MessageBox:
                 "ORDER BY id DESC LIMIT 1", (class_,)).fetchone()
         return row["ts"] if row else None
 
+    def latest_ts_from(self, senders, class_: Optional[str] = None) -> Optional[str]:
+        """来自指定发送者集合的最近一条未读消息时间戳（主人消息快速阅读用）。"""
+        if not senders:
+            return None
+        marks = ",".join("?" * len(senders))
+        if class_ is None:
+            row = self._conn().execute(
+                f"SELECT ts FROM messages WHERE read = 0 AND sender IN ({marks}) "
+                "ORDER BY id DESC LIMIT 1", list(senders)).fetchone()
+        else:
+            row = self._conn().execute(
+                f"SELECT ts FROM messages WHERE read = 0 AND sender IN ({marks}) "
+                "AND class = ? ORDER BY id DESC LIMIT 1",
+                list(senders) + [class_]).fetchone()
+        return row["ts"] if row else None
+
     def mark_read_by_msg_id(self, msg_id: Optional[str]) -> None:
         """按 envelope id 标记已读（被立即唤醒的消息从收件箱消失）。"""
         if not msg_id:
@@ -139,8 +161,8 @@ class MessageBox:
         since_ts 显式给出 = 时间回溯（含已读，默认不改已读标记）；
         否则只展开未读，并在 mark_read=True 时把本次返回的条目标记已读。
         """
-        sql = ["SELECT id, msg_id, class, peer, sender, text, ts, read, attachments"
-               " FROM messages WHERE 1=1"]
+        sql = ["SELECT id, msg_id, class, peer, sender, text, ts, read, attachments,"
+               " mentions FROM messages WHERE 1=1"]
         params: list = []
         if class_:
             sql.append("AND class = ?")
@@ -161,6 +183,10 @@ class MessageBox:
                 r["attachments"] = json.loads(r.get("attachments") or "[]")
             except ValueError:
                 r["attachments"] = []
+            try:
+                r["mentions"] = json.loads(r.get("mentions") or "[]")
+            except ValueError:
+                r["mentions"] = []
         if mark_read and rows and since_ts is None:
             ids = [r["id"] for r in rows]
             self._conn().execute(
