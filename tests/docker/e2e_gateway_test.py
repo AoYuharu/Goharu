@@ -26,6 +26,25 @@ def main() -> int:
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHON"] = VENV_PY
 
+    # 端口隔离：复制 config 到临时文件并把 gateway.rpc_port 设为 0（纯 stdio 模式），
+    # 避免与本机已在运行的 Goharu 实例抢占 rpc 端口导致单实例守卫拒绝启动。
+    import re
+    import tempfile
+    cfg_src = os.path.join(CWD, "config.yaml")
+    if os.path.exists(cfg_src):
+        txt = open(cfg_src, encoding="utf-8").read()
+        txt2 = re.sub(r"(?m)^(\s*rpc_port:\s*)\d+", r"\g<1>0", txt, count=1)
+        # 关掉首启慢/联网的子系统，隔离出核心(LLM+工具+循环)做快速验收
+        txt2 = re.sub(r"(?m)(bootstrap:\n\s*enabled:\s*)true", r"\g<1>false", txt2)
+        txt2 = re.sub(r"(?m)(upgrade:\n\s*enabled:\s*)true", r"\g<1>false", txt2)
+        txt2 = re.sub(r"(?m)(^agentnet:\n\s*enabled:\s*)true", r"\g<1>false", txt2)
+        # 放在仓库目录内：config 里的相对路径（./prompts 等）按 config 所在目录解析，
+        # 放 tempdir 会导致 E:\Temp\prompts\actor\base.md 找不到。
+        tmp_cfg = os.path.join(CWD, ".e2e_tmp_config.yaml")
+        with open(tmp_cfg, "w", encoding="utf-8") as f:
+            f.write(txt2)
+        env["CONFIG_FILE"] = tmp_cfg
+
     proc = subprocess.Popen(
         [VENV_PY, "-u", os.path.join(CWD, "Gateway", "gateway_entry.py")],
         cwd=CWD, env=env,
@@ -117,6 +136,11 @@ def main() -> int:
             print("  [agent.error]", pl.get("message"))
 
     proc.kill()
+    try:
+        if env.get("CONFIG_FILE") and os.path.exists(env["CONFIG_FILE"]):
+            os.remove(env["CONFIG_FILE"])
+    except Exception:
+        pass
     print("\n=== 验收结果 ===")
     print("调用的工具:", tool_calls or "（无）")
     print("回复:", (answer or "").strip()[:300] if answer else "（无）")
