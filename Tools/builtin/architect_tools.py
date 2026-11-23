@@ -11,10 +11,25 @@ import json
 import logging
 
 from Tools.registry import registry
+from Tools.config_proxy import write_config
 
 logger = logging.getLogger(__name__)
 
 _VALID_KINDS = ("guardian", "audit", "introspect", "explore")
+
+
+def _coerce_scalar(value):
+    """与 Gateway agent.update_config 一致的标量类型转换。"""
+    if not isinstance(value, str):
+        return value
+    if value.lower() == "true":
+        return True
+    if value.lower() == "false":
+        return False
+    try:
+        return float(value) if "." in value else int(value)
+    except (ValueError, TypeError):
+        return value
 
 
 async def ConsultArchitect(request: str, kind: str = "introspect",
@@ -78,6 +93,27 @@ async def MessageHero(message: str, to: str = "hero") -> str:
     return json.dumps({"status": "ok", "sent": sent}, ensure_ascii=False)
 
 
+async def SetConfig(key: str, value: str) -> str:
+    """修改 config.yaml 的某个配置项（点分路径）并写回磁盘。
+
+    Args:
+        key: 点分配置路径，如 network.proxy.url
+        value: 新值（自动标量转换：true/false→布尔、数字→int/float、其余→字符串；
+               仅支持标量，改列表/复合结构请用 Edit 工具改 config.yaml）
+    """
+    if not key:
+        return json.dumps({"error": "缺少 key"}, ensure_ascii=False)
+    v = _coerce_scalar(value)
+    try:
+        old, new = write_config(key, v)
+    except Exception as e:
+        return json.dumps({"error": f"写入配置失败: {e}"}, ensure_ascii=False)
+    logger.info("SetConfig: %s = %r (was %r)", key, new, old)
+    return json.dumps(
+        {"status": "ok", "key": key, "old_value": old, "new_value": new},
+        ensure_ascii=False, default=str)
+
+
 registry.register(
     name="MessageHero",
     description="""Send a message from Architect to the main Goharu agent (Hero) and/or the user.
@@ -97,6 +133,29 @@ Use sparingly — one concise message per finding. Do NOT start a chat loop; if 
         "required": ["message"],
     },
     handler=MessageHero,
+    group="agent",
+)
+
+
+registry.register(
+    name="SetConfig",
+    description="""Modify a Goharu configuration value in config.yaml (dotted key path) and persist it to disk.
+
+Architect uses this to adjust system configuration. Primary use — network proxy: SetConfig("network.proxy.url", "socks5://127.0.0.1:7897") to route GitHub/arXiv through a proxy, or SetConfig("network.proxy.url", "") to clear it.
+
+Values are auto-coerced: "true"/"false"→bool, numeric→int/float, else string. Only scalar values are supported; to edit lists or compound structures (e.g. network.proxy.rules) use the Edit tool on config.yaml instead.
+Changes take effect for components that read config at call time (the GitHub update listener re-reads the proxy every poll cycle). Returns the old and new value.""",
+    arguments_schema={
+        "type": "object",
+        "properties": {
+            "key": {"type": "string",
+                    "description": "Dotted config key path, e.g. network.proxy.url"},
+            "value": {"type": "string",
+                      "description": "New value (auto-coerced to bool/int/float/string)"},
+        },
+        "required": ["key", "value"],
+    },
+    handler=SetConfig,
     group="agent",
 )
 

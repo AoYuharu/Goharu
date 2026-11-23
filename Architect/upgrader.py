@@ -10,29 +10,84 @@ GitUpdateSource：拉式唤醒源（WakeSource 协议首个实现）——定期
 """
 
 import logging
+import re
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+
+def _host_of(url: str) -> str:
+    """从远端 URL 提取 host，支持 https://host/path 与 scp 形式 git@host:path。"""
+    if not url:
+        return ""
+    if "://" in url:
+        return (urlparse(url).hostname or "").lower()
+    m = re.match(r"^[^@]+@([^:]+):", url)
+    return (m.group(1).lower() if m else "")
+
+
+def _host_in_rules(host: str, rules) -> bool:
+    """host 命中规则（精确或子域名）即视为需要走代理。"""
+    host = (host or "").lower()
+    for r in rules or []:
+        r = str(r).strip().lower()
+        if r and (host == r or host.endswith("." + r)):
+            return True
+    return False
+
+
+def _proxy_args_for_remote(run_git, repo_dir: str, remote: str, proxy_provider) -> list:
+    """计算作用于该 remote 的 `git -c http.<scheme>://<host>/.proxy=<url>` 参数。
+
+    proxy_provider 为可调用对象，返回 (url, rules)：url 非空且该 remote 的 host
+    命中 rules 时才返回代理参数；否则返回 []（不注入，跟随 git config/系统默认，
+    不破坏既有行为）。仅对 http(s) 远端生效（ssh 远端 git 的 http.proxy 不适用）。
+    """
+    if not proxy_provider:
+        return []
+    try:
+        url, rules = proxy_provider()
+    except Exception:
+        return []
+    if not url:
+        return []
+    r = run_git(repo_dir, "config", "--get", f"remote.{remote}.url")
+    if not r.get("ok"):
+        return []
+    remote_url = (r.get("output") or "").strip()
+    if "://" not in remote_url:
+        return []
+    scheme = urlparse(remote_url).scheme or "https"
+    if scheme not in ("http", "https"):
+        return []
+    host = _host_of(remote_url)
+    if not _host_in_rules(host, rules):
+        return []
+    return ["-c", f"http.{scheme}://{host}/.proxy={url}"]
 
 
 class Upgrader:
     def __init__(self, repo_dir: str = ".",
                  staging_dir: str = "runtime_memory/upgrade_staging",
                  remote: str = "origin", branch: str = "master",
-                 run_git=None):
+                 run_git=None, proxy_provider=None):
         self.repo_dir = str(repo_dir)
         self.staging_dir = str(staging_dir)
         self.remote = str(remote)
         self.branch = str(branch)
         self._run_git = run_git or self._default_run_git
+        self._proxy_provider = proxy_provider
 
     # ------------------------------------------------------------------
 
     def fetch_staging(self) -> dict:
         """fetch 远端并检出到 staging worktree。幂等：已存在先移除重建。"""
-        r = self._git("fetch", self.remote, self.branch)
+        proxy = _proxy_args_for_remote(
+            self._run_git, self.repo_dir, self.remote, self._proxy_provider)
+        r = self._git(*proxy, "fetch", self.remote, self.branch)
         if not r["ok"]:
             return {"ok": False, "error": f"git fetch: {r['output']}"}
 
@@ -99,13 +154,14 @@ class GitUpdateSource:
 
     def __init__(self, repo_dir: str = ".", remote: str = "origin",
                  branch: str = "master", check_interval_seconds: int = 1800,
-                 run_git=None):
+                 run_git=None, proxy_provider=None):
         self.repo_dir = str(repo_dir)
         self.remote = str(remote)
         self.branch = str(branch)
         self.check_interval = int(
             check_interval_seconds if check_interval_seconds is not None else 1800)
         self._run_git = run_git or Upgrader._default_run_git
+        self._proxy_provider = proxy_provider
         self._last_check = 0.0
         self._accepted_sha = None
 
@@ -124,7 +180,9 @@ class GitUpdateSource:
         self._last_check = now
 
         ref = f"{self.remote}/{self.branch}"
-        r = self._run_git(self.repo_dir, "fetch", self.remote, self.branch)
+        proxy = _proxy_args_for_remote(
+            self._run_git, self.repo_dir, self.remote, self._proxy_provider)
+        r = self._run_git(self.repo_dir, *proxy, "fetch", self.remote, self.branch)
         if not r["ok"]:
             logger.warning("git_update fetch failed: %s", r["output"][:200])
             return None

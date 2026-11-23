@@ -62,3 +62,19 @@ def get_config():
         return config
     except ImportError:
         return ConfigView({})
+
+
+def write_config(key, value):
+    """写入配置键并持久化，返回 (old_value, new_value)。
+
+    底层是 Goharu 全局 `Configuration`（带 set/save）时走其 merge 式落盘，
+    与 Gateway `agent.update_config` 同一条写路径。注入的纯 dict/ConfigView
+    无持久化能力时抛 RuntimeError（调用方据此优雅降级）。
+    """
+    cfg = get_config()
+    old = cfg.get(key)
+    if hasattr(cfg, "set") and hasattr(cfg, "save"):
+        cfg.set(key, value)
+        cfg.save()
+        return old, cfg.get(key)
+    raise RuntimeError("当前配置后端不支持写入持久化（仅 Goharu 全局 Configuration 可写）")

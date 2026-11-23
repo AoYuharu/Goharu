@@ -139,4 +139,13 @@ export const CONFIG_CATALOG: ConfigEntry[] = [
     tips: "启用后，某些命令会要求用户确认后才执行",
     group: "🔒 工具安全",
   },
+  {
+    key: "network.proxy.url",
+    name: "出站代理地址",
+    type: "str",
+    description: "命中 network.proxy.rules 的 host（默认 GitHub/arXiv）的请求走该代理；Arch 的 GitHub 更新监听也走它",
+    default: "",
+    tips: "如 socks5://127.0.0.1:7897；留空 = 跟随 git config/系统默认。规则列表改 config.yaml 的 network.proxy.rules（或让 Arch 用 SetConfig）",
+    group: "🌐 网络代理",
+  },
 ];

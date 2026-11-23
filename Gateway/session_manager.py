@@ -296,6 +296,11 @@ class SessionManager:
                         branch=up_cfg.get("branch", "master"),
                         check_interval_seconds=up_cfg.get(
                             "check_interval_seconds", 1800),
+                        # 代理按调用时读取（panel/SetConfig 改了 network.proxy 下周期生效）
+                        proxy_provider=lambda: (
+                            config.get("network.proxy.url", ""),
+                            config.get("network.proxy.rules", []),
+                        ),
                     ))
                     get_default_hub().start_scheduler()
         except Exception as e:

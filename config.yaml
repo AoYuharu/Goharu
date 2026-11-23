@@ -78,6 +78,12 @@ agentnet:
   - windows
   identity_dir: ./runtime_memory/agentnet/identity
   messagebox_path: ./runtime_memory/agentnet/messagebox.db
+network:
+  proxy:
+    url: ""                        # 出站代理地址（如 socks5://127.0.0.1:7897）；空 = 跟随 git config/系统默认
+    rules:                         # 仅命中这些 host 的请求走代理（默认 GitHub + arXiv，可按需扩展）
+    - github.com
+    - arxiv.org
 prompt:
   system:
     shared: []
