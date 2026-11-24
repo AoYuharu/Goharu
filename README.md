@@ -57,7 +57,7 @@ goharu gateway log [N]      # 看守护日志末尾 N 行
 
 已克隆仓库则运行 `./install.sh`（Windows 用 `install.bat`），等价进入引导。
 
-卸载：`./uninstall.sh`（默认清干净端机：进程/服务/全局命令/依赖/数据/密钥；`--keep-data` 保留记忆数据）。
+卸载：**`goharu uninstall`**（安装后任意目录可用；等价 `./uninstall.sh` / `uninstall.bat`）。默认清干净端机：RPC 优雅停 → 杀 gateway/TUI（含目录已删的幽灵守护，不依赖 ps/pkill/wmic）→ 移除 systemd 服务与全局命令 → 删 venv/node_modules/dist/数据/.env。`--keep-data` 保留记忆数据；`--stop-only` 只停进程不删文件；`--dry-run` 预演；非交互环境加 `--yes`。
 
 ## 配置
 
