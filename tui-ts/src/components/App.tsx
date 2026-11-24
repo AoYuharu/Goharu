@@ -50,7 +50,7 @@ import { PromptEditorScreen } from "../screens/PromptEditorScreen.js";
 import { ConfigEditorScreen } from "../screens/ConfigEditorScreen.js";
 import { ChannelsEditorScreen } from "../screens/ChannelsEditorScreen.js";
 import { ToolsScreen } from "../screens/ToolsScreen.js";
-import type { ToolInfo } from "../gateway/protocol.js";
+import type { ChannelHealthRow, ToolInfo } from "../gateway/protocol.js";
 
 type ScreenName = "textviewer" | "promptcache" | "prompteditor" | "config" | "tools" | "channels";
 type BrowseMode = "none" | "agents";
@@ -1725,10 +1725,13 @@ export function App({ mock = false }: { mock?: boolean }) {
         onResult={(msg) => addRef.current({ kind: "system", text: msg })}
         onHealth={() => (gatewayRef.current
           ? gatewayRef.current.call("channels.health", {})
-          : Promise.resolve([])) as Promise<Array<{
-          session: string; type: string; channel_id: string; name: string;
-          ok: boolean; state: string; detail: string;
-        }>>}
+          : Promise.resolve([])) as Promise<ChannelHealthRow[]>}
+        onReconnect={(channelId) => (gatewayRef.current
+          ? gatewayRef.current.call("channels.reconnect", { channel_id: channelId })
+          : Promise.resolve({ ok: false, error: "gateway 未就绪" }))}
+        onSetPassword={(channelId, password) => (gatewayRef.current
+          ? gatewayRef.current.call("channels.set_password", { channel_id: channelId, password })
+          : Promise.resolve({ ok: false, error: "gateway 未就绪" }))}
       />
       <ToolsScreen
         active={screen === "tools"}

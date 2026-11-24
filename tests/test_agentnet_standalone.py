@@ -108,7 +108,7 @@ def main():
         asyncio.run(loopback_test(root))
 
         # ---------------------------------------------------------- 5. channel + 工具
-        print("\n[5] AgentNetChannel + agentnet_* 工具接线")
+        print("\n[5] HaruNetChannel + harunet_* 工具接线")
         asyncio.run(channel_test(root))
 
         # ---------------------------------------------------------- 6. 附件
@@ -286,16 +286,16 @@ async def loopback_test(root: Path):
 
 
 async def channel_test(root: Path):
-    """channel 全链路：hub + AgentNetChannel(goharu) + 对端 SDK 客户端。
+    """channel 全链路：hub + HaruNetChannel(goharu) + 对端 SDK 客户端。
 
     验证：dm → emit_inbound 唤醒（含标注）；群消息静默入盒；
-    摘要便利贴；send_answer 回中继；agentnet_* 工具动作。
+    摘要便利贴；send_answer 回中继；harunet_* 工具动作。
     """
     from AgentNet.client import AgentNetClient
     from AgentNet.server.hub import HubServer
     from AgentNet.server.observer import ObserverServer
-    from Gateway.channels.agentnet_channel import AgentNetChannel
-    from Tools.builtin import agentnet_tools
+    from Gateway.channels.harunet_channel import HaruNetChannel
+    from Tools.builtin import harunet_tools
 
     port, oport = free_port(), free_port()
     id_g = Identity.load_or_create(root / "ch_goharu", name="goharu")
@@ -318,7 +318,7 @@ async def channel_test(root: Path):
     await asyncio.sleep(0.3)
 
     inbound = []
-    ch = AgentNetChannel("agentnet_test", {
+    ch = HaruNetChannel("agentnet_test", {
         "url": f"ws://127.0.0.1:{port}",
         "http_base": f"http://127.0.0.1:{oport}",
         "name": "goharu",
@@ -327,7 +327,7 @@ async def channel_test(root: Path):
     })
     ch.bind(lambda msg: inbound.append(msg))
     ch.start()
-    agentnet_tools.set_agentnet_handle(ch)
+    harunet_tools.set_harunet_handle(ch)
 
     # 对端 SDK 客户端（模拟另一个智能体）
     box_x = MessageBox(root / "ch_box_x" / "box.db")
@@ -383,17 +383,17 @@ async def channel_test(root: Path):
         check("便利贴摘要", extras and "📬" in extras[0], str(extras))
 
         # 工具：summary / read / reply / presence
-        s = json.loads(await agentnet_tools.agentnet_summary())
+        s = json.loads(await harunet_tools.harunet_summary())
         # 唤醒即已读：mention/dm 在入盒时就被标记（内容已进合并上下文），
         # 未读只剩未唤醒的群闲聊
         check("唤醒消息不占未读", s.get("ok") and s["unread"] == 1, str(s)[:120])
-        r = json.loads(await agentnet_tools.agentnet_read(class_="group"))
+        r = json.loads(await harunet_tools.harunet_read(class_="group"))
         check("工具 read 展开+标已读", r.get("ok") and r["count"] == 1
               and ch.box.summary().get("group") is None, str(r)[:120])
-        p = json.loads(await agentnet_tools.agentnet_presence())
+        p = json.loads(await harunet_tools.harunet_presence())
         check("工具 presence", p.get("ok") and p["agents"].get(id_x.agent_id, {}).get("online"),
               str(p)[:120])
-        rp = json.loads(await agentnet_tools.agentnet_reply(
+        rp = json.loads(await harunet_tools.harunet_reply(
             text="收到你的私聊了", mentions=[id_x.agent_id]))
         check("工具 reply（广播+@）", rp.get("ok"), str(rp))
         check("reply 触达对端", await wait(lambda: len(received_x) == 1, label="reply"))
@@ -508,7 +508,7 @@ async def channel_test(root: Path):
         ch._group_inline_max_chars = 1500
 
         # update_profile：工具更新档案 → 落盘 + hub presence 即时生效
-        up = json.loads(await agentnet_tools.agentnet_update_profile(
+        up = json.loads(await harunet_tools.harunet_update_profile(
             focus="代码与组网协作", tags=["coding", "agentnet"]))
         check("工具 update_profile", up.get("ok"), str(up))
         ok = await wait(
@@ -695,7 +695,7 @@ async def channel_test(root: Path):
                         is False, label="attentive off")
         check("关注期退出上报观察台", ok, str(hub.presence.snapshot()[id_g.agent_id]))
     finally:
-        agentnet_tools.set_agentnet_handle(None)
+        harunet_tools.set_harunet_handle(None)
         ch.stop()
         await client_x.close()
         tx.cancel()
@@ -1410,9 +1410,9 @@ async def reliability_test(root: Path):
           f"{time.time()-started:.2f}s")
 
     # ---------- channel 离线与同 loop 非阻塞 profile 上报 ----------
-    from Gateway.channels.agentnet_channel import AgentNetChannel
+    from Gateway.channels.harunet_channel import HaruNetChannel
 
-    ch = AgentNetChannel.__new__(AgentNetChannel)
+    ch = HaruNetChannel.__new__(HaruNetChannel)
     ch.identity = a
     ch._connected = asyncio.Event()
     ch._connected.set()
@@ -1768,11 +1768,11 @@ async def security_control_test(root: Path):
 
 
 def reconnect_tool_test():
-    """agentnet_reconnect() → channel.net_reconnect_fut。"""
+    """harunet_reconnect() → channel.net_reconnect_fut。"""
     import asyncio as _aio
     from concurrent.futures import Future
 
-    from Tools.builtin import agentnet_tools
+    from Tools.builtin import harunet_tools
 
     class FakeHandle:
         def __init__(self):
@@ -1785,13 +1785,13 @@ def reconnect_tool_test():
             return fut
 
     h = FakeHandle()
-    old = agentnet_tools._handle
+    old = harunet_tools._handle
     try:
-        agentnet_tools.set_agentnet_handle(h)
-        out = _aio.run(agentnet_tools.agentnet_reconnect())
+        harunet_tools.set_harunet_handle(h)
+        out = _aio.run(harunet_tools.harunet_reconnect())
         check("工具触发主动重连", h.kicked and '"ok": true' in out, out)
     finally:
-        agentnet_tools.set_agentnet_handle(old)
+        harunet_tools.set_harunet_handle(old)
 
 
 def security_unit_test():

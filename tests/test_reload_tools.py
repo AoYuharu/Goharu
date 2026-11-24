@@ -212,16 +212,16 @@ def main():
         reset_config()
 
     # 6. 条件工具句柄：ReloadTools 后仍保持宿主注入的同一对象
-    print("\n[6] agentnet/floor 条件工具句柄保持")
-    from Tools.builtin import agentnet_tools, floor_tools
+    print("\n[6] harunet/floor 条件工具句柄保持")
+    from Tools.builtin import harunet_tools, floor_tools
     sentinel = object()
-    agentnet_tools.set_agentnet_handle(sentinel)
+    harunet_tools.set_harunet_handle(sentinel)
     floor_tools.set_floor_handle(sentinel)
     reload_tools(modules=[
-        "Tools.builtin.agentnet_tools", "Tools.builtin.floor_tools"])
-    check("agentnet 句柄 reload 后保持", agentnet_tools._handle is sentinel)
+        "Tools.builtin.harunet_tools", "Tools.builtin.floor_tools"])
+    check("harunet 句柄 reload 后保持", harunet_tools._handle is sentinel)
     check("floor 句柄 reload 后保持", floor_tools._handle is sentinel)
-    agentnet_tools.set_agentnet_handle(None)
+    harunet_tools.set_harunet_handle(None)
     floor_tools.set_floor_handle(None)
 
     print("\n" + "=" * 60)

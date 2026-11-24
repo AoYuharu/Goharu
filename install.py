@@ -338,7 +338,7 @@ def _form_sections() -> list[dict]:
             {"key": "harunet_url", "label": "hub 地址", "type": "str", "hint": "Enter 输入 ws:// 地址",
              "show_if": lambda v: v["harunet"]},
             {"key": "harunet_name", "label": "网络昵称", "type": "str",
-             "placeholder": "（默认 config agentnet.name）", "hint": "Enter 输入；留空用默认",
+             "placeholder": "（默认 config harunet.name）", "hint": "Enter 输入；留空用默认",
              "show_if": lambda v: v["harunet"]},
             {"key": "harunet_password", "label": "接入密码", "type": "secret",
              "hint": "Enter 输入（不可见；回车保持，输入 - 清空）；输错可再进来重输",
@@ -825,32 +825,32 @@ def step_write_channels(ch: dict) -> None:
         open(env_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
         info("已写入 QQ Bot 凭据到 .env")
     cfg_path = os.path.join(REPO_DIR, "config.yaml")
-    # HaruNet 接入开关：.env AGENTNET_ENABLED=true/false（机器级覆盖；config 默认 false）
+    # HaruNet 接入开关：.env HARUNET_ENABLED=true/false（机器级覆盖；config 默认 false）
     har = ch.get("harunet")
     if har is not None:
         enabled = bool(har.get("enabled", True))
         lines = (open(env_path, encoding="utf-8").read().splitlines()
                  if os.path.exists(env_path) else [])
-        lines = _set_env_line(lines, "AGENTNET_ENABLED",
+        lines = _set_env_line(lines, "HARUNET_ENABLED",
                               "true" if enabled else "false")
         if enabled:
             if har.get("name"):
-                lines = _set_env_line(lines, "AGENTNET_NAME", har["name"])
+                lines = _set_env_line(lines, "HARUNET_NAME", har["name"])
             if har.get("password"):
-                lines = _set_env_line(lines, "AGENTNET_PASSWORD", har["password"])
+                lines = _set_env_line(lines, "HARUNET_PASSWORD", har["password"])
         open(env_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
-        info("已写入 AGENTNET_ENABLED=%s 到 .env" % ("true" if enabled else "false"))
+        info("已写入 HARUNET_ENABLED=%s 到 .env" % ("true" if enabled else "false"))
     if not os.path.exists(cfg_path):
         return
     txt = open(cfg_path, encoding="utf-8").read()
     changed = False
-    # HaruNet → agentnet.url（config 里唯一 ws:// 的那行）
+    # HaruNet → harunet.url（config 里唯一 ws:// 的那行）
     if har and har.get("url"):
         t2 = re.sub(r"(?m)^(\s*url:\s*)ws://\S+",
                     lambda m: m.group(1) + har["url"], txt, count=1)
         if t2 != txt:
             txt, changed = t2, True
-            info(f"agentnet.url → {har['url']}")
+            info(f"harunet.url → {har['url']}")
     # 代理 → network.proxy.url（4 空格缩进、空引号的那行）
     if ch.get("proxy"):
         t2 = re.sub(r'(?m)^(    url:\s*)""',
@@ -917,7 +917,7 @@ def main() -> int:
     if not provider.get("key"):
         print(f"    {c('yellow', '提醒: 尚未配置 LLM 密钥，编辑 .env 后再启动')}")
     if channels.get("harunet"):
-        print(f"    组网: {c('green', 'HaruNet 已启用')}（首次握手若被拒，检查接入密码或让智能体 agentnet_reconnect）")
+        print(f"    组网: {c('green', 'HaruNet 已启用')}（首次握手若被拒，检查接入密码或让智能体 harunet_reconnect）")
 
     if confirm("现在立即启动 Goharu？", default=False):
         vp = _venv_py()

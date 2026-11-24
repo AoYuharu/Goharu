@@ -34,13 +34,43 @@ from Gateway.plan_mode import PlanModeGate
 logger = logging.getLogger(__name__)
 
 
-def _agentnet_enabled() -> bool:
-    """是否接入 HaruNet：环境变量 AGENTNET_ENABLED 优先（机器级覆盖不必进 git），
-    其次 config agentnet.enabled（仓库默认 false——接入是显式选择）。"""
-    env = os.environ.get("AGENTNET_ENABLED")
-    if env is not None and env.strip():
+def _henv(suffix: str) -> str:
+    """HaruNet 环境变量：HARUNET_<suffix> 优先，旧名 AGENTNET_<suffix> 兼容。"""
+    return (os.environ.get(f"HARUNET_{suffix}")
+            or os.environ.get(f"AGENTNET_{suffix}") or "")
+
+
+def _hcfg(key: str, default=None):
+    """HaruNet 配置键：harunet.<key> 优先，旧节 agentnet.<key> 兼容。"""
+    v = config.get(f"harunet.{key}")
+    return v if v is not None else config.get(f"agentnet.{key}", default)
+
+
+def _harunet_enabled() -> bool:
+    """是否接入 HaruNet：环境变量 HARUNET_ENABLED（旧 AGENTNET_ENABLED）优先——
+    机器级覆盖不必进 git；其次 config harunet.enabled（默认 false，接入是显式选择）。"""
+    env = _henv("ENABLED")
+    if env.strip():
         return env.strip().lower() in ("1", "true", "yes", "on")
-    return bool(config.get("agentnet.enabled", False))
+    return bool(_hcfg("enabled", False))
+
+
+def _write_env_var(key: str, value: str) -> None:
+    """行级写入仓库根 .env（保留其他行），供 harunet_set_password 持久化。"""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    lines = (open(path, encoding="utf-8").read().splitlines()
+             if os.path.exists(path) else [])
+    out, found = [], False
+    for ln in lines:
+        if ln.strip().startswith(key + "="):
+            out.append(f"{key}={value}")
+            found = True
+        else:
+            out.append(ln)
+    if not found:
+        out.append(f"{key}={value}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
 
 
 class SessionManager:
@@ -61,7 +91,7 @@ class SessionManager:
         self.sessions: dict = {}     # session_id → AgentSession
         self._channel_session: dict = {}  # channel 实例 → session_id
         self.default_session_id = "default"
-        self._agentnet_channel = None
+        self._harunet_channel = None
         self._error_unsubs: list = []
 
     # ------------------------------------------------------------------
@@ -144,9 +174,9 @@ class SessionManager:
 
         # ── 条件工具组必须在首次工具定义快照前注册（import 即注册）──
         # 决策在组合根；未接入 HaruNet 时连工具描述都不进上下文。
-        self.agentnet_enabled = _agentnet_enabled()
-        if self.agentnet_enabled:
-            from Tools.builtin import agentnet_tools, floor_tools
+        self.harunet_enabled = _harunet_enabled()
+        if self.harunet_enabled:
+            from Tools.builtin import harunet_tools, floor_tools
 
         # ── 工具运行时（hooks 把全局工具事件路由到目标 session 广播）──
         self.runtime = await create_tools(
@@ -181,8 +211,8 @@ class SessionManager:
         #    决策在组合根；Prompting/Agent 只认"加载器"这个通用缝 ──
         from Prompting.api import create_prompt_loader
         prompt_loader = create_prompt_loader(PromptSectionsOverlay(
-            config, actor=["./prompts/actor/agentnet.md"]
-            if self.agentnet_enabled else []))
+            config, actor=["./prompts/actor/harunet.md"]
+            if self.harunet_enabled else []))
 
         # ── 外部 channel 插件 ──
         load_plugins(config.get("channels.plugins", []))
@@ -247,43 +277,35 @@ class SessionManager:
                         sid, max_messages,
                         [f"{c.channel_type}#{c.channel_id}" for c in session.channels])
 
-        # ── AgentNet 组网 channel（可选，挂到 default session）──
-        if self.agentnet_enabled:
+        # ── HaruNet 组网 channel（可选，挂到 default session）──
+        if self.harunet_enabled:
             try:
                 session = self.sessions[self.default_session_id]
-                ch = create_channel("agentnet", "agentnet_main", {
-                    "url": config.get("agentnet.url", "ws://127.0.0.1:7878"),
-                    "http_base": config.get("agentnet.http_base", ""),
+                ch = create_channel("harunet", "harunet_main", {
+                    "url": _hcfg("url", "ws://127.0.0.1:7878"),
+                    "http_base": _hcfg("http_base", ""),
                     # 环境变量优先：多机部署时机器专属身份名不必进 git
-                    "name": os.environ.get("AGENTNET_NAME")
-                    or config.get("agentnet.name", "goharu"),
+                    "name": _henv("NAME") or _hcfg("name", "goharu"),
                     # 接入密码（env 优先，敏感信息不进 git）：新设备凭它自动登记
-                    "password": os.environ.get("AGENTNET_PASSWORD")
-                    or config.get("agentnet.password", ""),
-                    # 握手被拒后的重试间隔（秒；agentnet_reconnect 可跳过）
-                    "reject_backoff_seconds": int(
-                        config.get("agentnet.reject_backoff_seconds", 600) or 600),
-                    "identity_dir": config.get(
-                        "agentnet.identity_dir", "./runtime_memory/agentnet/identity"),
-                    "messagebox_path": config.get(
-                        "agentnet.messagebox_path", "./runtime_memory/agentnet/messagebox.db"),
-                    "focus": config.get("agentnet.focus", ""),
-                    "tags": config.get("agentnet.tags", []),
-                    "owner_ids": list(config.get("agentnet.owner_ids") or []),
-                    "quiet_seconds": float(config.get("agentnet.quiet_seconds", 120)),
-                    "owner_quiet_seconds": float(
-                        config.get("agentnet.owner_quiet_seconds", 15)),
-                    "group_inline_max_chars": int(
-                        config.get("agentnet.group_inline_max_chars", 1500)),
-                    "attention_seconds": float(
-                        config.get("agentnet.attention_seconds", 300)),
-                    "agent_pingpong_limit": int(
-                        config.get("agentnet.agent_pingpong_limit", 3)),
+                    "password": _henv("PASSWORD") or _hcfg("password", ""),
+                    # 握手被拒后的重试间隔（秒；harunet_reconnect 可跳过）
+                    "reject_backoff_seconds": int(_hcfg("reject_backoff_seconds", 600) or 600),
+                    "identity_dir": _hcfg("identity_dir", "./runtime_memory/agentnet/identity"),
+                    "messagebox_path": _hcfg("messagebox_path", "./runtime_memory/agentnet/messagebox.db"),
+                    "focus": _hcfg("focus", ""),
+                    "tags": _hcfg("tags", []),
+                    "owner_ids": list(_hcfg("owner_ids") or []),
+                    "quiet_seconds": float(_hcfg("quiet_seconds", 120)),
+                    "owner_quiet_seconds": float(_hcfg("owner_quiet_seconds", 15)),
+                    "group_inline_max_chars": int(_hcfg("group_inline_max_chars", 1500)),
+                    "attention_seconds": float(_hcfg("attention_seconds", 300)),
+                    "agent_pingpong_limit": int(_hcfg("agent_pingpong_limit", 3)),
                 })
                 session.attach_channel(ch)
                 ch.bind(session.enqueue)
+                ch.set_env_writer(_write_env_var)   # harunet_set_password 写回 .env 用
                 ch.start()
-                self._agentnet_channel = ch
+                self._harunet_channel = ch
                 # 网络话语权入队关卡（channel 之前）+ floor_* 工具句柄
                 try:
                     session.set_floor_context(
@@ -292,15 +314,15 @@ class SessionManager:
                 except Exception as e:
                     logger.warning("floor gate 装配失败（话语权功能关闭）: %s", e)
                 # 工具句柄 + 状态自报（任一会话处理中即 working）+ 摘要便利贴
-                agentnet_tools.set_agentnet_handle(ch)
+                harunet_tools.set_harunet_handle(ch)
                 ch.set_state_provider(
                     lambda: "working" if any(s._processing for s in self.sessions.values())
                     else "idle")
                 ch.set_can_auto_read(
                     lambda: not any(s._processing for s in self.sessions.values()))
-                ch.set_control_handler(self._agentnet_control)
-                ch.set_summarize_fn(self._agentnet_summarize)
-                def _agentnet_turn_extras():
+                ch.set_control_handler(self._harunet_control)
+                ch.set_summarize_fn(self._harunet_summarize)
+                def _harunet_turn_extras():
                     # 身份行常驻（改名后下一条消息即生效，昵称格式 «名字» 全提示词可 grep）
                     line = (f"你在 {NET_NAME} 的网络昵称是 {nick_token(ch.name)}——"
                             "主人和同事用这个名字称呼/@你，自我介绍时也用它。"
@@ -308,12 +330,12 @@ class SessionManager:
                             "本项目的管理、升级与维护。")
                     return [line] + ch.turn_extras()
 
-                session.memory.set_turn_extras_provider(_agentnet_turn_extras)
-                logger.info("agentnet channel ready: %s → %s",
+                session.memory.set_turn_extras_provider(_harunet_turn_extras)
+                logger.info("HaruNet channel ready: %s → %s",
                             ch.identity.agent_id, ch.url)
-                lifecycle("启动: AgentNet channel", f"{ch.identity.agent_id} → {ch.url}")
+                lifecycle("启动: HaruNet channel", f"{ch.identity.agent_id} → {ch.url}")
             except Exception as e:
-                logger.error("agentnet channel 启动失败（不阻断其余装配）: %s", e)
+                logger.error("HaruNet channel 启动失败（不阻断其余装配）: %s", e)
 
         # ── Architect ↔ Hero 双向沟通桥（Phase 1：default session）──
         # notify_user：Architect 报告 → default session 的全部 channel 广播
@@ -416,7 +438,7 @@ class SessionManager:
                 except Exception:
                     logger.warning("错误事件广播失败（session=%s）", session.session_id,
                                    exc_info=True)
-        ch = self._agentnet_channel
+        ch = self._harunet_channel
         fn = getattr(ch, "net_error_report_fut", None) if ch is not None else None
         if fn is not None:
             try:
@@ -471,12 +493,12 @@ class SessionManager:
                 logger.warning("修复失败审计记录写入失败", exc_info=True)
 
     # ------------------------------------------------------------------
-    # AgentNet 中控（观察台按钮 → hub control 消息 → agentnet channel）
+    # HaruNet 中控（观察台按钮 → hub control 消息 → HaruNet channel）
     # ------------------------------------------------------------------
 
-    def _agentnet_control(self, action: str) -> str:
-        """主人中控动作执行（agentnet channel 在收到 owner control 后调用）。"""
-        logger.info("agentnet 中控执行: %s", action)
+    def _harunet_control(self, action: str) -> str:
+        """主人中控动作执行（HaruNet channel 在收到 owner control 后调用）。"""
+        logger.info("HaruNet 中控执行: %s", action)
         if action == "clear_context":
             for s in self.sessions.values():
                 s.memory.clear_context()
@@ -502,7 +524,10 @@ class SessionManager:
         return f"未知动作: {action}"
 
     def channels_health(self) -> list:
-        """全部 session 挂载 channel 的连通/配置状态（gateway status / TUI 设置用）。"""
+        """全部 session 挂载 channel 的连通/配置状态（gateway status / TUI 设置用）。
+
+        含 params（TUI 详情页展示/编辑用；敏感字段由前端按键名脱敏显示）。
+        """
         rows = []
         for sid, session in self.sessions.items():
             for ch in session.channels:
@@ -515,9 +540,43 @@ class SessionManager:
                     "type": ch.channel_type,
                     "channel_id": ch.channel_id,
                     "name": getattr(ch, "name", ch.channel_id),
+                    "params": dict(getattr(ch, "params", {}) or {}),
                     **h,
                 })
         return rows
+
+    def _find_channel(self, channel_id: str):
+        for session in self.sessions.values():
+            for ch in session.channels:
+                if ch.channel_id == channel_id:
+                    return ch
+        return None
+
+    def channel_reconnect(self, channel_id: str) -> dict:
+        """TUI「重连」：让长连接 channel 立即重试（跳过退避）。"""
+        ch = self._find_channel(channel_id)
+        if ch is None:
+            return {"ok": False, "error": f"未找到 channel: {channel_id}"}
+        fn = getattr(ch, "net_reconnect_fut", None)
+        if fn is None:
+            return {"ok": False, "error": f"{ch.channel_type} 不支持重连"}
+        fut = fn()
+        if fut is None:
+            return {"ok": False, "error": "channel 未启动"}
+        return {"ok": True, "note": "已触发立即重连（数秒内重新握手）"}
+
+    def channel_set_password(self, channel_id: str, password: str) -> dict:
+        """TUI「修改接入密码」：运行时换密码 + 写回 .env + 立即重连（仅 HaruNet）。"""
+        ch = self._find_channel(channel_id)
+        if ch is None:
+            return {"ok": False, "error": f"未找到 channel: {channel_id}"}
+        fn = getattr(ch, "net_set_password_fut", None)
+        if fn is None:
+            return {"ok": False, "error": f"{ch.channel_type} 没有接入密码"}
+        fut = fn(password)
+        if fut is None:
+            return {"ok": False, "error": "channel 未启动（密码已记录，启动时生效）"}
+        return {"ok": True, "note": "接入密码已更新并写回 .env，正在用新密码重连"}
 
     def _arch_floor_dispatch(self, question: str, reminder: str | None = None):
         """话语权=arch：把主人消息交给 Architect 派发链（worker 线程调用，可阻塞）。"""
@@ -556,7 +615,7 @@ class SessionManager:
             return "（arch 正忙，请稍后再发或收回话语权。）"
         return None
 
-    def _agentnet_summarize(self, agent_name: str, lines: list) -> str:
+    def _harunet_summarize(self, agent_name: str, lines: list) -> str:
         """群消息压缩（arch 角色）：大体量群消息摘要，关注与接收方相关的信息。"""
         from Agent.LargeLanguageModel import LargeLanguageModel
         joined = "\n".join(lines)

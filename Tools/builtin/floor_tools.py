@@ -10,7 +10,7 @@
 - floor_status ：查询当前持有者
 
 句柄由 SessionManager 装配期注入（set_floor_handle）——
-对齐 agentnet_tools.set_agentnet_handle 的解耦模式。
+对齐 harunet_tools.set_harunet_handle 的解耦模式。
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ def _json(obj) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
-_NOT_WIRED = {"ok": False, "error": "话语权未接线（agentnet 未启用或未挂载）"}
-_NOT_CONNECTED = {"ok": False, "error": "agentnet 未连接"}
+_NOT_WIRED = {"ok": False, "error": "话语权未接线（HaruNet 未启用或未挂载）"}
+_NOT_CONNECTED = {"ok": False, "error": "HaruNet 未连接"}
 
 
 async def floor_handoff(target: str = "", persona: str = "main",
@@ -119,7 +119,7 @@ registry.register(
         "required": ["target"],
     },
     handler=floor_handoff,
-    group="agentnet",
+    group="harunet",
 )
 
 registry.register(
@@ -132,7 +132,7 @@ registry.register(
     ),
     arguments_schema={"type": "object", "properties": {}},
     handler=floor_release,
-    group="agentnet",
+    group="harunet",
 )
 
 registry.register(
@@ -143,5 +143,5 @@ registry.register(
     ),
     arguments_schema={"type": "object", "properties": {}},
     handler=floor_status,
-    group="agentnet",
+    group="harunet",
 )

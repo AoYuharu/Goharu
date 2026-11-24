@@ -13,7 +13,9 @@ from Gateway.channels.registry import (
 )
 from Gateway.channels.tui_channel import TuiChannel  # noqa: F401  （注册 "tui"）
 from Gateway.channels.qqbot_channel import QQBotChannel  # noqa: F401  （注册 "qqbot"）
-from Gateway.channels.agentnet_channel import AgentNetChannel  # noqa: F401  （注册 "agentnet"）
+from Gateway.channels.harunet_channel import HaruNetChannel  # noqa: F401  （注册 "harunet"）
+# 兼容旧配置里的 type: agentnet（同一实现，别名注册）
+register_channel("agentnet")(HaruNetChannel)
 __all__ = [
     "Channel",
     "ChannelMessage",
@@ -23,4 +25,5 @@ __all__ = [
     "registered_types",
     "TuiChannel",
     "QQBotChannel",
+    "HaruNetChannel",
 ]

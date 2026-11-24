@@ -100,7 +100,10 @@ export interface ChannelHealthRow {
   ok: boolean;
   state: string;
   detail: string;
+  params?: Record<string, unknown>;
 }
+
+export interface ChannelActionResult { ok: boolean; note?: string; error?: string }
 
 export interface RpcMethods {
   "agent.send_message": { params: SendMessageParams; result: QueuedResult };
@@ -122,6 +125,8 @@ export interface RpcMethods {
   "model.get_status": { params: Record<string, never>; result: ModelStatus };
   "model.set_config": { params: ModelSetConfigParams; result: ModelSetConfigResult };
   "channels.health": { params: Record<string, never>; result: ChannelHealthRow[] };
+  "channels.reconnect": { params: { channel_id: string }; result: ChannelActionResult };
+  "channels.set_password": { params: { channel_id: string; password: string }; result: ChannelActionResult };
 }
 
 export type MethodName = keyof RpcMethods;

@@ -1,14 +1,14 @@
-"""HaruNet（AgentNet）消息盒工具组（每个动作一个独立工具）。
+"""HaruNet 消息盒工具组（每个动作一个独立工具）。
 
-拆分为 6 个工具（不再用单工具多 action）：
-  agentnet_summary / agentnet_read / agentnet_reply /
-  agentnet_presence / agentnet_update_profile / agentnet_reconnect
+拆分为 7 个工具（不再用单工具多 action）：
+  harunet_summary / harunet_read / harunet_reply /
+  harunet_presence / harunet_update_profile / harunet_reconnect / harunet_set_password
 
-句柄由宿主（Gateway SessionManager）经 set_agentnet_handle() 注入
-AgentNetChannel 门面；未注入时返回明确降级错误（透明化原则）。
+句柄由宿主（Gateway SessionManager）经 set_harunet_handle() 注入
+HaruNetChannel 门面；未注入时返回明确降级错误（透明化原则）。
 
 上下文纪律：消息默认只在 messagebox 里计数（摘要便利贴自动进上下文），
-模型主动 agentnet_read 才把完整内容拉进来——不要在每次回复前无脑 read。
+模型主动 harunet_read 才把完整内容拉进来——不要在每次回复前无脑 read。
 """
 
 import asyncio
@@ -26,7 +26,7 @@ _handle = None  # AgentNetChannel（duck-typed 门面）
 _recover_cooldown_until = 0.0  # 找不到实例后的退避截止时间（避免每次调用全堆扫描）
 
 
-def set_agentnet_handle(handle) -> None:
+def set_harunet_handle(handle) -> None:
     global _handle
     with _lock:
         _handle = handle
@@ -52,7 +52,7 @@ def _recover_handle():
     if now < _recover_cooldown_until:
         return None
     try:
-        from Gateway.channels.agentnet_channel import AgentNetChannel
+        from Gateway.channels.harunet_channel import HaruNetChannel
     except Exception:
         return None
 
@@ -60,11 +60,11 @@ def _recover_handle():
     try:
         import gc
         for obj in gc.get_objects():
-            if isinstance(obj, AgentNetChannel) and _is_live(obj):
+            if isinstance(obj, HaruNetChannel) and _is_live(obj):
                 picked = obj
                 break
     except Exception:
-        logger.exception("agentnet 句柄自动恢复失败")
+        logger.exception("HaruNet 句柄自动恢复失败")
         return None
 
     if picked is None:
@@ -76,7 +76,7 @@ def _recover_handle():
             return _handle
         _handle = picked
     logger.warning(
-        "agentnet 句柄丢失，已从运行实例自动恢复: %s",
+        "HaruNet 句柄丢失，已从运行实例自动恢复: %s",
         getattr(getattr(picked, "identity", None), "agent_id", "?"),
     )
     return picked
@@ -94,13 +94,13 @@ def _json(obj) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
-_NOT_WIRED = {"ok": False, "error": "HaruNet 未启用或未接线（config.yaml agentnet.enabled）"}
-_NOT_CONNECTED = {"ok": False, "error": "HaruNet 未连接（可用 agentnet_reconnect 立即重试）"}
+_NOT_WIRED = {"ok": False, "error": "HaruNet 未启用或未接线（config.yaml harunet.enabled / HARUNET_ENABLED）"}
+_NOT_CONNECTED = {"ok": False, "error": "HaruNet 未连接（可用 harunet_reconnect 立即重试）"}
 
 
 # ---------------------------------------------------------------- 工具实现
 
-async def agentnet_summary() -> str:
+async def harunet_summary() -> str:
     """消息盒摘要：未读分类计数 + 各会话最近一条预览（不展开正文）。"""
     h = _get()
     if h is None:
@@ -108,11 +108,11 @@ async def agentnet_summary() -> str:
     try:
         return _json({"ok": True, **h.mb_summary()})
     except Exception as e:
-        logger.exception("agentnet_summary 失败")
+        logger.exception("harunet_summary 失败")
         return _json({"ok": False, "error": str(e)})
 
 
-async def agentnet_read(class_: str | None = None, peer: str | None = None,
+async def harunet_read(class_: str | None = None, peer: str | None = None,
                         since: str | None = None, limit: int = 50) -> str:
     """展开消息（class_ ∈ mention|group；since 回溯历史；读未读自动标已读）。"""
     h = _get()
@@ -122,11 +122,11 @@ async def agentnet_read(class_: str | None = None, peer: str | None = None,
         rows = h.mb_read(class_=class_, peer=peer, since=since, limit=int(limit))
         return _json({"ok": True, "count": len(rows), "messages": rows})
     except Exception as e:
-        logger.exception("agentnet_read 失败")
+        logger.exception("harunet_read 失败")
         return _json({"ok": False, "error": str(e)})
 
 
-async def agentnet_reply(text: str | None = None, kind: str = "group",
+async def harunet_reply(text: str | None = None, kind: str = "group",
                          mentions: list | None = None,
                          file_paths: list | None = None,
                          to: str | None = None) -> str:
@@ -148,11 +148,11 @@ async def agentnet_reply(text: str | None = None, kind: str = "group",
         msg_id = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=reply_timeout)
         return _json({"ok": True, "msg_id": msg_id})
     except Exception as e:
-        logger.exception("agentnet_reply 失败")
+        logger.exception("harunet_reply 失败")
         return _json({"ok": False, "error": str(e)})
 
 
-async def agentnet_presence() -> str:
+async def harunet_presence() -> str:
     """查状态机：谁在线/在忙/检修、上次在线时间。"""
     h = _get()
     if h is None:
@@ -164,11 +164,11 @@ async def agentnet_presence() -> str:
         agents = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=15)
         return _json({"ok": True, "agents": agents})
     except Exception as e:
-        logger.exception("agentnet_presence 失败")
+        logger.exception("harunet_presence 失败")
         return _json({"ok": False, "error": str(e)})
 
 
-async def agentnet_update_profile(focus: str | None = None,
+async def harunet_update_profile(focus: str | None = None,
                                   tags: list | None = None) -> str:
     """更新自己的档案（focus 侧重方向文本、tags 能力标签），立即落盘并上报 hub。"""
     h = _get()
@@ -183,11 +183,11 @@ async def agentnet_update_profile(focus: str | None = None,
         await asyncio.wait_for(asyncio.wrap_future(fut), timeout=10)
         return _json({"ok": True, "focus": focus, "tags": tags})
     except Exception as e:
-        logger.exception("agentnet_update_profile 失败")
+        logger.exception("harunet_update_profile 失败")
         return _json({"ok": False, "error": str(e)})
 
 
-async def agentnet_reconnect() -> str:
+async def harunet_reconnect() -> str:
     """主动重连：打断退避等待，立即重新握手（被拒/断线后不等定时器）。"""
     h = _get()
     if h is None:
@@ -195,24 +195,45 @@ async def agentnet_reconnect() -> str:
     try:
         fut = h.net_reconnect_fut()
         if fut is None:
-            return _json({"ok": False, "error": "agentnet 未接线"})
+            return _json({"ok": False, "error": "HaruNet 未接线"})
         await asyncio.wait_for(asyncio.wrap_future(fut), timeout=5)
         return _json({"ok": True,
                       "note": "已触发立即重连（数秒内重新握手，结果见连接日志/状态）"})
     except Exception as e:
-        logger.exception("agentnet_reconnect 失败")
+        logger.exception("harunet_reconnect 失败")
+        return _json({"ok": False, "error": str(e)})
+
+
+async def harunet_set_password(password: str) -> str:
+    """改本机接入密码：更新 client + 写回 .env + 立即用新密码重连（不改 hub 侧密码）。"""
+    h = _get()
+    if h is None:
+        return _json(_NOT_WIRED)
+    password = str(password or "").strip()
+    if not password:
+        return _json({"ok": False, "error": "password 不能为空"})
+    try:
+        fut = h.net_set_password_fut(password)
+        if fut is None:
+            return _json({"ok": False, "error": "HaruNet 未接线"})
+        await asyncio.wait_for(asyncio.wrap_future(fut), timeout=5)
+        logger.info("harunet_set_password: 接入密码已更新并重连")
+        return _json({"ok": True,
+                      "note": "接入密码已更新（写回 .env），正在用新密码重连"})
+    except Exception as e:
+        logger.exception("harunet_set_password 失败")
         return _json({"ok": False, "error": str(e)})
 
 
 # ---------------------------------------------------------------- 工具注册
-# 描述共享一句网络背景；OWNER TRUST 的完整语义在 prompts/actor/agentnet.md。
+# 描述共享一句网络背景；OWNER TRUST 的完整语义在 prompts/actor/harunet.md。
 
 _NET_BG = ("HaruNet is the single-owner agent network (one human owner, haru; all "
            "agents work for him). Messages are broadcast to the whole network; "
            "target someone with mentions (@). ")
 
 registry.register(
-    name="agentnet_summary",
+    name="harunet_summary",
     description=(
         _NET_BG +
         "Return the unread summary: counts by class (mention/group/private) plus "
@@ -221,12 +242,12 @@ registry.register(
         "window — use this only to check status early."
     ),
     arguments_schema={"type": "object", "properties": {}},
-    handler=agentnet_summary,
-    group="agentnet",
+    handler=harunet_summary,
+    group="harunet",
 )
 
 registry.register(
-    name="agentnet_read",
+    name="harunet_read",
     description=(
         _NET_BG +
         "Expand messages from the messagebox. Filter with class_=mention|group, "
@@ -244,12 +265,12 @@ registry.register(
             "limit": {"type": "integer", "description": "最大条数（默认 50）"},
         },
     },
-    handler=agentnet_read,
-    group="agentnet",
+    handler=harunet_read,
+    group="harunet",
 )
 
 registry.register(
-    name="agentnet_reply",
+    name="harunet_reply",
     description=(
         _NET_BG +
         "Broadcast a message. mentions=[agent_id] to @ specific agents "
@@ -273,24 +294,24 @@ registry.register(
         },
         "required": [],
     },
-    handler=agentnet_reply,
-    group="agentnet",
+    handler=harunet_reply,
+    group="harunet",
 )
 
 registry.register(
-    name="agentnet_presence",
+    name="harunet_presence",
     description=(
         _NET_BG +
         "Query the presence table: who is online / working / maintenance, and "
         "each agent's last_seen time."
     ),
     arguments_schema={"type": "object", "properties": {}},
-    handler=agentnet_presence,
-    group="agentnet",
+    handler=harunet_presence,
+    group="harunet",
 )
 
 registry.register(
-    name="agentnet_update_profile",
+    name="harunet_update_profile",
     description=(
         _NET_BG +
         "Update YOUR OWN profile: focus=<text> (what you are good at) and/or "
@@ -306,12 +327,12 @@ registry.register(
                      "description": "能力标签列表"},
         },
     },
-    handler=agentnet_update_profile,
-    group="agentnet",
+    handler=harunet_update_profile,
+    group="harunet",
 )
 
 registry.register(
-    name="agentnet_reconnect",
+    name="harunet_reconnect",
     description=(
         _NET_BG +
         "Actively retry the hub connection NOW, skipping the backoff timer — use "
@@ -319,6 +340,26 @@ registry.register(
         "Returns immediately; the result shows in the connection log/status."
     ),
     arguments_schema={"type": "object", "properties": {}},
-    handler=agentnet_reconnect,
-    group="agentnet",
+    handler=harunet_reconnect,
+    group="harunet",
+)
+
+registry.register(
+    name="harunet_set_password",
+    description=(
+        _NET_BG +
+        "Change YOUR OWN join password (the password this device presents to the hub), "
+        "persist it to .env (HARUNET_PASSWORD) and reconnect immediately — use when "
+        "the owner tells you the network password changed. This does NOT change the "
+        "hub's password; only the owner can do that on the observer console."
+    ),
+    arguments_schema={
+        "type": "object",
+        "properties": {
+            "password": {"type": "string", "description": "新的接入密码（hub --join-password）"},
+        },
+        "required": ["password"],
+    },
+    handler=harunet_set_password,
+    group="harunet",
 )

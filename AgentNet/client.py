@@ -118,6 +118,10 @@ class AgentNetClient:
     def connected(self) -> bool:
         return self._connected.is_set()
 
+    def set_password(self, password: str) -> None:
+        """运行时更换接入密码（配合 kick_reconnect 立即用新密码重连）。"""
+        self._password = password or ""
+
     async def kick_reconnect(self) -> None:
         """主动重连：打断当前退避等待，立即进入下一轮连接尝试。
 
@@ -145,7 +149,7 @@ class AgentNetClient:
             return True
         if kick_task in done:
             self._kick_event.clear()
-            logger.info("agentnet 主动重连：立即重试")
+            logger.info("HaruNet 主动重连：立即重试")
         return False
 
     async def connect_forever(self) -> None:
@@ -166,13 +170,13 @@ class AgentNetClient:
                 self.last_error = f"握手被拒: {e}"
                 self._last_backoff = float(self._reject_backoff)
                 logger.warning(
-                    "agentnet 握手被拒: %s（本机指纹不在 hub 白名单？%ds 后重试）",
+                    "HaruNet 握手被拒: %s（接入密码错误或不在白名单？%ds 后重试）",
                     e, self._reject_backoff)
                 if await self._wait_backoff(self._reject_backoff):
                     break
                 backoff = 1
             except Exception as e:
-                logger.warning("agentnet 连接断开: %s（%ds 后重连）", e, backoff)
+                logger.warning("HaruNet 连接断开: %s（%ds 后重连）", e, backoff)
                 self._connected.clear()
                 self.last_error = str(e)
                 self._last_backoff = float(backoff)
@@ -187,7 +191,7 @@ class AgentNetClient:
             try:
                 await self._handshake()
                 self._connected.set()
-                logger.info("agentnet 已连接: %s (%s)", self.url, self.identity.agent_id)
+                logger.info("HaruNet 已连接: %s (%s)", self.url, self.identity.agent_id)
                 hb = asyncio.create_task(self._heartbeat_loop())
                 try:
                     await self._recv_loop()
@@ -230,7 +234,7 @@ class AgentNetClient:
             try:
                 env = parse(raw)
             except ValueError as e:
-                logger.warning("agentnet 收到非法信封: %s", e)
+                logger.warning("HaruNet 收到非法信封: %s", e)
                 continue
             self._dispatch(env)
 
@@ -243,7 +247,7 @@ class AgentNetClient:
                 try:
                     self._on_control(env)
                 except Exception:
-                    logger.exception("agentnet on_control 回调异常")
+                    logger.exception("HaruNet on_control 回调异常")
         elif t == "presence_state":
             if self._presence_waiter is not None and not self._presence_waiter.done():
                 self._presence_waiter.set_result(env["payload"].get("agents", {}))
@@ -259,7 +263,7 @@ class AgentNetClient:
                 self._on_message(env, class_)
                 return
             except Exception:
-                logger.exception("agentnet on_message 回调异常")
+                logger.exception("HaruNet on_message 回调异常")
                 return
         if self.box is not None:
             peer = env["to"] if env.get("kind") == CLASS_GROUP else env["from"]
@@ -271,21 +275,21 @@ class AgentNetClient:
             try:
                 self._on_urgent(env, class_)
             except Exception:
-                logger.exception("agentnet on_urgent 回调异常")
+                logger.exception("HaruNet on_urgent 回调异常")
 
     def _emit_event(self, kind: str, env: dict) -> None:
         if self._on_event:
             try:
                 self._on_event(kind, env)
             except Exception:
-                logger.exception("agentnet on_event 回调异常")
+                logger.exception("HaruNet on_event 回调异常")
 
     # ------------------------------------------------------------- 发送
     async def _send(self, env: dict) -> None:
         env["sig"] = self.identity.sign(canonical_bytes(env))
         async with self._write_lock:
             if self._ws is None:
-                raise ConnectionError("agentnet 未连接")
+                raise ConnectionError("HaruNet 未连接")
             await self._ws.send(dumps(env))
 
     async def send_message(self, to: str, text: str,
@@ -433,7 +437,7 @@ class AgentNetClient:
                     sender=self.identity.agent_id, to="server", type_="presence_update",
                     payload=self._presence_payload()))
             except Exception as e:
-                logger.warning("agentnet 心跳失败: %s", e)
+                logger.warning("HaruNet 心跳失败: %s", e)
                 return
 
     async def close(self) -> None:

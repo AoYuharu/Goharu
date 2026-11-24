@@ -120,7 +120,7 @@ class Channel:
     def health(self) -> dict:
         """连通/配置状态：{ok: bool, state: str, detail: str}。
 
-        默认实现 = 无长连接的 channel 一律 ready；长连接型（agentnet/qqbot）
+        默认实现 = 无长连接的 channel 一律 ready；长连接型（harunet/qqbot）
         覆写为在线/连接中/失败三态并附最近错误原因。
         """
         return {"ok": True, "state": "ready", "detail": ""}

@@ -197,6 +197,19 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return {"jsonrpc": "2.0",
                     "result": _manager.channels_health() if _manager else [],
                     "id": req_id}
+        if method == "channels.reconnect":
+            cid = str(params.get("channel_id") or "")
+            return {"jsonrpc": "2.0",
+                    "result": (_manager.channel_reconnect(cid) if _manager
+                               else {"ok": False, "error": "gateway not ready"}),
+                    "id": req_id}
+        if method == "channels.set_password":
+            cid = str(params.get("channel_id") or "")
+            pw = str(params.get("password") or "")
+            return {"jsonrpc": "2.0",
+                    "result": (_manager.channel_set_password(cid, pw) if _manager
+                               else {"ok": False, "error": "gateway not ready"}),
+                    "id": req_id}
         if method == "agent.send_message":
             message = params.get("message", "")
             session_id = params.get("session_id", "default")

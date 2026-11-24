@@ -1,4 +1,4 @@
-"""AgentNet channel：把 HaruNet 组网接入 Goharu 的 channel 体系。
+"""HaruNet channel：把 HaruNet 组网接入 Goharu 的 channel 体系。
 
 入站：AgentNetClient 收消息 → MessageBox 落盒（全部）→ mention/dm 额外
 emit_inbound 唤醒 turn；group 静默入盒（摘要经 SessionMemoryView 的
@@ -32,9 +32,9 @@ from Gateway.names import NET_NAME
 logger = logging.getLogger(__name__)
 
 
-@register_channel("agentnet")
-class AgentNetChannel(Channel):
-    channel_type = "agentnet"
+@register_channel("harunet")
+class HaruNetChannel(Channel):
+    channel_type = "harunet"
     capabilities = frozenset()  # 只要 answer（隐含必要能力）
 
     def __init__(self, channel_id: str, params: dict | None = None):
@@ -75,9 +75,10 @@ class AgentNetChannel(Channel):
         self._control_handler = None             # SessionManager 注入（中控动作执行）
         self._client: Optional[AgentNetClient] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._env_writer = None                 # SessionManager 注入：写 .env（密码持久化）
         self._thread: Optional[threading.Thread] = None
         self._reply_target: Optional[dict] = None  # {sender}
-        self._agent_replied = False  # 本 turn 模型已通过 agentnet_reply 发过消息
+        self._agent_replied = False  # 本 turn 模型已通过 harunet_reply 发过消息
         self._connected = threading.Event()
         self._urgent_buf: list = []              # 待合并的 urgent 消息（mention/dm）
         self._urgent_lock = threading.Lock()
@@ -132,12 +133,12 @@ class AgentNetChannel(Channel):
         if self._thread is not None:
             return
         self._thread = threading.Thread(
-            target=self._run, name=f"agentnet-{self.channel_id}", daemon=True)
+            target=self._run, name=f"harunet-{self.channel_id}", daemon=True)
         self._thread.start()
         threading.Thread(target=self._quiet_watcher,
-                         name=f"agentnet-quiet-{self.channel_id}",
+                         name=f"harunet-quiet-{self.channel_id}",
                          daemon=True).start()
-        logger.info("agentnet channel 启动: %s → %s", self.identity.agent_id, self.url)
+        logger.info("HaruNet channel 启动: %s → %s", self.identity.agent_id, self.url)
 
     def _run(self):
         self._loop = asyncio.new_event_loop()
@@ -146,7 +147,7 @@ class AgentNetChannel(Channel):
             from Tools.security import get_security_checker
             security = get_security_checker().snapshot()
         except Exception:
-            security = None   # 无 Tools 环境（纯 AgentNet 测试）不上报
+            security = None   # 无 Tools 环境（纯协议库测试）不上报
         try:
             import Architect.hub  # noqa: F401——arch 可被转交话语权的宿主标记
             hosts_architect = True
@@ -173,7 +174,7 @@ class AgentNetChannel(Channel):
         try:
             self._loop.run_until_complete(self._client.connect_forever())
         except Exception:
-            logger.exception("agentnet client 循环退出")
+            logger.exception("HaruNet client 循环退出")
         finally:
             self._loop.close()
 
@@ -236,7 +237,7 @@ class AgentNetChannel(Channel):
     def _on_net_event(self, kind: str, env: dict) -> None:
         if kind == "welcome":
             self._connected.set()
-            logger.info("agentnet 已上线: %s", self.identity.agent_id)
+            logger.info("HaruNet 已上线: %s", self.identity.agent_id)
             self.floor.update((env.get("payload") or {}).get("floor"))
         elif kind == "presence_state":
             payload = env.get("payload") or {}
@@ -252,7 +253,7 @@ class AgentNetChannel(Channel):
                         snap.holder_name or "无", snap.persona if snap.held else "-")
         elif kind == "disconnected":
             self._connected.clear()
-            logger.info("agentnet 已离线: %s", self.identity.agent_id)
+            logger.info("HaruNet 已离线: %s", self.identity.agent_id)
 
     def _fmt_mentions(self, mentions: list) -> str:
         """mentions（agent_id 列表）→ '@名字1 @名字2'（名字缺失用短 id）。"""
@@ -484,7 +485,7 @@ class AgentNetChannel(Channel):
         parts.append("提示：三类消息区别对待——【@你的消息】是重点（被点名，"
                      "需处理或回应）；【主人消息·群体动态】和【关注期内群消息】是"
                      "旁观察看：主人在和别的智能体对话、或话题与你无关时，不要插话"
-                     "不要回复，看完即可。回复请用 agentnet_reply。")
+                     "不要回复，看完即可。回复请用 harunet_reply。")
         if not owners:
             parts.append("（同事消息：只有确实需要回应或行动时才用 reply 回复；"
                          "不要发送纯确认/待命/寒暄类消息，避免与同事形成反弹循环。）")
@@ -497,7 +498,7 @@ class AgentNetChannel(Channel):
             if self._reply_target is not None:
                 self._reply_target["auto_relay"] = owner_directed
         first_owner = owners[0] if owners else None
-        meta = {"agentnet": True, "class": items[0]["class"],
+        meta = {"harunet": True, "class": items[0]["class"],
                 "sender": (first_owner or items[-1])["sender"],
                 "from_owner": bool(owners), "merged": len(items)}
         logger.info("组网消息合并入站: %d 条（owner=%s）", len(items), bool(owners))
@@ -549,18 +550,18 @@ class AgentNetChannel(Channel):
             summary = joined[: self._group_inline_max_chars] + "\n…（截断）"
         t0, t1 = rows[0]["ts"][11:16], rows[-1]["ts"][11:16]
         text = (
-            f"[agentnet 群消息摘要（{len(rows)} 条 {t0}→{t1}，压缩后）]\n{summary}\n"
+            f"[HaruNet 群消息摘要（{len(rows)} 条 {t0}→{t1}，压缩后）]\n{summary}\n"
             "提示：以上为群消息摘要——关注可能与你有关的内容即可；"
             "不重要且不相关的可以不回复。"
         )
-        self.emit_inbound(text, meta={"agentnet": True, "class": "group",
+        self.emit_inbound(text, meta={"harunet": True, "class": "group",
                                       "summarized": True, "count": len(rows)})
 
     # ------------------------------------------------------------- 出站
     def send_answer(self, text: str, meta: dict | None = None):
         """把回答广播回网（全员可见），并 @ 最近一条 urgent 消息的发送者。
 
-        去重：模型本 turn 已经用 agentnet_reply 发过消息时不再中继
+        去重：模型本 turn 已经用 harunet_reply 发过消息时不再中继
         （否则同一条回答出现两遍）。中继/跳过之后清空回复目标——防止后续与
         组网无关的 turn（如 TUI 私聊）把回答误广播到全网。
 
@@ -579,11 +580,11 @@ class AgentNetChannel(Channel):
         if target is None:
             return
         if agent_replied:
-            logger.info("agentnet: 模型已自行广播，跳过 send_answer 中继")
+            logger.info("HaruNet: 模型已自行广播，跳过 send_answer 中继")
             return
         # 纯同事触发的 turn 不自动中继（防反弹循环）：要回应必须用 reply 工具
         if not target.get("auto_relay", True):
-            logger.info("agentnet: 同事触发的回答不自动中继（防乒乓）")
+            logger.info("HaruNet: 同事触发的回答不自动中继（防乒乓）")
             return
         self._broadcast_text(text, mentions=[target["sender"]])
 
@@ -597,7 +598,7 @@ class AgentNetChannel(Channel):
                 self._loop)
             fut.result(timeout=10)
         except Exception as e:
-            logger.warning("agentnet 回答广播失败: %s", e)
+            logger.warning("HaruNet 回答广播失败: %s", e)
 
     # -------------------------------------------------- 工具门面（线程安全）
     def mb_summary(self) -> dict:
@@ -634,6 +635,28 @@ class AgentNetChannel(Channel):
         if not self._client or not self._loop or not self._connected.is_set():
             return None
         return asyncio.run_coroutine_threadsafe(self._client.query_presence(), self._loop)
+
+    def set_env_writer(self, fn) -> None:
+        """SessionManager 注入 .env 写入器：fn(key, value)（harunet_set_password 用）。"""
+        self._env_writer = fn
+
+    def net_set_password_fut(self, password: str):
+        """运行时换接入密码：更新 client + 写回 .env + 立即重连（一步到位）。"""
+        password = str(password or "")
+        self.params["password"] = password
+        if self._env_writer is not None:
+            try:
+                self._env_writer("HARUNET_PASSWORD", password)
+            except Exception:
+                logger.warning("接入密码写回 .env 失败（仅本次运行生效）", exc_info=True)
+        if not self._client or not self._loop:
+            return None
+
+        async def _apply():
+            self._client.set_password(password)
+            await self._client.kick_reconnect()
+
+        return asyncio.run_coroutine_threadsafe(_apply(), self._loop)
 
     def net_reconnect_fut(self):
         """主动重连：打断当前退避等待，立即重新握手（工具/TUI 可触发）。"""
@@ -744,7 +767,7 @@ class AgentNetChannel(Channel):
         digest = self.box.digest_text()
         if not digest:
             return []
-        return [digest + "\n（可用 agentnet_summary / agentnet_read 查看与展开）"]
+        return [digest + "\n（可用 harunet_summary / harunet_read 查看与展开）"]
 
     # ------------------------------------------------- 安静期自动合并阅读
     def _quiet_watcher(self) -> None:
@@ -789,11 +812,11 @@ class AgentNetChannel(Channel):
             return
         # 与 urgent 合流共用分流：小体量内联，大体量交压缩智能体
         owner_flag = "（含主人消息）" if owner_latest else ""
-        parts = [f"[agentnet 群消息 · 安静期自动阅读{owner_flag}]"]
+        parts = [f"[HaruNet 群消息 · 安静期自动阅读{owner_flag}]"]
         parts.extend(self._consume_group_rows())
         parts.append("提示：以上为群内非定向消息——注意每条@的是谁：主人在和别的"
                      "智能体对话、或话题与你无关时，旁观即可不要插话；确实与你"
-                     "相关或被问到时才用 agentnet_reply 回复。")
+                     "相关或被问到时才用 harunet_reply 回复。")
         logger.info("安静期自动阅读触发")
-        self.emit_inbound("\n".join(parts), meta={"agentnet": True, "class": "group",
+        self.emit_inbound("\n".join(parts), meta={"harunet": True, "class": "group",
                                                   "auto_read": True})

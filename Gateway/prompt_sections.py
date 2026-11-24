@@ -7,7 +7,7 @@ Prompting 只认配置里的 `prompt.system.<agent_key>` 文件列表，不认�
 
 用法：
     loader = create_prompt_loader(
-        PromptSectionsOverlay(config, actor=["./prompts/actor/agentnet.md"]))
+        PromptSectionsOverlay(config, actor=["./prompts/actor/harunet.md"]))
     create_agent(..., prompt_loader=loader)
 """
 

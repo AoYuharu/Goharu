@@ -121,10 +121,10 @@ def main():
     check("提示带收回指引", any("floor_release" in x or "观察台" in x
                           for x in ch.sent), str(ch.sent))
 
-    # ------------------------------------- 4. 话语权在别处 + agentnet 广播副本
+    # ------------------------------------- 4. 话语权在别处 + harunet 广播副本
     print("\n[4] 话语权在别处：组网副本静默")
     ch.sent.clear()
-    check("gate=handled", s._floor_gate(msg("群消息副本", "agentnet", "agentnet_main"))
+    check("gate=handled", s._floor_gate(msg("群消息副本", "harunet", "harunet_main"))
           == "handled")
     check("无提示发送", not ch.sent, str(ch.sent))
 

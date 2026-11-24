@@ -104,7 +104,7 @@ class AgentSession:
                 return "dispatch"
             return "process"
         # 话语权在别处（绝对优先）：组网广播副本静默；本地直连输入给透明提示
-        if msg.channel_type == "agentnet":
+        if msg.channel_type == "harunet":
             return "handled"
         self._floor_notice(
             msg,

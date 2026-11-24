@@ -22,9 +22,9 @@
    新增配置键必须给默认值，并同步到 README 的配置表。
 2. **registry 是进程级全局单例**：import builtin 模块即注册。外部 harness 与
    Goharu 共用同一进程时工具会互相可见，属预期行为。
-   **条件工具组**（HaruNet 的 `agentnet_tools` / `floor_tools`）**不进**
+   **条件工具组**（HaruNet 的 `harunet_tools` / `floor_tools`）**不进**
    `tools.builtin_modules` 静态表——未接入组网的智能体连工具描述都不该看见；
-   由 Gateway 组合根在 `agentnet.enabled` 时 `import` 注册（Tools 本身不认识
+   由 Gateway 组合根在 `harunet.enabled` 时 `import` 注册（Tools 本身不认识
    任何功能开关）。新增"仅某功能启用时才存在"的工具照此模式。
 3. **handler 线程安全**：同步 handler 在线程池并发执行，宿主可能在同一 LLM 步
    并行下发多个调用。写文件/共享资源必须自管锁（先例：pdf_annotate_tools 的
