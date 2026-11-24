@@ -642,6 +642,17 @@ class AgentNetChannel(Channel):
             self._client.set_floor(action, target=target, persona=persona,
                                    note=note), self._loop)
 
+    def net_error_report_fut(self, record: dict):
+        """把统一错误记录上报 hub 错误流（观察台）；未连接时静默丢弃。"""
+        if not self._client or not self._loop or not self._connected.is_set():
+            return None
+        try:
+            return asyncio.run_coroutine_threadsafe(
+                self._client.send_error_report(record), self._loop)
+        except Exception:
+            logger.debug("错误记录上报调度失败", exc_info=True)
+            return None
+
     def _report_profile(self) -> None:
         """把最新 profile（含安全规则快照）上报 hub：更新内存档案并触发广播。"""
         if not self._client or not self._loop or not self._connected.is_set():

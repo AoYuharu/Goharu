@@ -607,9 +607,13 @@ export function App({ mock = false }: { mock?: boolean }) {
       showStatic("Interrupted - What should I do?", "warning");
     });
     gw.on("agent.error", (p) => {
-      add({ kind: "error", text: p.message });
+      const meta = [p.blocking, p.cause, p.scope].filter(Boolean).join(" / ");
+      add({ kind: "error", text: meta ? `[${meta}] ${p.message}` : p.message });
       showStatic(`Error: ${String(p.message).slice(0, 50)}`, "error");
-      try { gw.restart(); } catch { /* restart failure surfaces via next error */ }
+      // 只有进程级致命错误才重启；配置/单轮/通道错误只展示，避免崩溃循环
+      if (p.blocking === "fatal") {
+        try { gw.restart(); } catch { /* restart failure surfaces via next error */ }
+      }
     });
     gw.on("command.complete", (p) => {
       if (p.success) {

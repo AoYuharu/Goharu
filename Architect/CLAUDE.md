@@ -11,6 +11,8 @@ Architect/
 ├── telemetry.py          # TelemetryDigest：事件流哑聚合（纯计数器，零 LLM/IO）
 ├── wake.py               # WakeRequest + WakeSource 协议（唤醒条件接口，未实现调度）
 ├── audit.py              # AuditPipeline：staging 审计 → PASS 合并 / FAIL 隔离
+├── error_hooks.py        # 错误 hook 规则引擎（受保护底线 + 自定义规则/冷却/次数）
+├── repair.py             # RepairGuard：工作区快照 → 自检 → 失败精确回滚
 ├── channel.py            # TelemetryChannel：channel 插件，唯一 import Gateway 的文件
 └── CLAUDE.md
 ```
@@ -34,6 +36,12 @@ Architect/
      工具（wait=true 同步等报告，false 后台派发）
    派发串行由 `hub._dispatch_lock` 非阻塞兜底（忙时返回 busy 不排队）；
    后台派发走 hub 内守护线程（turn 线程/看门狗绝不能阻塞）。
+   - ⑥ 统一错误 hook（2026-11-24）：`Gateway` 的 `Core.error_report` listener 把完整错误记录
+     广播为 `agent.error` → `hub.ingest_event` → `ErrorHookEngine.evaluate`。匹配规则后唤醒
+     `KIND_REPAIR`（有 RepairGuard 时）或 `KIND_GUARDIAN`，上下文含错误全文/traceback/
+     日志尾部/lifecycle/git status + "直接改生产代码必须保证自身可运行"约束。
+     内置底线规则 `builtin:fatal_process` / `all_turns` / `runtime_logic` / `repair_failed`
+     **不可禁用/删除**；Arch 通过 `ErrorHook` 工具追加自定义规则（runtime_memory/architect/error_hooks.json）。
    - ⑤ 定期轮询（首个拉式源）：`upgrader.GitUpdateSource` 定期 fetch
      `architect_hub.upgrade.{remote,branch}`（默认 origin/master =
      github.com/AoYuharu/Goharu）比对本地 HEAD，有新提交 → code_update 唤醒
@@ -64,7 +72,13 @@ Architect/
    报告不动目录。staging 目录与生产目录的物理布局由注入方决定。
 5. **digest 是旁路观测**：计数错误不得影响主流程；遥测 channel 不实现任何
    用户可见出站（send_answer 是 no-op）。
-6. **Hero 桥是唯一对外通道**：`hub.set_hero_bridge(notify_user, message_hero)`
+6. **自动修复必须经过 RepairGuard**（2026-11-24）：错误 hook 的 `KIND_REPAIR` 派发前
+   `snapshot()`（`git stash create` + 临时 index 纳入 untracked 的完整树 commit），
+   派发后 `verify()`（改动 .py py_compile + config.yaml 解析 + 配置自检命令），
+   失败/异常才 `restore()` 并上报；成功才 `finish()` 清理 ref。恢复失败必须保留 ref
+   并升级为致命错误，绝不静默。规则与状态在 `runtime_memory/architect/error_hooks.json`
+   与 `error_hooks_state.json`；`ErrorHookEngine` 不 import Gateway/Tools。
+7. **Hero 桥是唯一对外通道**：`hub.set_hero_bridge(notify_user, message_hero)`
    由 Gateway 装配期注入（session_manager.py，Phase 1 只接 default session）。
    hub 不得自己 import Gateway 拿 channel——未接线时 notify/message 降级为
    日志并返回 False。后台派发完成自动 `_push_report`（`architect_hub.report_push`

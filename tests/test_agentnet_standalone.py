@@ -158,6 +158,10 @@ def main():
         # ------------------------------------------- 15. 可靠性修复回归
         print("\n[15] 可靠性：mailbox/共享状态/重连/生命周期")
         asyncio.run(reliability_test(root))
+
+        # ----------------------------------- 16. 接入密码设置 / 删除智能体
+        print("\n[16] 接入密码运行时设置 + 删除已注册智能体")
+        asyncio.run(admin_test(root))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1531,6 +1535,111 @@ async def handshake_test(root: Path):
         td.cancel()
         serve_task.cancel()
         for t in (tb, td, serve_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+async def admin_test(root: Path):
+    """观察台管理：运行时改接入密码（持久化）+ 删除已注册智能体（白名单/presence）。"""
+    import urllib.error
+    import urllib.request
+
+    from AgentNet.client import AgentNetClient
+    from AgentNet.server.hub import HubServer
+    from AgentNet.server.observer import ObserverServer
+
+    port, oport = free_port(), free_port()
+    a = Identity.load_or_create(root / "ad_a", name="alpha")
+    b = Identity.load_or_create(root / "ad_b", name="beta")
+    wl_path = root / "wl_admin.json"
+    wl_path.write_text(json.dumps({
+        "agents": {a.agent_id: {"name": "alpha", "pubkey": a.pubkey_b64},
+                   b.agent_id: {"name": "beta", "pubkey": b.pubkey_b64}},
+        "groups": {}}), encoding="utf-8")
+    hub = HubServer("127.0.0.1", port, wl_path, root / "hub_state_admin")
+    obs = ObserverServer(hub.message_log, hub.presence, host="127.0.0.1", port=oport,
+                         token="adtok", file_store=hub.files, whitelist=hub.whitelist,
+                         join_password_snapshot=hub.join_password_snapshot,
+                         on_set_join_password=hub.submit_join_password,
+                         on_remove_agent=hub.submit_remove_agent)
+    obs.start()
+    serve_task = asyncio.create_task(hub.serve())
+    await asyncio.sleep(0.3)
+
+    cb = AgentNetClient(b, f"ws://127.0.0.1:{port}", heartbeat_seconds=3600)
+    tb = asyncio.create_task(cb.connect_forever())
+
+    def get_json(path, token="adtok"):
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{oport}{path}?token={token}", timeout=5) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def post(path, payload, token="adtok"):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{oport}{path}",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Token": token})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read().decode("utf-8"))
+            except Exception:
+                return e.code, {}
+
+    try:
+        check("管理端上线", await wait_conn(cb))
+
+        # 密码设置：无 token 拒绝 → 设置 → 快照可见 → 落盘持久化
+        status, _ = await asyncio.to_thread(post, "/api/join-password",
+                                            {"password": "x"}, "")
+        check("无 token 设置密码被拒", status == 403, str(status))
+        status, j = await asyncio.to_thread(post, "/api/join-password",
+                                            {"password": "newpw"})
+        check("设置密码成功", status == 200 and j.get("ok") and j.get("enabled"),
+              f"{status} {j}")
+        pw_file = root / "hub_state_admin" / "join_password.txt"
+        check("密码持久化", pw_file.exists()
+              and pw_file.read_text(encoding="utf-8").strip() == "newpw")
+        snap = await asyncio.to_thread(get_json, "/api/join-password")
+        check("快照返回当前密码", snap.get("password") == "newpw", str(snap))
+        # 重启（新建 hub 实例）后密码保持
+        hub2 = HubServer("127.0.0.1", free_port(), wl_path,
+                         root / "hub_state_admin")
+        check("重启后密码从磁盘恢复", hub2.join_password == "newpw",
+              hub2.join_password)
+
+        # 删除智能体：owner 不可删 → 普通设备删除（白名单 + presence）
+        check("删除前在白名单", hub.whitelist.agent(b.agent_id) is not None)
+        status, j = await asyncio.to_thread(post, "/api/remove-agent",
+                                            {"target": hub.owner.agent_id})
+        check("owner 不可删除", status == 500 and not j.get("ok"), f"{status} {j}")
+        status, j = await asyncio.to_thread(post, "/api/remove-agent",
+                                            {"target": b.agent_id})
+        check("删除智能体成功", status == 200 and j.get("ok")
+              and j.get("removed") == b.agent_id, f"{status} {j}")
+        check("白名单已移除", hub.whitelist.agent(b.agent_id) is None)
+        check("presence 已移除",
+              b.agent_id not in hub.presence.snapshot(),
+              str(hub.presence.snapshot().keys()))
+        # 删除未知目标 → 报错
+        status, j = await asyncio.to_thread(post, "/api/remove-agent",
+                                            {"target": "agt_nope"})
+        check("未知目标删除报错", status == 500 and not j.get("ok"), f"{status} {j}")
+
+        # 页面静态标记
+        page = (Path(__file__).resolve().parent.parent
+                / "AgentNet" / "server" / "observer_page.html").read_text(encoding="utf-8")
+        check("页面含网络设置面板", "netPanel" in page and "/api/join-password" in page
+              and "/api/remove-agent" in page)
+    finally:
+        await cb.close()
+        tb.cancel()
+        serve_task.cancel()
+        for t in (tb, serve_task):
             try:
                 await t
             except (asyncio.CancelledError, Exception):

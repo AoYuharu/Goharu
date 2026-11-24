@@ -38,7 +38,9 @@ class ObserverServer:
                  port: int = 6001, token: str = "",
                  file_store=None, whitelist=None, on_send=None,
                  on_control=None, pending_asks=None, on_answer=None,
-                 on_floor=None, floor_snapshot=None):
+                 on_floor=None, floor_snapshot=None, error_log=None,
+                 join_password_snapshot=None, on_set_join_password=None,
+                 on_remove_agent=None):
         self.message_log = message_log
         self.presence = presence
         self.token = token or ""
@@ -50,6 +52,10 @@ class ObserverServer:
         self.on_answer = on_answer  # hub.submit_answer(request_id, answer) -> dict
         self.on_floor = on_floor  # hub.submit_floor_request(action, target, persona, note)
         self.floor_snapshot = floor_snapshot  # hub.floor_snapshot() -> dict|None
+        self.error_log = error_log  # hub.errors (ErrorLog.recent(limit, after))
+        self.join_password_snapshot = join_password_snapshot  # -> {enabled, password}
+        self.on_set_join_password = on_set_join_password  # (password) -> dict
+        self.on_remove_agent = on_remove_agent  # (agent_id) -> dict
         self._httpd = ThreadingHTTPServer((host, port), self._make_handler())
         self._thread = None
 
@@ -99,6 +105,19 @@ class ObserverServer:
                     if url.path == "/api/floor":
                         data = {"floor": outer.floor_snapshot() if outer.floor_snapshot else None}
                         self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"))
+                        return
+                    if url.path == "/api/join-password":
+                        data = (outer.join_password_snapshot()
+                                if outer.join_password_snapshot else {"enabled": False, "password": ""})
+                        self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"))
+                        return
+                    if url.path == "/api/errors":
+                        rows = outer.error_log.recent(
+                            limit=int(qs.get("limit", ["200"])[0]),
+                            after=int(qs.get("after", ["0"])[0])) \
+                            if outer.error_log else []
+                        self._send(200, json.dumps({"errors": rows},
+                                                   ensure_ascii=False).encode("utf-8"))
                         return
                     if url.path == "/api/messages":
                         rows = outer.message_log.recent(
@@ -158,6 +177,12 @@ class ObserverServer:
                         return
                     if url.path == "/api/floor":
                         self._handle_floor(qs)
+                        return
+                    if url.path == "/api/join-password":
+                        self._handle_join_password(qs)
+                        return
+                    if url.path == "/api/remove-agent":
+                        self._handle_remove_agent(qs)
                         return
                     if url.path == "/api/files":
                         self._handle_upload(qs)
@@ -248,6 +273,55 @@ class ObserverServer:
                 self._send(code, json.dumps(result, ensure_ascii=False).encode("utf-8"))
                 logger.info("观察台话语权: %s target=%s persona=%s",
                             action, req.get("target"), req.get("persona"))
+
+            def _handle_join_password(self, qs: dict):
+                """设置接入密码（仅 token 持有人；空密码=关闭密码模式）。"""
+                if outer.on_set_join_password is None:
+                    self._send(503, b'{"ok":false,"error":"password disabled"}')
+                    return
+                if not outer.token or not self._authed(qs):
+                    self._send(403, b'{"ok":false,"error":"token required"}')
+                    return
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length <= 0 or length > 4096:
+                    self._send(413, b'{"ok":false,"error":"bad size"}')
+                    return
+                try:
+                    req = json.loads(self.rfile.read(length).decode("utf-8"))
+                except ValueError:
+                    self._send(400, b'{"ok":false,"error":"bad json"}')
+                    return
+                result = outer.on_set_join_password(str(req.get("password") or ""))
+                code = 200 if result.get("ok") else 500
+                self._send(code, json.dumps(result, ensure_ascii=False).encode("utf-8"))
+                logger.info("观察台设置接入密码: %s",
+                            "已开启" if result.get("enabled") else "已关闭")
+
+            def _handle_remove_agent(self, qs: dict):
+                """删除已注册智能体（仅 token 持有人）：白名单 + presence 移除。"""
+                if outer.on_remove_agent is None:
+                    self._send(503, b'{"ok":false,"error":"remove disabled"}')
+                    return
+                if not outer.token or not self._authed(qs):
+                    self._send(403, b'{"ok":false,"error":"token required"}')
+                    return
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length <= 0 or length > 4096:
+                    self._send(413, b'{"ok":false,"error":"bad size"}')
+                    return
+                try:
+                    req = json.loads(self.rfile.read(length).decode("utf-8"))
+                except ValueError:
+                    self._send(400, b'{"ok":false,"error":"bad json"}')
+                    return
+                target = str(req.get("target") or "").strip()
+                if not target:
+                    self._send(400, b'{"ok":false,"error":"target required"}')
+                    return
+                result = outer.on_remove_agent(target)
+                code = 200 if result.get("ok") else 500
+                self._send(code, json.dumps(result, ensure_ascii=False).encode("utf-8"))
+                logger.info("观察台删除智能体: %s", target)
 
             def _handle_answer(self, qs: dict):
                 """观察台作答：把答案回送给挂起询问的发起智能体（须 token）。"""

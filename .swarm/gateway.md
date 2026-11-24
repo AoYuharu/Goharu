@@ -244,3 +244,15 @@
   否则会回审计体。context 在任务文本末尾，是可靠的覆盖位置。
 - **可靠性修复（2026-11-24）**：条件工具必须**在 create_tools/create_agent 快照之前** import；注册进 registry ≠ 出现在 last_tool_definitions。Channel 的 control 回调跑在 client loop，绝不能 `.result()` 等同 loop Future（profile 上报用 done_callback）。Mailbox 投递改 pending→逐条 send 成功→ack，失败保留；这是**有序至少一次**，不是 exactly-once。同身份重连先替换 `_online` 再 close 旧 ws，旧 finally 才能不误下线新连接。Presence/pending_asks/Mailbox 都要锁，但锁不跨 await。
 - **UI 与状态细节**：`feed.innerHTML=''` 会连 askDock 一起删，feed 重置必须 `clearFeed()` 保留 Dock 节点身份；FloorState 对 presence 的重复快照必须幂等，否则 epoch 被不断重置、long-hold 永不触发；ReloadTools 对 agentnet/floor 两个模块级句柄都要保存恢复。
+- **统一错误审计 + Arch 自修复（2026-11-24）**：所有错误经 `Core/error_report` 归一为
+  `blocking`(后果) + `cause`(根因) + fingerprint，JSONL 落 `runtime_memory/errors`；
+  Gateway listener 广播 `agent.error`（updated 不再弹 TUI/触发 Arch）、转发 HaruNet
+  `error_report` 到观察台错误 tab。fatal 早期路径在 logging/config 未就绪时也可写，
+  同 fingerprint 120s 窗口去重（systemd 崩溃循环不刷爆审计）。
+  Architect `ErrorHookEngine` 自定义规则优先、protected 底线兜底（fatal/all_turns/
+  runtime_logic/repair_failed 不可关），Arch 用 `ErrorHook` 工具自管规则。
+  `KIND_REPAIR` 经 RepairGuard：`git stash create` 覆盖 tracked 脏文件，临时
+  GIT_INDEX_FILE+add -A+write-tree 覆盖 untracked；失败 `read-tree --reset -u` 恢复并
+  删除新增文件。坑：`git diff` 不反映既有 untracked 修改；自检命令必须 shell 执行
+  （Windows shlex posix=False 会带引号）。TUI 只有 `blocking=fatal` 才重启，否则普通
+  错误会被误当成崩溃无限重启。

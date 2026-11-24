@@ -37,6 +37,22 @@ def _thread_tag() -> str:
     return _THREAD_ZH.get(name, name)
 
 
+def tail(lines: int = 80) -> str:
+    """读生命周期日志末尾若干行（Architect 修复证据用；失败返回空串）。"""
+    try:
+        if not _PATH.is_file():
+            return ""
+        with _PATH.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            chunk = min(size, 256 * 1024)
+            f.seek(size - chunk)
+            data = f.read().decode("utf-8", "replace")
+        return "\n".join(data.splitlines()[-max(1, int(lines)):])
+    except Exception:
+        return ""
+
+
 def lifecycle(stage: str, detail: str = "", *, level: int = 0) -> None:
     """实时追加一条生命周期状态。
 

@@ -204,7 +204,8 @@ class SubAgentConfig:
             # Goharu 自身管理/升级：全量读写 + MessageHero 对外沟通 + SetConfig 改配置。
             # 高危灰名单命令（del/taskkill/reg 等）由 run_cmd 工具内部的
             # confirmation_manager 拦截弹人工确认
-            return ["Read", "Grep", "Glob", "run_cmd", "Write", "Edit", "MessageHero", "SetConfig"]
+            return ["Read", "Grep", "Glob", "run_cmd", "Write", "Edit",
+                    "MessageHero", "SetConfig", "ErrorHook"]
         else:
             raise ValueError(f"Unknown agent type: {agent_type}")
 

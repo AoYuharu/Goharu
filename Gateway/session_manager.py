@@ -11,15 +11,18 @@
 
 import logging
 import os
+import subprocess
 import threading
 
 from Core.LifecycleLog import lifecycle
+from Core.LogManager import tail as log_tail, tail_file
 from Core.timing import timeit
 from Memory.bridge import create_memory
 from Prompting.api import create_context_manager
 from Tools.api import create_tools, close_tools
 from configurationLoader import config
 
+from Core.error_report import load_error, register_error_listener, update_error
 from Gateway.channels import create_channel, load_plugins
 from Gateway.channels.base import ChannelMessage
 from Gateway.names import EXEC_LABEL, MAINT_LABEL, NET_NAME, nick_token
@@ -58,6 +61,8 @@ class SessionManager:
         self.sessions: dict = {}     # session_id → AgentSession
         self._channel_session: dict = {}  # channel 实例 → session_id
         self.default_session_id = "default"
+        self._agentnet_channel = None
+        self._error_unsubs: list = []
 
     # ------------------------------------------------------------------
     # 配置读取
@@ -275,6 +280,7 @@ class SessionManager:
                 session.attach_channel(ch)
                 ch.bind(session.enqueue)
                 ch.start()
+                self._agentnet_channel = ch
                 # 网络话语权入队关卡（channel 之前）+ FloorControl 工具句柄
                 try:
                     session.set_floor_context(
@@ -330,6 +336,25 @@ class SessionManager:
                     confirm_fn=confirmation_manager.request,
                     on_update_done=default_session._start_processing,
                 )
+                # 统一错误 hook：证据读取 + 状态回写 + 修复护栏（直接改生产代码）
+                repair_cfg = config.get("architect_hub.repair", {}) or {}
+                guard = None
+                if repair_cfg.get("enabled", True):
+                    from Architect.repair import RepairGuard
+                    checks = (list(repair_cfg.get("self_check_commands") or [])
+                              + list(repair_cfg.get("startup_check_commands") or []))
+                    guard = RepairGuard(
+                        repair_cfg.get("repo_dir")
+                        or config.get("architect_hub.upgrade.repo_dir", "."),
+                        self_check_commands=checks,
+                        timeout=int(repair_cfg.get("timeout", 600) or 600),
+                        max_snapshot_mb=int(repair_cfg.get("max_snapshot_mb", 200) or 200),
+                    )
+                get_default_hub().set_error_hooks(
+                    evidence_fn=self._error_evidence,
+                    status_fn=self._error_status,
+                    repair_guard=guard,
+                )
                 # 拉式唤醒源：定期检查 GitHub 新提交（audit 流把关）
                 if config.get("architect_hub.upgrade.enabled", False):
                     from Architect.upgrader import GitUpdateSource
@@ -360,6 +385,87 @@ class SessionManager:
                 )
             except Exception as e:
                 logger.warning("bootstrap hook failed (non-fatal): %s", e)
+
+        # ── 统一错误审计监听：TUI 事件 + （可选）HaruNet 观察台转发 ──
+        self._error_unsubs.append(register_error_listener(self._on_error_record))
+
+        # 上次进程致命错误：本次成功启动后补唤醒 Architect（进程内死亡时 Arch 也死了）
+        try:
+            from Architect.hub import get_default_hub
+            from Core.error_report import pending_fatals
+            hub = get_default_hub()
+            if hasattr(hub, "ingest_error"):
+                for rec in pending_fatals(max_attempts=int(
+                        config.get("architect_hub.repair.max_attempts", 2) or 2)):
+                    hub.ingest_error(rec)   # 状态回写由注入的 status_fn 统一处理
+        except Exception as e:
+            logger.warning("pending fatal 补唤醒失败（非致命）: %s", e)
+
+    def _on_error_record(self, record: dict) -> None:
+        """统一错误广播：新错误发 event，状态更新只同步 HaruNet/KPI，不重复弹错。"""
+        payload = {k: v for k, v in record.items() if k != "_event"}
+        event = str(record.get("_event") or "created")
+        payload.setdefault("message", str(record.get("message") or ""))
+        if event != "updated":
+            for session in list(self.sessions.values()):
+                try:
+                    session._broadcast_event("agent.error", payload)
+                except Exception:
+                    logger.warning("错误事件广播失败（session=%s）", session.session_id,
+                                   exc_info=True)
+        ch = self._agentnet_channel
+        fn = getattr(ch, "net_error_report_fut", None) if ch is not None else None
+        if fn is not None:
+            try:
+                fn(payload)
+            except Exception:
+                logger.warning("错误上报 HaruNet 失败", exc_info=True)
+
+    def _error_evidence(self, record: dict) -> dict:
+        """Architect 修复证据：日志尾部 + lifecycle + git 状态。"""
+        try:
+            from Core.LifecycleLog import tail as lifecycle_tail
+        except Exception:
+            lifecycle_tail = lambda _n=60: ""
+        try:
+            git_status = subprocess.run(
+                ["git", "status", "--short"], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=10,
+            ).stdout[-4000:]
+        except Exception:
+            git_status = ""
+        return {
+            "log.gateway": log_tail("gateway", 80),
+            "log.api": log_tail("api", 80),
+            "log.tools": log_tail("tools", 80),
+            "log.crash": tail_file("runtime_memory/logs/gateway/crash.log", 80),
+            "lifecycle": lifecycle_tail(60),
+            "git_status": git_status,
+        }
+
+    def _error_status(self, error_id: str, **fields) -> None:
+        """错误记录状态回写；保留原有 extra，并通知 TUI/HaruNet。"""
+        current = load_error(error_id) or {}
+        extra = current.get("extra") or {}
+        if fields.get("extra"):
+            extra = {**extra, **dict(fields.pop("extra"))}
+        if extra:
+            fields["extra"] = extra
+        update_error(error_id, **fields)
+        if fields.get("wake_status") == "repair_failed":
+            # 生成独立的修复失败审计记录；内置 repair_failed 规则只通知、不再自动重派
+            try:
+                from Core.error_report import report_error
+                report_error(
+                    f"Architect 自动修复失败（源错误 {error_id}），已尝试回滚",
+                    scope="architect_repair", severity="error",
+                    blocking="feature", cause="runtime",
+                    source="Architect.repair",
+                    extra={"source_error_id": error_id,
+                           **(fields.get("extra") or {})},
+                )
+            except Exception:
+                logger.warning("修复失败审计记录写入失败", exc_info=True)
 
     # ------------------------------------------------------------------
     # AgentNet 中控（观察台按钮 → hub control 消息 → agentnet channel）
@@ -591,6 +697,12 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     async def shutdown(self):
+        for unsub in self._error_unsubs:
+            try:
+                unsub()
+            except Exception:
+                pass
+        self._error_unsubs.clear()
         for session in self.sessions.values():
             try:
                 session.shutdown()

@@ -200,7 +200,16 @@ export type GatewayEvent =
   | { type: "agent.answer"; payload: { answer: string } }
   | { type: "agent.streaming"; payload: { chunk: string } }
   | { type: "agent.interrupted"; payload: { message: string } }
-  | { type: "agent.error"; payload: { message: string } }
+  | { type: "agent.error"; payload: {
+      message: string;
+      id?: string;
+      fingerprint?: string;
+      scope?: string;
+      severity?: string;
+      blocking?: "fatal" | "all_turns" | "channel" | "feature" | "request";
+      cause?: "config" | "runtime" | "external";
+      wake_status?: string;
+    } }
   | { type: "tool.call"; payload: { tool: string; arguments: unknown; call_id: string; step: number } }
   | { type: "tool.result"; payload: { tool: string; call_id: string; result: string } }
   | { type: "token.stats"; payload: { current_tokens?: number; prompt_cache_ratio?: number; cache_read_tokens?: number; cache_write_tokens?: number; uncached_input_tokens?: number } & Record<string, unknown> }

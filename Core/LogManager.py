@@ -246,3 +246,38 @@ def get_logger(name: str) -> logging.Logger:
         logger = get_logger(__name__)
     """
     return _log_manager.get_logger(name)
+
+
+def tail(category: str, lines: int = 80) -> str:
+    """读某个日志分类的末尾若干行（Architect 修复证据用；只读、失败返回空串）。"""
+    try:
+        base = _log_manager._log_dir or Path("./runtime_memory/logs")
+        path = Path(base) / str(category) / f"{category}.log"
+        if not path.is_file():
+            return ""
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            chunk = min(size, 256 * 1024)
+            f.seek(size - chunk)
+            data = f.read().decode("utf-8", "replace")
+        return "\n".join(data.splitlines()[-max(1, int(lines)):])
+    except Exception:
+        return ""
+
+
+def tail_file(path: str | Path, lines: int = 80) -> str:
+    """读任意日志文件末尾若干行（如 logs/gateway/crash.log）。"""
+    try:
+        p = Path(path)
+        if not p.is_file():
+            return ""
+        with p.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            chunk = min(size, 256 * 1024)
+            f.seek(size - chunk)
+            data = f.read().decode("utf-8", "replace")
+        return "\n".join(data.splitlines()[-max(1, int(lines)):])
+    except Exception:
+        return ""

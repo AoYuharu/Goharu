@@ -6,16 +6,20 @@
 background=True 时派发放守护线程——调用方是 turn 线程/看门狗线程，绝不能阻塞。
 """
 
+import json
 import logging
 import threading
 import time
 import uuid
 from collections import deque
+from pathlib import Path
 
 from Architect.audit import AuditPipeline
+from Architect.error_hooks import ErrorHookEngine
 from Architect.telemetry import TelemetryDigest
 from Architect.wake import (
-    KIND_GUARDIAN, REASON_CODE_UPDATE, REASON_FATAL, WakeRequest,
+    KIND_GUARDIAN, KIND_REPAIR, REASON_CODE_UPDATE, REASON_ERROR_HOOK,
+    REASON_FATAL, WakeRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,6 +86,18 @@ class ArchitectHub:
             merge_fn=merge_fn,
             test_timeout=hub_cfg.get("audit", {}).get("test_timeout", 600),
         )
+        # 错误 hook / 自修复：规则引擎默认可用；证据与回滚护栏由 Gateway 注入
+        hook_cfg = hub_cfg.get("error_hooks", {}) or {}
+        try:
+            self.error_engine = ErrorHookEngine(
+                hook_cfg.get("path", "runtime_memory/architect/error_hooks.json"))
+        except Exception:
+            logger.exception("ErrorHookEngine 初始化失败，错误唤醒降级为旧逻辑")
+            self.error_engine = None
+        self._error_evidence_fn = None
+        self._error_status_fn = None
+        self._repair_guard = None
+        self._repair_cfg = hub_cfg.get("repair", {}) or {}
 
     # ------------------------------------------------------------------
     # 遥测入口（TelemetryChannel 调用）+ 逻辑错误自动唤醒（触发器 ②）
@@ -89,14 +105,167 @@ class ArchitectHub:
 
     def ingest_event(self, event_type: str, payload: dict | None = None):
         self.digest.ingest(event_type, payload)
+        payload = payload or {}
         if event_type == "agent.error":
-            msg = str((payload or {}).get("message", ""))
+            # 统一错误记录（带 fingerprint/id）→ 规则引擎；旧 payload 回落兼容路径
+            if payload.get("fingerprint") and payload.get("id"):
+                self.ingest_error(dict(payload))
+                return
+            msg = str(payload.get("message", ""))
             if classify_error(msg) == "logic":
                 logger.warning("逻辑错误触发 Architect 守护唤醒: %s", msg[:200])
                 self.request_wake(WakeRequest(
                     reason=REASON_FATAL, kind=KIND_GUARDIAN, priority=0,
                     context={"trigger": "logic_error", "error": msg[:500]},
                 ))
+
+    # ------------------------------------------------------------------
+    # 错误 hook → 唤醒 / 自修复
+    # ------------------------------------------------------------------
+
+    def set_error_hooks(self, engine=None, evidence_fn=None, status_fn=None,
+                        repair_guard=None) -> None:
+        """Gateway 装配期注入：规则引擎（可替换）/证据读取/状态回写/修复护栏。"""
+        if engine is not None:
+            self.error_engine = engine
+        self._error_evidence_fn = evidence_fn
+        self._error_status_fn = status_fn
+        self._repair_guard = repair_guard
+        logger.info("error hooks wired: engine=%s evidence=%s status=%s repair=%s",
+                    bool(self.error_engine), bool(evidence_fn), bool(status_fn),
+                    bool(repair_guard))
+
+    def _error_status(self, error_id: str, **fields) -> None:
+        if not self._error_status_fn or not error_id:
+            return
+        try:
+            self._error_status_fn(error_id, **fields)
+        except Exception:
+            logger.warning("error status 回写失败: %s", fields, exc_info=True)
+
+    def _error_context(self, record: dict, rule: dict) -> dict:
+        evidence = {}
+        if self._error_evidence_fn is not None:
+            try:
+                evidence = self._error_evidence_fn(record) or {}
+            except Exception:
+                logger.warning("读取错误证据失败", exc_info=True)
+        ctx = {
+            "trigger": "error_hook",
+            "error_id": record.get("id", ""),
+            "fingerprint": record.get("fingerprint", ""),
+            "scope": record.get("scope", ""),
+            "severity": record.get("severity", ""),
+            "blocking": record.get("blocking", ""),
+            "cause": record.get("cause", ""),
+            "message": str(record.get("message", ""))[:4000],
+            "traceback": str(record.get("traceback", ""))[:12000],
+            "rule": rule.get("id", ""),
+        }
+        for key, value in (evidence or {}).items():
+            ctx[f"evidence.{key}"] = str(value)[:8000]
+        prompt_extra = str((rule.get("action") or {}).get("prompt_extra") or "")
+        ctx["修复要求"] = (
+            "报错，请注意观察并修复。注意！你的修复是直接改变原始代码，"
+            "你应该保证你自己的正常运行。先定位最小根因，不要顺手重构；"
+            "修改后必须运行相关契约测试与自检；如果修复会让自身无法启动，"
+            "必须回滚并报告原因。"
+            + (f"\n规则附加要求：{prompt_extra}" if prompt_extra else "")
+        )
+        return ctx
+
+    def ingest_error(self, record: dict) -> bool:
+        """统一错误 → hook 匹配 → 唤醒（成功受理返回 True）。"""
+        engine = self.error_engine
+        if engine is None or not isinstance(record, dict):
+            return False
+        try:
+            match = engine.evaluate(record)
+        except Exception:
+            logger.exception("错误 hook 匹配失败")
+            return False
+        if not match:
+            return False
+        rule = match["rule"]
+        action = rule.get("action") or {}
+        wants_repair = bool(action.get("repair", True))
+        # 没有修复护栏时不允许直接改生产代码，降级为守护分析
+        if wants_repair and self._repair_guard is None:
+            wants_repair = False
+        request = WakeRequest(
+            reason=REASON_ERROR_HOOK,
+            kind=KIND_REPAIR if wants_repair else KIND_GUARDIAN,
+            priority=0,
+            context=self._error_context(record, rule),
+        )
+        result = self.request_wake(request, background=True)
+        status = result.get("status")
+        if status in ("dispatched", "started"):
+            engine.mark_wake(str(record.get("fingerprint") or ""), str(rule.get("id") or ""))
+            self._error_status(
+                str(record.get("id") or ""),
+                wake_status="pending_repair" if wants_repair else "notified",
+                status="woken",
+                attempts=int((record.get("attempts") or 0)) + 1,
+            )
+            logger.warning("错误 hook 命中 %s → Arch 已唤醒（repair=%s, id=%s）",
+                           rule.get("id"), wants_repair, record.get("id"))
+            return True
+        logger.info("错误 hook 命中但未唤醒（%s）: %s", status, rule.get("id"))
+        return False
+
+    def _run_repair(self, request: WakeRequest, task_text: str) -> dict:
+        """错误修复派发：快照 → Arch 直接改生产代码 → 自检 → 失败回滚。"""
+        ctx = request.context or {}
+        error_id = str(ctx.get("error_id") or "")
+        guard = self._repair_guard
+        if guard is None:
+            return {"type": "error", "error": "repair guard 未接线"}
+        snapshot = {}
+        try:
+            snapshot = guard.snapshot()
+        except Exception as e:
+            logger.exception("修复前快照失败，拒绝修复")
+            self._error_status(error_id, wake_status="snapshot_failed",
+                               status="open", attempts=int(ctx.get("attempts") or 0))
+            return {"type": "error", "error": f"snapshot failed: {e}"}
+        if not snapshot.get("ok"):
+            self._error_status(error_id, wake_status="snapshot_failed", status="open")
+            return {"type": "error", "error": snapshot.get("error", "snapshot failed")}
+
+        self._error_status(error_id, wake_status="repairing")
+        try:
+            result = self._dispatch(KIND_REPAIR, task_text) if self._dispatch else None
+        except Exception as e:
+            logger.exception("Architect 修复派发异常")
+            result = {"type": "error", "error": f"{type(e).__name__}: {e}"}
+        verify = {}
+        try:
+            verify = guard.verify()
+        except Exception as e:
+            verify = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        failed = (not verify.get("ok")) or (
+            isinstance(result, dict) and result.get("status") == "error") or (
+            isinstance(result, dict) and result.get("type") == "error") or result is None
+        if not failed:
+            try:
+                guard.finish(snapshot)
+            except Exception:
+                logger.warning("RepairGuard 快照清理失败", exc_info=True)
+            self._error_status(error_id, wake_status="repair_done", status="resolved")
+            return result if isinstance(result, dict) else {"status": "success"}
+        restore = {}
+        try:
+            restore = guard.restore(snapshot)
+        except Exception as e:
+            restore = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        self._error_status(error_id, wake_status="repair_failed", status="open",
+                           extra={"verify": verify, "restore": restore})
+        self.notify_user(
+            f"⚠ Architect 自动修复失败，已尝试回滚（{error_id}）："
+            f"{verify.get('error') or '自检未通过'} / 回滚={restore.get('ok')}")
+        return {"type": "error", "error": "repair failed and rolled back",
+                "verify": verify, "restore": restore}
 
     def render_digest(self) -> str:
         return self.digest.render_text()
@@ -226,6 +395,8 @@ class ArchitectHub:
 
         def _run():
             try:
+                if request.reason == REASON_ERROR_HOOK and request.kind == KIND_REPAIR:
+                    return self._run_repair(request, task_text)
                 return self._dispatch(request.kind, task_text)
             finally:
                 self._dispatch_lock.release()

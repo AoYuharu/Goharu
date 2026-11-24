@@ -44,6 +44,8 @@ from Gateway.session_manager import SessionManager
 # Logging setup — centralized, per-module file output
 from Core.LogManager import init_logging, get_logger
 from Core.LifecycleLog import lifecycle
+from Core.error_report import report_error, report_fatal_early
+from Gateway.error_policy import classify_startup_error
 init_logging()
 logger = get_logger(__name__)
 lifecycle("════════ 新会话 ════════", f"Gateway 进程启动 pid={os.getpid()}", level=1)
@@ -593,16 +595,13 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     except Exception as e:
         logger.error(f"Error dispatching {method}: {e}", exc_info=True)
-
-        # Emit error event
-        write_json({
-            "jsonrpc": "2.0",
-            "method": "event",
-            "params": {
-                "type": "agent.error",
-                "payload": {"message": str(e)}
-            }
-        })
+        report_error(
+            f"RPC {method} failed: {type(e).__name__}: {e}",
+            scope="rpc", severity="error", blocking="request",
+            cause="runtime", source="gateway_entry.dispatch",
+            traceback=traceback.format_exc(),
+            extra={"method": str(method)},
+        )
 
         return {
             "jsonrpc": "2.0",
@@ -1084,6 +1083,14 @@ def main():
         if root_state["init_error"] is not None:
             init_err = root_state["init_error"]
             error_msg = str(init_err)
+            _blocking, _cause = classify_startup_error(error_msg)
+            report_fatal_early(
+                f"Gateway initialization failed: {error_msg}",
+                scope="gateway", cause=_cause, source="gateway_entry",
+                traceback="".join(traceback.format_exception(
+                    type(init_err), init_err, init_err.__traceback__)),
+                extra={"phase": "startup", "exception_type": type(init_err).__name__},
+            )
             log_crash(f"Gateway initialization failed: {error_msg}", sys.exc_info())
             write_json({
                 "jsonrpc": "2.0",
@@ -1183,6 +1190,13 @@ def main():
     except KeyboardInterrupt:
         logger.info("Interrupted, shutting down...")
     except Exception as e:
+        _blocking, _cause = classify_startup_error(str(e))
+        report_fatal_early(
+            f"Unhandled exception: {e}",
+            scope="gateway", cause=_cause, source="gateway_entry.main",
+            traceback=traceback.format_exc(),
+            extra={"phase": "main_loop", "exception_type": type(e).__name__},
+        )
         log_crash(f"Unhandled exception: {e}", sys.exc_info())
         sys.exit(1)
     finally:

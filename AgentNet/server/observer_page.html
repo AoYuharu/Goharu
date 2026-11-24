@@ -25,6 +25,26 @@
   .topRow .sub { margin-left: auto; color: var(--dim); font-size: 12px; }
   #menuBtn { width: 32px; height: 32px; border-radius: 10px; border: 1px solid var(--line);
     background: var(--panel2); color: var(--accent); font-size: 16px; cursor: pointer; }
+  #settingsBtn { width: 32px; height: 32px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--panel2); color: var(--yellow); font-size: 16px; cursor: pointer;
+    flex: 0 0 auto; }
+  /* ── 网络设置面板 ─────────────────────────────────── */
+  #netMask { position: fixed; inset: 0; background: rgba(0,0,0,.55); opacity: 0;
+    pointer-events: none; transition: opacity .18s; z-index: 70; }
+  #netMask.on { opacity: 1; pointer-events: auto; }
+  #netPanel { position: fixed; top: 0; bottom: 0; right: 0; width: 88%; max-width: 390px;
+    background: var(--panel); border-left: 1px solid var(--line); padding: 14px;
+    padding-top: calc(14px + env(safe-area-inset-top)); z-index: 71; overflow-y: auto;
+    transform: translateX(102%); transition: transform .2s ease; }
+  #netPanel.on { transform: translateX(0); }
+  .netRow { display: flex; align-items: center; gap: 8px; padding: 8px 2px;
+    border-bottom: 1px dashed var(--line); font-size: 13px; }
+  .netRow .nm { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; }
+  .netRow .nm small { color: var(--dim); font-size: 11px; }
+  .netDel { flex: 0 0 auto; border: 1px solid rgba(247,118,142,.5); background: var(--panel2);
+    color: var(--red); border-radius: 10px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
+  .netDel:disabled { opacity: .4; }
   .agents { display: flex; gap: 6px; overflow-x: auto; margin-top: 8px; padding-bottom: 2px;
     scrollbar-width: none; }
   .agents::-webkit-scrollbar { display: none; }
@@ -196,6 +216,20 @@
     color: var(--dim); font-size: 12px; padding: 5px 10px; }
   .msg.control .who { color: var(--dim); font-weight: 500; }
 
+  /* ── 错误流 ───────────────────────────────────────── */
+  .errCard { background: var(--panel); border: 1px solid var(--line);
+    border-left: 3px solid var(--yellow); border-radius: 12px;
+    padding: 9px 12px; margin-bottom: 8px; }
+  .errCard.fatal, .errCard.all_turns { border-left-color: var(--red); }
+  .errHead { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    font-size: 11px; color: var(--dim); }
+  .errBadge { border-radius: 6px; padding: 0 6px; line-height: 17px;
+    background: var(--panel2); color: var(--text); }
+  .errBadge.red { color: var(--red); } .errBadge.yellow { color: var(--yellow); }
+  .errBadge.blue { color: var(--accent); } .errBadge.green { color: var(--green); }
+  .errMsg { margin-top: 5px; white-space: pre-wrap; word-break: break-word;
+    font-size: 13px; }
+
   /* ── 待答卡片（AskUser / 高危确认）────────────────── */
   #askDock { position: sticky; top: 0; z-index: 20; }
   .askCard { background: var(--panel); border: 1px solid var(--accent2);
@@ -242,6 +276,7 @@
     <button id="menuBtn" aria-label="智能体菜单">☰</button>
     <h1>⬡ HaruNet</h1>
     <span class="sub" id="sub">连接中…</span>
+    <button id="settingsBtn" aria-label="网络设置">⚙</button>
   </div>
   <div class="agents" id="agents"></div>
 </header>
@@ -252,8 +287,9 @@
 <div class="tabs" id="tabs">
   <div class="tab on" data-f="all">全部</div>
   <div class="tab" data-f="mention">@ 提及</div>
+  <div class="tab" data-f="errors">错误</div>
 </div>
-<main id="feed"><div id="askDock"></div><div class="empty">暂无消息</div></main>
+<main id="feed"><div id="askDock"></div><div id="errorList" style="display:none"></div><div class="empty">暂无消息</div></main>
 <div id="newpill">↓ 新消息</div>
 
 <section id="composer">
@@ -275,6 +311,24 @@
     <div class="back" id="backBtn">← 返回列表</div>
     <div class="detail" id="detailBody"></div>
   </div>
+</aside>
+
+<div id="netMask"></div>
+<aside id="netPanel">
+  <div class="drawerHead">
+    <h2>🌐 HaruNet 设置</h2>
+    <span class="cnt" id="netClose" style="cursor:pointer">✕</span>
+  </div>
+  <div class="section">接入密码</div>
+  <div class="kv"><span class="k">当前</span><span class="v" id="pwState">—</span></div>
+  <div class="renameRow">
+    <input id="pwInput" maxlength="64" placeholder="新密码（留空=关闭密码模式）">
+    <button class="renameBtn" id="pwSave">保存</button>
+  </div>
+  <div class="secHint">新设备凭此密码自动登记入网；已登记成员免密。保存后立即生效、重启不丢。</div>
+  <div class="section">已注册智能体</div>
+  <div id="netAgents"></div>
+  <div class="secHint">删除 = 从白名单与状态表移除，在线连接立即断开。密码模式下对方若仍持有密码，重连会再次自动登记。</div>
 </aside>
 
 <script>
@@ -333,6 +387,7 @@ function renderPresence(agents) {
   document.getElementById('agentCnt').textContent = online + ' 在线 / 共 ' + ids.length;
   renderMentionRow(ids);
   renderFloorBar(floorData);
+  if (document.getElementById('netPanel').classList.contains('on')) renderNetAgents();
   if (drawer.classList.contains('on')) {
     if (document.getElementById('agentDetail').style.display === 'none') renderAgentList();
     else {
@@ -492,8 +547,9 @@ function renderMsg(m) {
 }
 function nearBottom() { return feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80; }
 function clearFeed() {
-  // 保留待答卡片区：节点身份、输入值、焦点和事件监听器都不能因消息刷新丢失
-  feed.replaceChildren(document.getElementById('askDock'));
+  // 保留待答卡片区与错误流容器：节点身份、输入值、焦点和监听器不能因刷新丢失
+  feed.replaceChildren(document.getElementById('askDock'),
+                       document.getElementById('errorList'));
 }
 function append(ms) {
   if (!ms.length) return;
@@ -823,6 +879,115 @@ document.getElementById('menuBtn').onclick = openDrawer;
 mask.onclick = closeDrawer;
 document.getElementById('backBtn').onclick = showList;
 
+/* ── 网络设置面板：接入密码 + 已注册智能体删除 ─────────── */
+const netPanel = document.getElementById('netPanel');
+const netMask = document.getElementById('netMask');
+function openNetPanel() {
+  netPanel.classList.add('on');
+  netMask.classList.add('on');
+  loadJoinPassword();
+  renderNetAgents();
+}
+function closeNetPanel() {
+  netPanel.classList.remove('on');
+  netMask.classList.remove('on');
+}
+document.getElementById('settingsBtn').onclick = openNetPanel;
+document.getElementById('netClose').onclick = closeNetPanel;
+netMask.onclick = closeNetPanel;
+
+async function loadJoinPassword() {
+  try {
+    const r = await fetch(q('/api/join-password'));
+    if (!r.ok) return;
+    const j = await r.json();
+    document.getElementById('pwState').textContent =
+      j.enabled ? j.password : '未设置（仅白名单模式）';
+  } catch (e) { /* 忽略，下次再拉 */ }
+}
+
+async function saveJoinPassword() {
+  const btn = document.getElementById('pwSave');
+  const input = document.getElementById('pwInput');
+  const pw = input.value.trim();
+  if (pw && !confirm('保存后立即生效：新设备需使用此密码入网。确定？')) return;
+  if (!pw && !confirm('密码留空 = 关闭密码模式（仅白名单接入）。确定？')) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch(q('/api/join-password'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Token': TOKEN },
+      body: JSON.stringify({ password: pw }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) {
+      input.value = '';
+      loadJoinPassword();
+      alert('已保存');
+    } else {
+      alert('保存失败: ' + (j.error || r.status));
+    }
+  } catch (e) {
+    alert('网络错误: ' + e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+document.getElementById('pwSave').onclick = saveJoinPassword;
+document.getElementById('pwInput').onkeydown = e => {
+  if (e.key === 'Enter') saveJoinPassword();
+};
+
+function renderNetAgents() {
+  const boxEl = document.getElementById('netAgents');
+  boxEl.innerHTML = '';
+  const ids = Object.keys(agentsData);
+  if (!ids.length) {
+    boxEl.appendChild(el('div', 'secHint', '（暂无已注册智能体）'));
+    return;
+  }
+  for (const id of ids) {
+    const a = agentsData[id];
+    const row = el('div', 'netRow');
+    const nm = el('span', 'nm');
+    nm.appendChild(document.createTextNode(a.name || id));
+    nm.appendChild(el('small', '', ` ${id} · ${a.online ? '在线' : '离线'}`));
+    row.appendChild(nm);
+    // owner（haru）是服务器自持身份，不允许删除
+    if ((a.name || '') !== 'haru') {
+      const btn = el('button', 'netDel', '删除');
+      btn.onclick = () => removeAgent(id, a.name || id, btn);
+      row.appendChild(btn);
+    }
+    boxEl.appendChild(row);
+  }
+}
+
+async function removeAgent(id, name, btn) {
+  if (!confirm(`删除智能体「${name}」？将从白名单与状态表移除，在线连接立即断开。`)) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch(q('/api/remove-agent'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Token': TOKEN },
+      body: JSON.stringify({ target: id }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) {
+      delete agentsData[id];
+      renderNetAgents();
+      renderPresence(agentsData);
+      alert(`已删除「${j.name || name}」`);
+    } else {
+      alert('删除失败: ' + (j.error || r.status));
+    }
+  } catch (e) {
+    alert('网络错误: ' + e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 /* ── 待答卡片：AskUser 问题 / 高危命令确认 ─────────── */
 const askCards = {};   // request_id → card 元素（已存在则保留，避免抢输入焦点）
 
@@ -969,15 +1134,54 @@ function buildQuestionCard(r) {
   return card;
 }
 
+/* ── 错误流 ───────────────────────────────────────── */
+function errCard(row) {
+  const card = el('div', 'errCard ' + (row.blocking || ''));
+  const head = el('div', 'errHead');
+  head.appendChild(el('span', 'errBadge ' +
+    (row.severity === 'fatal' || row.blocking === 'fatal' ||
+     row.blocking === 'all_turns' ? 'red' : 'yellow'),
+    row.blocking || 'feature'));
+  head.appendChild(el('span', 'errBadge blue', row.cause || 'runtime'));
+  head.appendChild(el('span', 'errBadge', row.scope || '—'));
+  head.appendChild(document.createTextNode(
+    (row.agent_name || row.agent_id || '?') + ' · ' + fmtTs(row.ts)));
+  head.appendChild(el('span', 'errBadge ' +
+    (row.wake_status === 'repair_done' ? 'green' : ''), row.wake_status || 'none'));
+  if (row.status) head.appendChild(el('span', 'errBadge', row.status));
+  card.appendChild(head);
+  card.appendChild(el('div', 'errMsg', row.message || ''));
+  return card;
+}
+function renderErrors(rows) {
+  const box = document.getElementById('errorList');
+  box.style.display = '';
+  box.textContent = '';
+  if (!(rows || []).length) {
+    box.appendChild(el('div', 'empty', '暂无错误记录'));
+    return;
+  }
+  for (const row of rows || []) box.appendChild(errCard(row));
+  feed.scrollTop = feed.scrollHeight;
+}
+
 /* ── 轮询 ─────────────────────────────────────────── */
 async function poll() {
   try {
-    const r = await fetch(q(`/api/messages?limit=200&after=${lastId}&filter=${filter}`));
-    if (r.status === 401) { document.getElementById('sub').textContent = '需要 token'; return; }
-    const j = await r.json();
-    const ms = j.messages || [];
-    if (ms.length) lastId = ms[ms.length - 1].id;
-    append(ms);
+    const errorList = document.getElementById('errorList');
+    if (filter === 'errors') {
+      errorList.style.display = '';
+      const er = await fetch(q('/api/errors?limit=200'));
+      if (er.ok) renderErrors((await er.json()).errors || []);
+    } else {
+      errorList.style.display = 'none';
+      const r = await fetch(q(`/api/messages?limit=200&after=${lastId}&filter=${filter}`));
+      if (r.status === 401) { document.getElementById('sub').textContent = '需要 token'; return; }
+      const j = await r.json();
+      const ms = j.messages || [];
+      if (ms.length) lastId = ms[ms.length - 1].id;
+      append(ms);
+    }
     const pr = await fetch(q('/api/presence'));
     if (pr.ok) renderPresence((await pr.json()).agents || {});
     const ar = await fetch(q('/api/requests'));

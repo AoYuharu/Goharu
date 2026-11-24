@@ -28,6 +28,7 @@ from typing import Any, Optional
 import websockets
 
 from AgentNet.identity import Identity
+from AgentNet.server.error_log import ErrorLog
 from AgentNet.protocol import (
     RUNTIME_STATES,
     agent_id_from_pubkey_der,
@@ -84,11 +85,25 @@ class Whitelist:
         if cur.get("pubkey") == pubkey and cur.get("name") == name:
             return
         agents[agent_id] = {**cur, "name": name, "pubkey": pubkey}
+        self._persist()
+        logger.info("whitelist 登记: %s (%s)", agent_id, name)
+
+    def remove_agent(self, agent_id: str) -> bool:
+        """移除一个已登记的智能体（观察台"删除设备"用）。"""
+        self.maybe_reload()
+        agents = self._data.get("agents", {})
+        if agent_id not in agents:
+            return False
+        del agents[agent_id]
+        self._persist()
+        logger.info("whitelist 移除: %s", agent_id)
+        return True
+
+    def _persist(self) -> None:
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self._path)
         self.reload()
-        logger.info("whitelist 登记: %s (%s)", agent_id, name)
 
 
 class Presence:
@@ -137,6 +152,15 @@ class Presence:
                 self._table[agent_id]["online"] = False
                 self._table[agent_id]["last_seen"] = now_ts()
                 self._persist()
+
+    def remove(self, agent_id: str) -> bool:
+        """从状态机表移除（观察台"删除设备"：与白名单同步清理）。"""
+        with self._lock:
+            if agent_id not in self._table:
+                return False
+            del self._table[agent_id]
+            self._persist()
+            return True
 
     def rename(self, agent_id: str, name: str) -> bool:
         """主人中控改名：状态机表同步更新并广播（白名单由调用方改）。"""
@@ -334,14 +358,24 @@ class HubServer:
         self.host = host
         self.port = port
         self.whitelist = Whitelist(whitelist_path)
-        # 接入密码：未在白名单的设备凭它自动登记入网；空 = 仅白名单模式。
-        # 白名单已有成员免密（向后兼容，无需给存量设备补密码）。
-        self.join_password = join_password or ""
         state_dir.mkdir(parents=True, exist_ok=True)
+        # 接入密码：未在白名单的设备凭它自动登记入网；空 = 仅白名单模式。
+        # 白名单已有成员免密。持久化：state_dir/join_password.txt 为准（观察台
+        # 可运行时修改）；文件不存在时由启动参数初始化并落盘。
+        self._pw_path = state_dir / "join_password.txt"
+        if self._pw_path.exists():
+            try:
+                self.join_password = self._pw_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                self.join_password = join_password or ""
+        else:
+            self.join_password = join_password or ""
+            self._persist_join_password()
         self.presence = Presence(state_dir / "presence.json")
         self.mailbox = Mailbox(state_dir / "mailbox.db")
         self.message_log = MessageLog(state_dir / "messages.db")
         self.files = FileStore(state_dir / "files")
+        self.errors = ErrorLog(state_dir / "errors.db")
         # 挂起的询问/确认（agent→server "ask" 信封存入，观察台 /api/answer 回送）
         self.pending_asks: dict[str, dict] = {}
         self._pending_asks_lock = threading.Lock()
@@ -424,6 +458,57 @@ class HubServer:
             self.mailbox.put(target, env)
             return {"ok": True, "msg_id": env["id"], "queued": True}
         return {"ok": True, "msg_id": env["id"], "queued": False}
+
+    # ---------------------------------------------------------- 接入密码（观察台可改）
+    def _persist_join_password(self) -> None:
+        tmp = self._pw_path.with_suffix(".tmp")
+        tmp.write_text(self.join_password, encoding="utf-8")
+        tmp.replace(self._pw_path)
+
+    def join_password_snapshot(self) -> dict:
+        return {"enabled": bool(self.join_password),
+                "password": self.join_password}
+
+    def submit_join_password(self, password: str) -> dict:
+        """观察台设置接入密码（空 = 关闭密码模式，仅白名单）。持久化到 state。"""
+        self.join_password = str(password or "").strip()
+        try:
+            self._persist_join_password()
+        except OSError as e:
+            return {"ok": False, "error": f"写盘失败: {e}"}
+        logger.info("接入密码已更新（%s）", "已开启" if self.join_password else "已关闭")
+        self._log_floor("接入密码已更新", self.owner.agent_id)
+        return {"ok": True, **self.join_password_snapshot()}
+
+    # ---------------------------------------------------------- 删除已注册智能体
+    def submit_remove_agent(self, target: str) -> dict:
+        """观察台删除已登记设备：白名单 + presence 移除，在线连接即刻断开。
+
+        注意：密码模式开启时，被删设备若仍持有密码，重连会再次自动登记。
+        """
+        target = str(target or "").strip()
+        if not target or self.whitelist.agent(target) is None:
+            return {"ok": False, "error": "目标不在白名单"}
+        if target == self.owner.agent_id:
+            return {"ok": False, "error": "不能删除 owner 自身身份"}
+        name = (self.whitelist.agent(target) or {}).get("name", target)
+        ws = self._online.pop(target, None)
+        if ws is not None and self.loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(ws.close(), self.loop)
+            except Exception:
+                pass
+        self.whitelist.remove_agent(target)
+        self.presence.remove(target)
+        if self.loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_presence(), self.loop)
+            except Exception:
+                pass
+        self._log_floor(f"已删除智能体 {name}（{target}）", self.owner.agent_id)
+        logger.info("观察台删除设备: %s (%s)", target, name)
+        return {"ok": True, "removed": target, "name": name}
 
     # ---------------------------------------------------------- 网络话语权（Floor）
     def floor_snapshot(self) -> Optional[dict]:
@@ -736,6 +821,21 @@ class HubServer:
                 str(p.get("note") or ""),
                 by=sender)
             return
+        if t == "error_report":
+            record = self.whitelist.agent(sender)
+            if record is None or not Identity.verify(
+                    record["pubkey"], canonical_bytes(env), env.get("sig", "")):
+                logger.warning("error_report 验签失败 from=%s", sender)
+                return
+            err = (env.get("payload") or {}).get("record")
+            if not isinstance(err, dict) or not err.get("id"):
+                logger.warning("error_report 载荷非法 from=%s", sender)
+                return
+            self.errors.upsert(sender, record.get("name", sender), err)
+            logger.info("错误流登记: %s [%s/%s] %s",
+                        err.get("id"), err.get("blocking"), err.get("cause"),
+                        str(err.get("message", ""))[:120])
+            return
         if t == "message":
             # 验签（防冒充）；白名单公钥
             record = self.whitelist.agent(sender)
@@ -830,6 +930,10 @@ def main() -> None:
             on_answer=server.submit_answer,
             on_floor=server.submit_floor_request,
             floor_snapshot=server.floor_snapshot,
+            error_log=server.errors,
+            join_password_snapshot=server.join_password_snapshot,
+            on_set_join_password=server.submit_join_password,
+            on_remove_agent=server.submit_remove_agent,
         )
         observer.start()
     asyncio.run(server.serve())

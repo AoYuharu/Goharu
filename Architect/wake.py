@@ -20,13 +20,15 @@ REASON_CODE_UPDATE = "code_update"   # git push 钩子：staging 有待审计更
 REASON_SCHEDULED = "scheduled"       # 定时自省（未实现）
 REASON_IDLE = "idle"                 # 空闲探索（未实现）
 REASON_MANUAL = "manual"             # 人工点名
+REASON_ERROR_HOOK = "error_hook"     # 统一错误记录命中 Architect hook
 
-# kind 决定任务模板：守护 / 审计 / 自省 / 探索 / 话语权对话
+# kind 决定任务模板：守护 / 审计 / 自省 / 探索 / 话语权对话 / 错误修复
 KIND_GUARDIAN = "guardian"
 KIND_AUDIT = "audit"
 KIND_INTROSPECT = "introspect"
 KIND_EXPLORE = "explore"
 KIND_FLOOR_CHAT = "floor_chat"       # 话语权=arch：主人直接对话
+KIND_REPAIR = "repair"               # 错误 hook 触发的生产代码修复
 
 
 @dataclass

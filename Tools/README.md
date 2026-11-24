@@ -140,6 +140,8 @@ tools = await create_tools(config={
 | `agent_delegate` | AgentDelegate | 注入 llm 后可用（`create_agent(subagent_llm=)`）；否则回退 Goharu LLMCore | ✅ |
 | `reload_tools` | ReloadTools | 无（热重载内置工具模块） | ✅ |
 | `mcp_tools` | mcp_manage | mcp, httpx | ✅（启用 MCP 时） |
+| `architect_tools` | ConsultArchitect / MessageHero / SetConfig | 宿主带 Architect 模块（惰性 import 降级） | ⚠️ 需 Architect |
+| `error_hooks_tools` | ErrorHook | 宿主带 Architect 模块 + ErrorHookEngine | ⚠️ 需 Architect |
 
 ## 宿主边界（不属于本模块）
 

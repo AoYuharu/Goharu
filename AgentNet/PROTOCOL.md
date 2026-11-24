@@ -147,6 +147,11 @@ hub 按 id 顺序逐条以**原始 envelope** 转发（不包外层类型）。�
 - **端 → hub：`floor`**：`{action: set|clear, target, persona: main|arch, note}`，当前白名单智能体均可发起，hub 记录并全网广播。
 - **hub → 端：`floor_state`**：`{floor: {holder_agent_id, holder_name, persona, since, note}|null}`。floor 仅内存保存，hub 重启清空；持有者掉线自动收回。
 
+### 3.8 统一错误流
+
+- **端 → hub：`error_report`**（验签）：`{record: {id, fingerprint, ts, scope, severity, blocking, cause, source, session, message, traceback, retryable, status, wake_status, attempts, updated_ts, extra}}`。同一 `id` 再次上报表示状态更新（upsert）。
+- 语义：`blocking ∈ fatal|all_turns|channel|feature|request`（后果）；`cause ∈ config|runtime|external`（根因）。hub 存入 `state_dir/errors.db`，观察台通过 `GET /api/errors` 读取。
+
 ---
 
 ## 4. HTTP 接口（观察台，端口 6001）
@@ -160,6 +165,7 @@ hub 按 id 顺序逐条以**原始 envelope** 转发（不包外层类型）。�
 | GET | `/api/presence` | `{agents: {...}}`（同 §3.3 presence_state payload） |
 | GET | `/api/requests` | `{requests: [...]}`：未过期的挂起提问/高危确认 |
 | GET | `/api/floor` | `{floor: <快照或 null>}` |
+| GET | `/api/errors?limit=200&after=<row_id>` | `{errors: [...]}`：统一错误流（按 row_id 增量） |
 | GET | `/api/messages?limit=100&after=<id>&filter=all\|mention\|group\|dm` | 消息流水（当前页按 id **旧→新**，`after` 增量拉取） |
 | POST | `/api/send` | 主人广播指令 `{text, mentions?}` → `{ok, msg_id}` |
 | POST | `/api/control` | 中控 `{target, action, name?, extra...}` → `{ok, msg_id, queued}` |

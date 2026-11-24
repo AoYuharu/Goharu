@@ -92,6 +92,11 @@ def main():
     check("启用快照含 serverMessageHandler", "serverMessageHandler" in enabled_names,
           str(sorted(enabled_names)))
     check("启用快照含 FloorControl", "FloorControl" in enabled_names)
+    check("始终注册 ErrorHook（Arch 自管理规则）", "ErrorHook" in enabled_names,
+          str(sorted(enabled_names)))
+    from Agent.SubAgent import SubAgentConfig
+    check("Architect 白名单含 ErrorHook",
+          "ErrorHook" in SubAgentConfig.get_allowed_tools("architect"))
 
     print("\n[4] 接入开关：默认关闭，环境变量覆盖")
     check("config 默认 agentnet.enabled=false", cfg["agentnet"]["enabled"] is False)

@@ -171,6 +171,7 @@ tools:
   - Tools.builtin.reload_tools
   - Tools.builtin.mcp_tools
   - Tools.builtin.architect_tools
+  - Tools.builtin.error_hooks_tools
   - Tools.builtin.time_tool
   - Tools.builtin.reminder_tools
   - Tools.builtin.music_tools
@@ -279,6 +280,16 @@ architect_hub:
     identity_path: runtime_memory/identity.yaml
   guardian:
     not_ready_seconds: 600
+  error_hooks:
+    path: ./runtime_memory/architect/error_hooks.json
+  repair:
+    enabled: true
+    max_attempts: 2
+    max_snapshot_mb: 200
+    timeout: 600
+    repo_dir: .
+    self_check_commands: []        # 修复后的额外自检（如 python tests/test_xxx.py）
+    startup_check_commands: []     # 启动安全自检（可复用同上）
   upgrade:
     enabled: true
     check_interval_seconds: 1800

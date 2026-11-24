@@ -356,6 +356,14 @@ class AgentNetClient:
                      "persona": persona, "note": note})
         await self._send(env)
 
+    async def send_error_report(self, record: dict) -> str:
+        """把统一错误记录上报 hub（观察台错误流）；fire-and-forget。"""
+        env = make_envelope(
+            sender=self.identity.agent_id, to="server", type_="error_report",
+            payload={"record": record})
+        await self._send(env)
+        return env["id"]
+
     async def query_presence(self, timeout: float = 10) -> dict:
         """查状态机快照：{agent_id: {state, last_seen, name}}。"""
         if self._presence_waiter is not None and not self._presence_waiter.done():

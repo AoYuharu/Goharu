@@ -18,15 +18,18 @@ import logging
 import queue
 import threading
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
 from Core.Message import CoreMessage, MessageSource
 from Core.LifecycleLog import lifecycle
+from Core.error_report import report_error
 from Core.timing import timeit
 from Core.TokenEstimator import TokenEstimator
 from Tools.api import tool_process_tracker
 from configurationLoader import config
+from Gateway.error_policy import classify_llm_error
 from Gateway.plan_mode import is_plan_mode_command
 from Gateway.names import EXEC_LABEL, MAINT_LABEL
 from Prompting.reminders import PLAN_MODE_REMINDER
@@ -940,6 +943,14 @@ class AgentSession:
                         await self.compact_session()
                         continue
                     logger.error(f"Actor error: {error_msg}")
+                    blocking, cause, retryable = classify_llm_error(error_msg)
+                    report_error(
+                        f"Actor error: {error_msg}",
+                        scope="agent", severity="error", blocking=blocking,
+                        cause=cause, source="Gateway.session",
+                        session=self.session_id, retryable=retryable,
+                        extra={"response_type": "actor_error"},
+                    )
                     lifecycle("轮结束", f"错误: {error_msg}", level=2)
                     self._broadcast_answer(f"Error: {error_msg}")
                     self._turn_outcome = "error"
@@ -961,8 +972,13 @@ class AgentSession:
             err_type = type(e).__name__
             err_msg = str(e) or "(no message)"
             logger.error(f"Error processing message: {err_type}: {err_msg}", exc_info=True)
-            self._broadcast_event("agent.error",
-                                  {"message": f"Agent异常 [{err_type}]: {err_msg}"})
+            report_error(
+                f"Agent异常 [{err_type}]: {err_msg}",
+                scope="agent", severity="error", blocking="request",
+                cause="runtime", source="Gateway.session",
+                session=self.session_id, traceback=traceback.format_exc(),
+                extra={"exception_type": err_type},
+            )
             raise
         finally:
             # checkpoint：turn 结束收口（finalize 重哈希 + git 对账 + 落盘）。
