@@ -77,7 +77,7 @@ class AgentNetChannel(Channel):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._reply_target: Optional[dict] = None  # {sender}
-        self._agent_replied = False  # 本 turn 模型已通过 serverMessageHandler 发过消息
+        self._agent_replied = False  # 本 turn 模型已通过 agentnet_reply 发过消息
         self._connected = threading.Event()
         self._urgent_buf: list = []              # 待合并的 urgent 消息（mention/dm）
         self._urgent_lock = threading.Lock()
@@ -484,7 +484,7 @@ class AgentNetChannel(Channel):
         parts.append("提示：三类消息区别对待——【@你的消息】是重点（被点名，"
                      "需处理或回应）；【主人消息·群体动态】和【关注期内群消息】是"
                      "旁观察看：主人在和别的智能体对话、或话题与你无关时，不要插话"
-                     "不要回复，看完即可。回复请用 serverMessageHandler(reply)。")
+                     "不要回复，看完即可。回复请用 agentnet_reply。")
         if not owners:
             parts.append("（同事消息：只有确实需要回应或行动时才用 reply 回复；"
                          "不要发送纯确认/待命/寒暄类消息，避免与同事形成反弹循环。）")
@@ -560,7 +560,7 @@ class AgentNetChannel(Channel):
     def send_answer(self, text: str, meta: dict | None = None):
         """把回答广播回网（全员可见），并 @ 最近一条 urgent 消息的发送者。
 
-        去重：模型本 turn 已经用 serverMessageHandler reply 发过消息时不再中继
+        去重：模型本 turn 已经用 agentnet_reply 发过消息时不再中继
         （否则同一条回答出现两遍）。中继/跳过之后清空回复目标——防止后续与
         组网无关的 turn（如 TUI 私聊）把回答误广播到全网。
 
@@ -644,7 +644,7 @@ class AgentNetChannel(Channel):
 
     def net_set_floor_fut(self, action: str, target: str = "",
                           persona: str = "main", note: str = ""):
-        """切换网络话语权（FloorControl 工具调用）：set|clear，hub 广播全网。"""
+        """切换网络话语权（floor_handoff/floor_release 工具调用）：set|clear，hub 广播全网。"""
         if not self._client or not self._loop or not self._connected.is_set():
             return None
         return asyncio.run_coroutine_threadsafe(
@@ -744,7 +744,7 @@ class AgentNetChannel(Channel):
         digest = self.box.digest_text()
         if not digest:
             return []
-        return [digest + "\n（可用 serverMessageHandler 工具的 summary/read 查看与展开）"]
+        return [digest + "\n（可用 agentnet_summary / agentnet_read 查看与展开）"]
 
     # ------------------------------------------------- 安静期自动合并阅读
     def _quiet_watcher(self) -> None:
@@ -793,7 +793,7 @@ class AgentNetChannel(Channel):
         parts.extend(self._consume_group_rows())
         parts.append("提示：以上为群内非定向消息——注意每条@的是谁：主人在和别的"
                      "智能体对话、或话题与你无关时，旁观即可不要插话；确实与你"
-                     "相关或被问到时才用 serverMessageHandler(reply) 回复。")
+                     "相关或被问到时才用 agentnet_reply 回复。")
         logger.info("安静期自动阅读触发")
         self.emit_inbound("\n".join(parts), meta={"agentnet": True, "class": "group",
                                                   "auto_read": True})

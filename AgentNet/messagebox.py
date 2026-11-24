@@ -2,7 +2,7 @@
 
 核心目的：智能体不一股脑收所有消息——消息先落盒（SQLite append-only），
 模型只看到分类计数摘要（经 reminders 便利贴进当轮上下文），展开由
-阈值触发或模型主动调 serverMessageHandler(read) 完成。
+阈值触发或模型主动调 agentnet_read 完成。
 
 类别：mention（群@我）/ dm（私聊）/ group（群闲聊），维度含 peer
 （dm 的对方 / group 的群名）。

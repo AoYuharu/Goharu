@@ -108,7 +108,7 @@ def main():
         asyncio.run(loopback_test(root))
 
         # ---------------------------------------------------------- 5. channel + 工具
-        print("\n[5] AgentNetChannel + serverMessageHandler 接线")
+        print("\n[5] AgentNetChannel + agentnet_* 工具接线")
         asyncio.run(channel_test(root))
 
         # ---------------------------------------------------------- 6. 附件
@@ -289,7 +289,7 @@ async def channel_test(root: Path):
     """channel 全链路：hub + AgentNetChannel(goharu) + 对端 SDK 客户端。
 
     验证：dm → emit_inbound 唤醒（含标注）；群消息静默入盒；
-    摘要便利贴；send_answer 回中继；serverMessageHandler 四动作。
+    摘要便利贴；send_answer 回中继；agentnet_* 工具动作。
     """
     from AgentNet.client import AgentNetClient
     from AgentNet.server.hub import HubServer
@@ -383,19 +383,18 @@ async def channel_test(root: Path):
         check("便利贴摘要", extras and "📬" in extras[0], str(extras))
 
         # 工具：summary / read / reply / presence
-        s = json.loads(await agentnet_tools.serverMessageHandler(action="summary"))
+        s = json.loads(await agentnet_tools.agentnet_summary())
         # 唤醒即已读：mention/dm 在入盒时就被标记（内容已进合并上下文），
         # 未读只剩未唤醒的群闲聊
         check("唤醒消息不占未读", s.get("ok") and s["unread"] == 1, str(s)[:120])
-        r = json.loads(await agentnet_tools.serverMessageHandler(
-            action="read", class_="group"))
+        r = json.loads(await agentnet_tools.agentnet_read(class_="group"))
         check("工具 read 展开+标已读", r.get("ok") and r["count"] == 1
               and ch.box.summary().get("group") is None, str(r)[:120])
-        p = json.loads(await agentnet_tools.serverMessageHandler(action="presence"))
+        p = json.loads(await agentnet_tools.agentnet_presence())
         check("工具 presence", p.get("ok") and p["agents"].get(id_x.agent_id, {}).get("online"),
               str(p)[:120])
-        rp = json.loads(await agentnet_tools.serverMessageHandler(
-            action="reply", text="收到你的私聊了", mentions=[id_x.agent_id]))
+        rp = json.loads(await agentnet_tools.agentnet_reply(
+            text="收到你的私聊了", mentions=[id_x.agent_id]))
         check("工具 reply（广播+@）", rp.get("ok"), str(rp))
         check("reply 触达对端", await wait(lambda: len(received_x) == 1, label="reply"))
         if received_x:
@@ -509,9 +508,8 @@ async def channel_test(root: Path):
         ch._group_inline_max_chars = 1500
 
         # update_profile：工具更新档案 → 落盘 + hub presence 即时生效
-        up = json.loads(await agentnet_tools.serverMessageHandler(
-            action="update_profile", focus="代码与组网协作",
-            tags=["coding", "agentnet"]))
+        up = json.loads(await agentnet_tools.agentnet_update_profile(
+            focus="代码与组网协作", tags=["coding", "agentnet"]))
         check("工具 update_profile", up.get("ok"), str(up))
         ok = await wait(
             lambda: (hub.presence.snapshot().get(id_g.agent_id, {})
@@ -1770,7 +1768,7 @@ async def security_control_test(root: Path):
 
 
 def reconnect_tool_test():
-    """serverMessageHandler(action=reconnect) → channel.net_reconnect_fut。"""
+    """agentnet_reconnect() → channel.net_reconnect_fut。"""
     import asyncio as _aio
     from concurrent.futures import Future
 
@@ -1790,7 +1788,7 @@ def reconnect_tool_test():
     old = agentnet_tools._handle
     try:
         agentnet_tools.set_agentnet_handle(h)
-        out = _aio.run(agentnet_tools.serverMessageHandler(action="reconnect"))
+        out = _aio.run(agentnet_tools.agentnet_reconnect())
         check("工具触发主动重连", h.kicked and '"ok": true' in out, out)
     finally:
         agentnet_tools.set_agentnet_handle(old)

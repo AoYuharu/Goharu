@@ -34,7 +34,7 @@ def check(name, cond, detail=""):
         print(f"  FAIL  {name}  {str(detail)[:300]}")
 
 
-NET_WORDS = ("HaruNet", "AgentNet", "组网", "serverMessageHandler", "FloorControl",
+NET_WORDS = ("HaruNet", "AgentNet", "组网", "agentnet_", "floor_",
              "话语权", "haru-box")
 
 
@@ -49,7 +49,7 @@ def main():
     if net_md.exists():
         net_text = net_md.read_text(encoding="utf-8")
         check("组网段含 HaruNet 成员规则", "HaruNet" in net_text
-              and "serverMessageHandler" in net_text and "FloorControl" in net_text)
+              and "agentnet_reply" in net_text and "floor_handoff" in net_text)
 
     print("\n[2] 叠加层：只有组合根追加时组网段才进 system")
     from configurationLoader import config
@@ -80,8 +80,8 @@ def main():
     from Tools.registry import registry
     asyncio.run(create_tools())
     names = {e.name for e in registry.list_entries()}
-    check("registry 无 serverMessageHandler", "serverMessageHandler" not in names)
-    check("registry 无 FloorControl", "FloorControl" not in names)
+    check("registry 无 agentnet_* 工具", not [n for n in names if n.startswith("agentnet_")])
+    check("registry 无 floor_* 工具", not [n for n in names if n.startswith("floor_")])
 
     print("\n[3.1] 启用时：条件工具在首次定义快照前注册")
     # 与 SessionManager 的真实顺序一致：先 import 条件模块，再 create_tools。
@@ -89,9 +89,12 @@ def main():
     enabled_tools = asyncio.run(create_tools())
     enabled_defs = asyncio.run(enabled_tools.list_tools())
     enabled_names = {d["name"] for d in enabled_defs}
-    check("启用快照含 serverMessageHandler", "serverMessageHandler" in enabled_names,
-          str(sorted(enabled_names)))
-    check("启用快照含 FloorControl", "FloorControl" in enabled_names)
+    check("启用快照含 agentnet_* 工具",
+          {"agentnet_summary", "agentnet_read", "agentnet_reply",
+           "agentnet_presence", "agentnet_update_profile",
+           "agentnet_reconnect"} <= enabled_names, str(sorted(enabled_names)))
+    check("启用快照含 floor_* 工具",
+          {"floor_handoff", "floor_release", "floor_status"} <= enabled_names)
     check("始终注册 ErrorHook（Arch 自管理规则）", "ErrorHook" in enabled_names,
           str(sorted(enabled_names)))
     from Agent.SubAgent import SubAgentConfig

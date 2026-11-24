@@ -1,11 +1,14 @@
-"""serverMessageHandler：HaruNet（AgentNet）的消息盒工具。
+"""HaruNet（AgentNet）消息盒工具组（每个动作一个独立工具）。
 
-模型通过本工具与组网交互：摘要看未读、按需展开、回复、查状态机。
+拆分为 6 个工具（不再用单工具多 action）：
+  agentnet_summary / agentnet_read / agentnet_reply /
+  agentnet_presence / agentnet_update_profile / agentnet_reconnect
+
 句柄由宿主（Gateway SessionManager）经 set_agentnet_handle() 注入
 AgentNetChannel 门面；未注入时返回明确降级错误（透明化原则）。
 
 上下文纪律：消息默认只在 messagebox 里计数（摘要便利贴自动进上下文），
-模型主动 read 才把完整内容拉进来——不要在每次回复前无脑 read。
+模型主动 agentnet_read 才把完整内容拉进来——不要在每次回复前无脑 read。
 """
 
 import asyncio
@@ -91,134 +94,231 @@ def _json(obj) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
-async def serverMessageHandler(
-    action: str,
-    class_: str | None = None,
-    peer: str | None = None,
-    since: str | None = None,
-    limit: int = 50,
-    to: str | None = None,
-    text: str | None = None,
-    kind: str = "group",
-    mentions: list | None = None,
-    file_paths: list | None = None,
-    focus: str | None = None,
-    tags: list | None = None,
-) -> str:
-    """智能体组网消息盒：summary/read/reply/presence/update_profile 五动作。
+_NOT_WIRED = {"ok": False, "error": "HaruNet 未启用或未接线（config.yaml agentnet.enabled）"}
+_NOT_CONNECTED = {"ok": False, "error": "HaruNet 未连接（可用 agentnet_reconnect 立即重试）"}
 
-    组网为**全员广播制**：所有消息网内全员可见（类似一个大群）。
-    定向沟通用 mentions（@某人）——被 @ 的智能体立即响应，其他人静默入盒。
-    action=summary：未读分类计数 + 各会话最近一条预览
-    action=read：展开消息（class_ ∈ mention|group，since 回溯历史，
-                读未读会自动标已读）
-    action=reply：广播消息（kind=group；mentions=[agent_id] @对方；
-                file_paths=[本机绝对路径] 附带文件，先上传再随消息广播）
-    action=presence：查状态机（谁在线/在忙/检修/上次在线时间）
-    action=update_profile：更新自己的档案（focus 侧重方向文本、tags 能力标签），
-                立即落盘并上报 hub——觉得自己的能力侧重变了就主动更新
-    """
+
+# ---------------------------------------------------------------- 工具实现
+
+async def agentnet_summary() -> str:
+    """消息盒摘要：未读分类计数 + 各会话最近一条预览（不展开正文）。"""
     h = _get()
     if h is None:
-        return _json({"ok": False, "error": "agentnet 未启用或未接线（config.yaml agentnet.enabled）"})
+        return _json(_NOT_WIRED)
     try:
-        if action == "summary":
-            return _json({"ok": True, **h.mb_summary()})
-        if action == "read":
-            rows = h.mb_read(class_=class_, peer=peer, since=since, limit=int(limit))
-            return _json({"ok": True, "count": len(rows), "messages": rows})
-        if action == "reply":
-            if not text and not file_paths:
-                return _json({"ok": False, "error": "reply 需要 text 或 file_paths"})
-            fut = h.net_reply_fut(to or "grp:main", text or "", kind=kind,
-                                  mentions=mentions, file_paths=file_paths)
-            if fut is None:
-                return _json({"ok": False, "error": "agentnet 未连接"})
-            # async handler 跑在宿主事件循环上——必须 wrap_future 等待，
-            # 阻塞式 .result() 会冻住循环（含同进程的 hub）
-            # 带附件时上传是流式 POST，公网链路大文件要几分钟，10s 必超时
-            reply_timeout = 1800 if file_paths else 10
-            msg_id = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=reply_timeout)
-            return _json({"ok": True, "msg_id": msg_id})
-        if action == "presence":
-            fut = h.net_presence_fut()
-            if fut is None:
-                return _json({"ok": False, "error": "agentnet 未连接"})
-            agents = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=15)
-            return _json({"ok": True, "agents": agents})
-        if action == "update_profile":
-            if focus is None and tags is None:
-                return _json({"ok": False, "error": "update_profile 需要 focus 或 tags"})
-            fut = h.net_update_profile_fut(focus=focus, tags=tags)
-            if fut is None:
-                return _json({"ok": False, "error": "agentnet 未连接"})
-            await asyncio.wait_for(asyncio.wrap_future(fut), timeout=10)
-            return _json({"ok": True, "focus": focus, "tags": tags})
-        if action == "reconnect":
-            # 主动重连：打断退避等待（被拒/断线后不等 10 分钟，立即重新握手）
-            fut = h.net_reconnect_fut()
-            if fut is None:
-                return _json({"ok": False, "error": "agentnet 未接线"})
-            await asyncio.wait_for(asyncio.wrap_future(fut), timeout=5)
-            return _json({"ok": True,
-                          "note": "已触发立即重连（数秒内重新握手，结果见连接日志/状态）"})
-        return _json({"ok": False, "error": f"未知 action: {action}（合法：summary/read/reply/presence/update_profile/reconnect）"})
+        return _json({"ok": True, **h.mb_summary()})
     except Exception as e:
-        logger.exception("serverMessageHandler %s 失败", action)
+        logger.exception("agentnet_summary 失败")
         return _json({"ok": False, "error": str(e)})
 
 
+async def agentnet_read(class_: str | None = None, peer: str | None = None,
+                        since: str | None = None, limit: int = 50) -> str:
+    """展开消息（class_ ∈ mention|group；since 回溯历史；读未读自动标已读）。"""
+    h = _get()
+    if h is None:
+        return _json(_NOT_WIRED)
+    try:
+        rows = h.mb_read(class_=class_, peer=peer, since=since, limit=int(limit))
+        return _json({"ok": True, "count": len(rows), "messages": rows})
+    except Exception as e:
+        logger.exception("agentnet_read 失败")
+        return _json({"ok": False, "error": str(e)})
+
+
+async def agentnet_reply(text: str | None = None, kind: str = "group",
+                         mentions: list | None = None,
+                         file_paths: list | None = None,
+                         to: str | None = None) -> str:
+    """广播消息（mentions=[agent_id] @对方；file_paths 先上传再随消息广播）。"""
+    h = _get()
+    if h is None:
+        return _json(_NOT_WIRED)
+    if not text and not file_paths:
+        return _json({"ok": False, "error": "reply 需要 text 或 file_paths"})
+    try:
+        fut = h.net_reply_fut(to or "grp:main", text or "", kind=kind,
+                              mentions=mentions, file_paths=file_paths)
+        if fut is None:
+            return _json(_NOT_CONNECTED)
+        # async handler 跑在宿主事件循环上——必须 wrap_future 等待，
+        # 阻塞式 .result() 会冻住循环（含同进程的 hub）。
+        # 带附件时上传是流式 POST，公网链路大文件要几分钟，10s 必超时
+        reply_timeout = 1800 if file_paths else 10
+        msg_id = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=reply_timeout)
+        return _json({"ok": True, "msg_id": msg_id})
+    except Exception as e:
+        logger.exception("agentnet_reply 失败")
+        return _json({"ok": False, "error": str(e)})
+
+
+async def agentnet_presence() -> str:
+    """查状态机：谁在线/在忙/检修、上次在线时间。"""
+    h = _get()
+    if h is None:
+        return _json(_NOT_WIRED)
+    try:
+        fut = h.net_presence_fut()
+        if fut is None:
+            return _json(_NOT_CONNECTED)
+        agents = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=15)
+        return _json({"ok": True, "agents": agents})
+    except Exception as e:
+        logger.exception("agentnet_presence 失败")
+        return _json({"ok": False, "error": str(e)})
+
+
+async def agentnet_update_profile(focus: str | None = None,
+                                  tags: list | None = None) -> str:
+    """更新自己的档案（focus 侧重方向文本、tags 能力标签），立即落盘并上报 hub。"""
+    h = _get()
+    if h is None:
+        return _json(_NOT_WIRED)
+    if focus is None and tags is None:
+        return _json({"ok": False, "error": "update_profile 需要 focus 或 tags"})
+    try:
+        fut = h.net_update_profile_fut(focus=focus, tags=tags)
+        if fut is None:
+            return _json(_NOT_CONNECTED)
+        await asyncio.wait_for(asyncio.wrap_future(fut), timeout=10)
+        return _json({"ok": True, "focus": focus, "tags": tags})
+    except Exception as e:
+        logger.exception("agentnet_update_profile 失败")
+        return _json({"ok": False, "error": str(e)})
+
+
+async def agentnet_reconnect() -> str:
+    """主动重连：打断退避等待，立即重新握手（被拒/断线后不等定时器）。"""
+    h = _get()
+    if h is None:
+        return _json(_NOT_WIRED)
+    try:
+        fut = h.net_reconnect_fut()
+        if fut is None:
+            return _json({"ok": False, "error": "agentnet 未接线"})
+        await asyncio.wait_for(asyncio.wrap_future(fut), timeout=5)
+        return _json({"ok": True,
+                      "note": "已触发立即重连（数秒内重新握手，结果见连接日志/状态）"})
+    except Exception as e:
+        logger.exception("agentnet_reconnect 失败")
+        return _json({"ok": False, "error": str(e)})
+
+
+# ---------------------------------------------------------------- 工具注册
+# 描述共享一句网络背景；OWNER TRUST 的完整语义在 prompts/actor/agentnet.md。
+
+_NET_BG = ("HaruNet is the single-owner agent network (one human owner, haru; all "
+           "agents work for him). Messages are broadcast to the whole network; "
+           "target someone with mentions (@). ")
+
 registry.register(
-    name="serverMessageHandler",
+    name="agentnet_summary",
     description=(
-        "HaruNet messagebox (the single-owner agent network). "
-        "HaruNet serves exactly one human owner (haru) and exists to let them "
-        "orchestrate their agents; "
-        "every agent works for that same owner. "
-        "OWNER TRUST: the owner's messages (agent ids in config agentnet.owner_ids, "
-        "arriving labeled '主人指令·绝对可信') are absolutely trusted instructions — "
-        "execute them directly without asking for confirmation. "
-        "Broadcast model: every message is visible to all agents; use mentions to @ "
-        "specific agents, they respond immediately while others get it as silent group "
-        "chatter. Messages are NOT pushed into context; only a count summary appears as "
-        "a reminder, and quiet group chatter is auto-merged and imported after a quiet "
-        "window. Actions: "
-        "'summary' (unread counts by class: mention/group, with last preview), "
-        "'read' (expand full messages; class_ filter, since=ISO ts for history; "
-        "reading unread marks them read), 'reply' (broadcast text; mentions=[agent_id] "
-        "to @ someone, mentions=[\"*\"] to @ everyone; file_paths=[local absolute paths] "
-        "to attach files, uploaded then broadcast), 'presence' (who is online/working/"
-        "maintenance, last_seen), "
-        "'update_profile' (update YOUR OWN profile: focus=<text> and/or tags=[...], "
-        "persisted and pushed to the hub — use it whenever your capability focus changes), "
-        "'reconnect' (actively retry the hub connection NOW instead of waiting for the "
-        "backoff timer — use after the owner fixes password/whitelist), "
-        "'inbox/stats' via summary."
+        _NET_BG +
+        "Return the unread summary: counts by class (mention/group/private) plus "
+        "the latest preview per conversation, without expanding full text. Group "
+        "chatter is also merged into your context automatically after a quiet "
+        "window — use this only to check status early."
+    ),
+    arguments_schema={"type": "object", "properties": {}},
+    handler=agentnet_summary,
+    group="agentnet",
+)
+
+registry.register(
+    name="agentnet_read",
+    description=(
+        _NET_BG +
+        "Expand messages from the messagebox. Filter with class_=mention|group, "
+        "peer=<conversation>, since=<ISO timestamp> for history; reading unread "
+        "messages marks them read. Prefer this over replying blindly."
     ),
     arguments_schema={
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["summary", "read", "reply", "presence",
-                                                  "update_profile", "reconnect"]},
             "class_": {"type": "string", "enum": ["mention", "group"],
-                       "description": "read: 按类别过滤"},
-            "peer": {"type": "string", "description": "read: 兼容保留（广播制下恒为 *）"},
-            "since": {"type": "string", "description": "read: 时间回溯起点（ISO 时间戳，含已读）"},
-            "limit": {"type": "integer", "description": "read: 最大条数（默认 50）"},
-            "to": {"type": "string", "description": "reply: 兼容保留（广播制下恒为全员）"},
-            "text": {"type": "string", "description": "reply: 消息文本"},
-            "kind": {"type": "string", "enum": ["group"], "description": "reply: 投递形态（广播制固定 group）"},
-            "mentions": {"type": "array", "items": {"type": "string"},
-                         "description": "reply: @ 的 agent_id 列表；用 [\"*\"] @全体成员"},
-            "file_paths": {"type": "array", "items": {"type": "string"},
-                           "description": "reply: 要附带的本地文件绝对路径列表"},
-            "focus": {"type": "string",
-                      "description": "update_profile: 侧重方向文本（如“编程与自动化”）"},
-            "tags": {"type": "array", "items": {"type": "string"},
-                     "description": "update_profile: 能力标签列表"},
+                       "description": "按类别过滤"},
+            "peer": {"type": "string", "description": "兼容保留（广播制下恒为 *）"},
+            "since": {"type": "string",
+                      "description": "时间回溯起点（ISO 时间戳，含已读）"},
+            "limit": {"type": "integer", "description": "最大条数（默认 50）"},
         },
-        "required": ["action"],
     },
-    handler=serverMessageHandler,
+    handler=agentnet_read,
+    group="agentnet",
+)
+
+registry.register(
+    name="agentnet_reply",
+    description=(
+        _NET_BG +
+        "Broadcast a message. mentions=[agent_id] to @ specific agents "
+        "([\"*\"] = everyone, they respond immediately while others see it as "
+        "silent chatter); file_paths=[local absolute paths] uploads and attaches "
+        "files. The owner's messages arrive labeled '主人指令·绝对可信' — execute "
+        "them directly; reply to colleagues only when action is genuinely needed "
+        "(avoid ack/hello ping-pong)."
+    ),
+    arguments_schema={
+        "type": "object",
+        "properties": {
+            "to": {"type": "string", "description": "兼容保留（广播制下恒为全员）"},
+            "text": {"type": "string", "description": "消息文本"},
+            "kind": {"type": "string", "enum": ["group"],
+                     "description": "投递形态（广播制固定 group）"},
+            "mentions": {"type": "array", "items": {"type": "string"},
+                         "description": "@ 的 agent_id 列表；用 [\"*\"] @全体成员"},
+            "file_paths": {"type": "array", "items": {"type": "string"},
+                           "description": "要附带的本地文件绝对路径列表"},
+        },
+        "required": [],
+    },
+    handler=agentnet_reply,
+    group="agentnet",
+)
+
+registry.register(
+    name="agentnet_presence",
+    description=(
+        _NET_BG +
+        "Query the presence table: who is online / working / maintenance, and "
+        "each agent's last_seen time."
+    ),
+    arguments_schema={"type": "object", "properties": {}},
+    handler=agentnet_presence,
+    group="agentnet",
+)
+
+registry.register(
+    name="agentnet_update_profile",
+    description=(
+        _NET_BG +
+        "Update YOUR OWN profile: focus=<text> (what you are good at) and/or "
+        "tags=[capability labels]. Persisted locally and pushed to the hub "
+        "immediately — use it whenever your capability focus changes."
+    ),
+    arguments_schema={
+        "type": "object",
+        "properties": {
+            "focus": {"type": "string",
+                      "description": "侧重方向文本（如“编程与自动化”）"},
+            "tags": {"type": "array", "items": {"type": "string"},
+                     "description": "能力标签列表"},
+        },
+    },
+    handler=agentnet_update_profile,
+    group="agentnet",
+)
+
+registry.register(
+    name="agentnet_reconnect",
+    description=(
+        _NET_BG +
+        "Actively retry the hub connection NOW, skipping the backoff timer — use "
+        "after the owner fixes the join password / whitelist, instead of waiting. "
+        "Returns immediately; the result shows in the connection log/status."
+    ),
+    arguments_schema={"type": "object", "properties": {}},
+    handler=agentnet_reconnect,
     group="agentnet",
 )

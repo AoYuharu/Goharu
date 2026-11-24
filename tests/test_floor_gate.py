@@ -118,7 +118,7 @@ def main():
     check("gate=handled", decision == "handled", decision)
     check("收到透明提示", any("话语权当前在" in x and "haru-box" in x and "arch" in x
                           for x in ch.sent), str(ch.sent))
-    check("提示带收回指引", any("FloorControl" in x or "观察台" in x
+    check("提示带收回指引", any("floor_release" in x or "观察台" in x
                           for x in ch.sent), str(ch.sent))
 
     # ------------------------------------- 4. 话语权在别处 + agentnet 广播副本

@@ -110,7 +110,7 @@ class AgentSession:
             msg,
             f"🎙 话语权当前在 {snap.holder_name or snap.holder_agent_id}"
             f"（{'arch' if snap.persona == 'arch' else '主'}），本条消息未处理。"
-            "可在观察台继续对话，或用 FloorControl 收回话语权。")
+            "可在观察台继续对话，或用 floor_release 收回话语权。")
         return "handled"
 
     def _floor_origin_channel(self, msg):
@@ -154,7 +154,7 @@ class AgentSession:
                 or (snap.since and time.time() - snap.since > 600)):
             reminder = (
                 f"你已经长期持有了 {EXEC_LABEL} 的聊天能力，请注意，如果你不再必要，"
-                f"应该切换回 {EXEC_LABEL} 发言（调用 FloorControl action='release'，"
+                f"应该切换回 {EXEC_LABEL} 发言（调用 floor_release，"
                 "或 handoff 回主执行人格）。")
         origin = self._floor_origin_channel(msg)
         with self._floor_q_lock:

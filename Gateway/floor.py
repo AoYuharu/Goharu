@@ -2,7 +2,7 @@
 
 话语权 = 网络内唯一的状态：(持有账号 agent_id, 人格 persona∈{main,arch})。
 hub 是权威；各端由 AgentNetChannel 的 floor_state 事件同步一份本地快照，
-Gateway 的入队关卡（AgentSession）与 FloorControl 工具读它做路由决策。
+Gateway 的入队关卡（AgentSession）与 floor_* 工具读它做路由决策。
 
 空快照（holder_agent_id == ""）= 无话语权 = 功能关闭（如未接 agentnet）。
 """
