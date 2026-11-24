@@ -47,12 +47,32 @@ if [ -f "$(pwd)/install.py" ] && [ -f "$(pwd)/run_tui_ts.py" ]; then
 fi
 
 # ── 克隆/更新到目标目录 ──
-if [ -d "$TARGET_DIR/.git" ]; then
+# 只有"有效仓库"（.git 完整 + install.py 在）才 pull；残缺 .git（删除/克隆中断
+# 残留）或空目录自动清理重建；目录含其他文件则报错不动用户数据。
+is_repo=0
+if [ -d "$TARGET_DIR/.git" ] && [ -f "$TARGET_DIR/install.py" ] \
+   && [ "$(git -C "$TARGET_DIR" rev-parse --is-inside-work-tree 2>/dev/null)" = "true" ]; then
+  is_repo=1
+fi
+if [ "$is_repo" = "1" ]; then
   info "已存在 $TARGET_DIR，拉取最新代码"
   git -C "$TARGET_DIR" pull --ff-only || true
+elif [ -e "$TARGET_DIR" ]; then
+  left="$(find "$TARGET_DIR" -mindepth 1 -maxdepth 1 ! -name ".git" 2>/dev/null | head -1)"
+  if [ -n "$left" ]; then
+    err "$TARGET_DIR 已存在但不是有效的 Goharu 仓库（含其他文件）；请删除该目录或设置 GOHARU_DIR 指定新目录后重跑"
+    exit 1
+  fi
+  info "发现残缺目录 $TARGET_DIR，清理后重新克隆"
+  rm -rf "$TARGET_DIR"
+  git clone "$REPO_URL" "$TARGET_DIR" || { err "克隆失败，请检查网络后重试"; exit 1; }
 else
   info "克隆仓库到 $TARGET_DIR"
-  git clone "$REPO_URL" "$TARGET_DIR"
+  git clone "$REPO_URL" "$TARGET_DIR" || { err "克隆失败，请检查网络后重试"; exit 1; }
+fi
+if [ ! -f "$TARGET_DIR/install.py" ]; then
+  err "克隆后 $TARGET_DIR 中没有 install.py，请检查网络后重试"
+  exit 1
 fi
 
 cd "$TARGET_DIR"

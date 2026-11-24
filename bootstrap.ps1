@@ -1,4 +1,4 @@
-# Goharu 一键引导（Windows）
+﻿# Goharu 一键引导（Windows）
 #
 # 一行安装（Win+R 粘贴回车，或 PowerShell 窗口执行，自动 clone + 进入交互式向导）：
 #   powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/AoYuharu/Goharu/master/bootstrap.ps1 | iex"
@@ -45,14 +45,34 @@ if ((Test-Path ".\install.py") -and (Test-Path ".\run_tui_ts.py")) {
 }
 
 # ── 克隆/更新到目标目录 ──
-if (Test-Path (Join-Path $TargetDir ".git")) {
+# 只有"有效仓库"（.git 完整 + install.py 在）才 pull；残缺 .git（删除/克隆中断
+# 残留）或空目录自动清理重建；目录含其他文件则报错不动用户数据。
+$isRepo = $false
+if ((Test-Path (Join-Path $TargetDir ".git")) -and
+    (Test-Path (Join-Path $TargetDir "install.py"))) {
+    $isRepo = ((& git -C $TargetDir rev-parse --is-inside-work-tree 2>$null) -eq "true")
+}
+if ($isRepo) {
     Info "已存在 $TargetDir，拉取最新代码"
     git -C $TargetDir pull --ff-only | Out-Null
+} elseif (Test-Path $TargetDir) {
+    $left = Get-ChildItem $TargetDir -Force | Where-Object { $_.Name -ne ".git" }
+    if ($left) {
+        Err "$TargetDir 已存在但不是有效的 Goharu 仓库（含其他文件）；请删除该目录或设置 GOHARU_DIR 指定新目录后重跑"
+        return
+    }
+    Info "发现残缺目录 $TargetDir，清理后重新克隆"
+    Remove-Item $TargetDir -Recurse -Force
+    git clone $RepoUrl $TargetDir
 } else {
     Info "克隆仓库到 $TargetDir"
     git clone $RepoUrl $TargetDir
 }
 
+if (-not (Test-Path (Join-Path $TargetDir "install.py"))) {
+    Err "克隆后 $TargetDir 中没有 install.py，请检查网络后重试"
+    return
+}
 Set-Location $TargetDir
 Info "进入安装向导…"
 & $py install.py
