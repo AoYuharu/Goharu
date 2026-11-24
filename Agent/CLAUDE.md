@@ -76,6 +76,13 @@ AgentDelegate → SubAgent.execute（子代理 turn 驱动：迭代上限/倒计
     组装器。改动后跑 `tests/test_subagent_loop_unified.py`（含 thinking
     结构化回传回归：截断续写必须以 `{"type":"thinking"}` 块回传）。
 
+12. **prompt_loader 注入缝**（2026-11-24）：`create_agent(prompt_loader=)` →
+    `ActorAgent(prompt_loader=)` → `PromptAssembler(prompt_loader=)`。None →
+    Prompting 默认加载器（全局配置 prompt.system.*），Goharu 原行为不变；宿主
+    组合根可注入"叠加了功能段"的加载器（`Prompting.api.create_prompt_loader` +
+    Gateway/prompt_sections.py），让未启用的功能在 system 里零痕迹。
+    Agent 层只认"加载器"这个通用对象，禁止在此 import 任何具体功能的开关。
+
 ## 接口契约测试
 
 `tests/test_agent_loop_standalone.py`（tests/ 目录）：剧本化假 LLM 驱动真实 ActorAgent——

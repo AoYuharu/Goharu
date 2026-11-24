@@ -144,6 +144,14 @@ def main():
         # ------------------------------------------------- 12. security 单测
         print("\n[12] CommandSecurityChecker.apply_rules")
         security_unit_test()
+
+        # ------------------------------------------------- 13. 网络话语权
+        print("\n[13] 网络话语权（hub 广播/观察台/掉线收回）")
+        asyncio.run(floor_test(root))
+
+        # ------------------------------------------- 14. 接入边界（握手/退避）
+        print("\n[14] 接入边界：两段式握手 + 白名单拒绝长退避")
+        asyncio.run(handshake_test(root))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -335,7 +343,7 @@ async def channel_test(root: Path):
         await client_x.send_message(id_g.agent_id, "私聊你一下", kind="dm")
         check("dm 唤醒入站", await wait(lambda: len(inbound) == 1, label="dm inbound"))
         if inbound:
-            check("入站为合并整理格式", "组网消息整理" in inbound[0].text
+            check("入站为合并整理格式", "HaruNet 组网消息整理" in inbound[0].text
                   and id_x.agent_id in inbound[0].text, inbound[0].text)
 
         # 主人身份识别：owner_ids 内的发送者 → 可信标注 + meta.from_owner
@@ -643,6 +651,28 @@ async def channel_test(root: Path):
         await asyncio.sleep(1.6)
         check("乒乓刹车生效", ok1 and len(inbound) == mid2,
               f"woke_first={ok1} delta={len(inbound) - mid2}")
+
+        # ── 网络话语权（channel 层）：他人持权 → @ 不唤醒；归己 → 唤醒 ──
+        ch._agent_pingpong_limit = 3
+        ch._agent_streak = 0
+        ch.attention_seconds = 60
+        mock_floor = {"holder_agent_id": id_x.agent_id, "holder_name": "haru-box",
+                      "persona": "main", "since": time.time()}
+        ch.floor.update(mock_floor)
+        ch._attentive_until = 0
+        mid = len(inbound)
+        await client_x.send_message("grp:town", "@你但话语权在别处", kind="group",
+                                    mentions=[id_g.agent_id])
+        await asyncio.sleep(1.8)
+        check("他人持权 → @也不唤醒", len(inbound) == mid,
+              f"delta={len(inbound) - mid}")
+        ch.floor.update({"holder_agent_id": id_g.agent_id, "holder_name": "goharu",
+                         "persona": "main", "since": time.time()})
+        mid = len(inbound)
+        await client_x.send_message("grp:town", "归你了", kind="group")
+        ok = await wait(lambda: len(inbound) > mid, label="floor owner wake")
+        check("话语权归己 → 主人消息必唤醒", ok, f"delta={len(inbound) - mid}")
+        ch.floor.update(None)
 
         # 关注期状态上报观察台：进入/退出翻转即推 presence（hub 存 attentive 字段）
         ch._attentive_until = time.time() + 60
@@ -1050,6 +1080,234 @@ async def wait_conn(client, timeout: float = 8) -> bool:
             return True
         await asyncio.sleep(0.05)
     return False
+
+
+async def floor_test(root: Path):
+    """网络话语权全链路：agent 工具/观察台设置 → floor_state 广播 → welcome 快照
+    → 观察台查询 → 持有者掉线自动收回。"""
+    import urllib.error
+    import urllib.request
+
+    from AgentNet.client import AgentNetClient
+    from AgentNet.server.hub import HubServer
+    from AgentNet.server.observer import ObserverServer
+
+    port, oport = free_port(), free_port()
+    a = Identity.load_or_create(root / "fl_a", name="alpha")
+    b = Identity.load_or_create(root / "fl_b", name="beta")
+    c = Identity.load_or_create(root / "fl_c", name="gamma")
+    wl_path = root / "wl_fl.json"
+    wl_path.write_text(json.dumps({
+        "agents": {a.agent_id: {"name": "alpha", "pubkey": a.pubkey_b64},
+                   b.agent_id: {"name": "beta", "pubkey": b.pubkey_b64},
+                   c.agent_id: {"name": "gamma", "pubkey": c.pubkey_b64}},
+        "groups": {}}), encoding="utf-8")
+    hub = HubServer("127.0.0.1", port, wl_path, root / "hub_state_fl")
+    obs = ObserverServer(hub.message_log, hub.presence, host="127.0.0.1", port=oport,
+                         token="fltok", file_store=hub.files, whitelist=hub.whitelist,
+                         on_floor=hub.submit_floor_request,
+                         floor_snapshot=hub.floor_snapshot)
+    obs.start()
+    serve_task = asyncio.create_task(hub.serve())
+    await asyncio.sleep(0.3)
+
+    events_a, events_b = [], []
+    ca = AgentNetClient(a, f"ws://127.0.0.1:{port}", heartbeat_seconds=3600,
+                        on_event=lambda k, e: events_a.append((k, e)))
+    cb = AgentNetClient(b, f"ws://127.0.0.1:{port}", heartbeat_seconds=3600,
+                        on_event=lambda k, e: events_b.append((k, e)))
+    ta = asyncio.create_task(ca.connect_forever())
+    tb = asyncio.create_task(cb.connect_forever())
+
+    def post_floor(payload: dict, token: str = "fltok"):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{oport}/api/floor",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Token": token})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read().decode("utf-8"))
+            except Exception:
+                return e.code, {}
+
+    def get_floor():
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{oport}/api/floor?token=fltok", timeout=5) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    try:
+        check("floor 双端上线", await wait_conn(ca) and await wait_conn(cb))
+
+        # agent 工具路径：a 把话语权交给 b
+        await ca.set_floor("set", target=b.agent_id, persona="main",
+                           note="测试转交")
+        deadline = time.time() + 8
+        got = None
+        while time.time() < deadline:
+            for k, e in events_b:
+                if k == "floor_state" and (e.get("payload") or {}).get("floor"):
+                    got = (e.get("payload") or {})["floor"]
+                    break
+            if got:
+                break
+            await asyncio.sleep(0.05)
+        check("floor_state 广播到持有者", got is not None, str(events_b)[-300:])
+        if got:
+            check("广播载荷正确", got.get("holder_agent_id") == b.agent_id
+                  and got.get("persona") == "main"
+                  and got.get("holder_name") == "beta", str(got))
+        check("非持有者也收到广播",
+              any(k == "floor_state" for k, _ in events_a), str(events_a)[-200:])
+
+        # 观察台查询
+        data = await asyncio.to_thread(get_floor)
+        check("观察台可见话语权", (data.get("floor") or {}).get("holder_agent_id")
+              == b.agent_id, str(data))
+
+        # 迟到者 welcome 快照携带 floor（独立身份 gamma，避免同身份双连接竞态）
+        events_c = []
+        cc = AgentNetClient(c, f"ws://127.0.0.1:{port}", heartbeat_seconds=3600,
+                            on_event=lambda k, e: events_c.append((k, e)))
+        tc = asyncio.create_task(cc.connect_forever())
+        ok = await wait_conn(cc)
+        welcome_floor = None
+        for k, e in events_c:
+            if k == "welcome":
+                welcome_floor = (e.get("payload") or {}).get("floor")
+        check("welcome 携带 floor 快照", ok and welcome_floor
+              and welcome_floor.get("holder_agent_id") == b.agent_id,
+              str(welcome_floor))
+        await cc.close()
+        tc.cancel()
+
+        # 无 token 被拒；带 token 收回
+        status, _ = await asyncio.to_thread(
+            post_floor, {"action": "clear"}, "")
+        check("无 token 话语权被拒", status == 403, str(status))
+        status, j = await asyncio.to_thread(post_floor, {"action": "clear"})
+        check("带 token 收回成功", status == 200 and j.get("ok")
+              and not j.get("floor"), f"{status} {j}")
+
+        # 观察台转交给 arch（简写）：b 未报 hosts_architect → 失败
+        status, j = await asyncio.to_thread(
+            post_floor, {"action": "set", "target": "arch", "persona": "arch"})
+        check("无 arch 宿主时优雅拒绝", status == 500 and not j.get("ok"),
+              f"{status} {j}")
+
+        # 持有者掉线 → 自动收回
+        events_a.clear()
+        status, j = await asyncio.to_thread(
+            post_floor, {"action": "set", "target": b.agent_id, "persona": "main"})
+        check("先设置持有者", status == 200 and j.get("ok"), f"{status} {j}")
+        await cb.close()
+        deadline = time.time() + 8
+        cleared = False
+        while time.time() < deadline:
+            for k, e in events_a:
+                if k == "floor_state" and not (e.get("payload") or {}).get("floor"):
+                    cleared = True
+                    break
+            if cleared:
+                break
+            await asyncio.sleep(0.05)
+        check("持有者掉线 → 自动收回广播", cleared, str(events_a)[-300:])
+        data = await asyncio.to_thread(get_floor)
+        check("收回后快照为空", data.get("floor") is None, str(data))
+    finally:
+        await ca.close()
+        await cb.close()
+        ta.cancel()
+        tb.cancel()
+        serve_task.cancel()
+        for t in (ta, tb, serve_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+async def handshake_test(root: Path):
+    """接入边界：hello 不带/不采信设备档案（入白名单后才 profile_update 上报）；
+    不在白名单的机器握手被拒后走长退避，不刷屏。"""
+    import websockets
+
+    from AgentNet.client import AgentNetClient
+    from AgentNet.server.hub import HubServer
+
+    port = free_port()
+    b = Identity.load_or_create(root / "hs_b", name="beta")
+    c = Identity.load_or_create(root / "hs_c", name="gamma")
+    d = Identity.load_or_create(root / "hs_d", name="intruder")
+    wl_path = root / "wl_hs.json"
+    wl_path.write_text(json.dumps({
+        "agents": {b.agent_id: {"name": "beta", "pubkey": b.pubkey_b64},
+                   c.agent_id: {"name": "gamma", "pubkey": c.pubkey_b64}},
+        "groups": {}}), encoding="utf-8")
+    hub = HubServer("127.0.0.1", port, wl_path, root / "hub_state_hs")
+    serve_task = asyncio.create_task(hub.serve())
+    await asyncio.sleep(0.3)
+
+    # 真客户端：档案经第二段（profile_update）到达 hub
+    cb = AgentNetClient(b, f"ws://127.0.0.1:{port}", heartbeat_seconds=3600,
+                        profile={"focus": "beta-focus"})
+    tb = asyncio.create_task(cb.connect_forever())
+    # 不在白名单：短退避参数便于测试观测
+    cd = AgentNetClient(d, f"ws://127.0.0.1:{port}", heartbeat_seconds=3600,
+                        reject_backoff_seconds=1)
+    td = asyncio.create_task(cd.connect_forever())
+    try:
+        check("白名单端上线", await wait_conn(cb))
+        ok = False
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            prof = hub.presence.snapshot().get(b.agent_id, {}).get("profile") or {}
+            if prof.get("focus") == "beta-focus" and (prof.get("device") or {}).get("host"):
+                ok = True
+                break
+            await asyncio.sleep(0.05)
+        check("档案经 profile_update 第二段上报", ok,
+              str(hub.presence.snapshot().get(b.agent_id, {}).get("profile"))[:160])
+
+        # 原始 ws：hello 带诱饵档案 → hub 必须忽略
+        hello = make_envelope(sender=c.agent_id, to="server", type_="hello",
+                              payload={"agent_id": c.agent_id, "name": "gamma",
+                                       "pubkey": c.pubkey_b64,
+                                       "profile": {"focus": "LEAK-MARKER"}})
+        hello["sig"] = c.sign(canonical_bytes(hello))
+        async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+            await ws.send(dumps(hello))
+            reply = parse(await ws.recv())
+            check("诱饵档案端仍能握手", reply["type"] == "welcome", reply["type"])
+        prof_c = hub.presence.snapshot().get(c.agent_id, {}).get("profile") or {}
+        check("hub 忽略 hello 内档案（无 LEAK）", "LEAK-MARKER" not in json.dumps(prof_c),
+              str(prof_c)[:120])
+
+        # 非白名单端：握手被拒 → 长退避（_last_backoff == reject_backoff）
+        ok = False
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if cd._last_backoff == 1.0 and not cd.connected:
+                ok = True
+                break
+            await asyncio.sleep(0.05)
+        check("非白名单 → 被拒且走 reject_backoff", ok,
+              f"last_backoff={cd._last_backoff} connected={cd.connected}")
+        check("默认拒绝退避为 10 分钟",
+              AgentNetClient(b, f"ws://127.0.0.1:{port}")._reject_backoff == 600)
+    finally:
+        await cb.close()
+        await cd.close()
+        tb.cancel()
+        td.cancel()
+        serve_task.cancel()
+        for t in (tb, td, serve_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 async def security_control_test(root: Path):

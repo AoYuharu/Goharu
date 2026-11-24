@@ -28,6 +28,7 @@ from Core.TokenEstimator import TokenEstimator
 from Tools.api import tool_process_tracker
 from configurationLoader import config
 from Gateway.plan_mode import is_plan_mode_command
+from Gateway.names import EXEC_LABEL, MAINT_LABEL
 from Prompting.reminders import PLAN_MODE_REMINDER
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,119 @@ class AgentSession:
         # 计划模式（只读运行时状态）：闸门由 SessionManager 装配
         self.plan_mode = False
         self.plan_gate = None
+
+        # 网络话语权入队关卡（SessionManager 装配；未装配 = 无话语权功能）。
+        # 拦截在 enqueue 前端（channel 之前），任何 channel 的入站都先过它。
+        self._floor_state = None         # Gateway.floor.FloorState
+        self._floor_agent_id = ""
+        self._floor_arch_dispatch = None # fn(question, reminder) -> str|None
+        self._floor_queue: list = []     # (text, origin_ch, reminder)
+        self._floor_q_lock = threading.Lock()
+        self._floor_worker_running = False
+        self._floor_turns = 0            # 当前话语权持有期的 arch 轮数
+        self._floor_epoch = 0            # 快照 epoch（变化即重置计数）
+
+    def set_floor_context(self, state, agent_id: str, arch_dispatch=None) -> None:
+        """SessionManager 装配：话语权快照 + 本机网络身份 + arch 派发函数。"""
+        self._floor_state = state
+        self._floor_agent_id = str(agent_id or "")
+        self._floor_arch_dispatch = arch_dispatch
+        logger.info("session %s: floor gate 装配（agent=%s, arch=%s）",
+                    self.session_id, self._floor_agent_id,
+                    "on" if arch_dispatch else "off")
+
+    def _floor_gate(self, msg) -> str:
+        """入队关卡：process（照常）/ handled（已答复或静默）/ dispatch（交 arch）。"""
+        snap = self._floor_state.snapshot()
+        if not snap.held:
+            return "process"
+        if msg.channel_type == "architect":
+            return "process"   # Arch 桥的合成消息不受话语权影响
+        if snap.holder_agent_id == self._floor_agent_id:
+            if snap.persona == "arch" and self._floor_arch_dispatch is not None:
+                return "dispatch"
+            return "process"
+        # 话语权在别处（绝对优先）：组网广播副本静默；本地直连输入给透明提示
+        if msg.channel_type == "agentnet":
+            return "handled"
+        self._floor_notice(
+            msg,
+            f"🎙 话语权当前在 {snap.holder_name or snap.holder_agent_id}"
+            f"（{'arch' if snap.persona == 'arch' else '主'}），本条消息未处理。"
+            "可在观察台继续对话，或用 FloorControl 收回话语权。")
+        return "handled"
+
+    def _floor_origin_channel(self, msg):
+        for ch in self.channels:
+            if ch.channel_type == msg.channel_type and ch.channel_id == msg.channel_id:
+                return ch
+        return None
+
+    def _floor_send(self, origin, text: str) -> None:
+        """话语权回复：来源 channel 优先；失效兜底全广播；TUI 常驻旁观副本。"""
+        sent = False
+        if origin is not None:
+            try:
+                origin.send_answer(text, {"floor": True})
+                sent = True
+            except Exception:
+                logger.warning("session %s: floor 回复发送失败（%s）",
+                               self.session_id, origin, exc_info=True)
+        targets = ([ch for ch in self.channels if ch.channel_type == "tui"]
+                   if sent else list(self.channels))
+        for ch in targets:
+            if ch is origin:
+                continue
+            try:
+                ch.send_answer(text, {"floor": True})
+            except Exception:
+                pass
+
+    def _floor_notice(self, msg, text: str) -> None:
+        self._floor_send(self._floor_origin_channel(msg), text)
+
+    def _floor_dispatch(self, msg) -> None:
+        """话语权=arch：消息入队 + daemon worker 串行派发（enqueue 立即返回）。"""
+        snap = self._floor_state.snapshot()
+        if snap.epoch != self._floor_epoch:
+            self._floor_epoch = snap.epoch
+            self._floor_turns = 0
+        self._floor_turns += 1
+        reminder = None
+        if (self._floor_turns > 3
+                or (snap.since and time.time() - snap.since > 600)):
+            reminder = (
+                f"你已经长期持有了 {EXEC_LABEL} 的聊天能力，请注意，如果你不再必要，"
+                f"应该切换回 {EXEC_LABEL} 发言（调用 FloorControl action='release'，"
+                "或 handoff 回主执行人格）。")
+        origin = self._floor_origin_channel(msg)
+        with self._floor_q_lock:
+            self._floor_queue.append((str(msg.text), origin, reminder))
+            if len(self._floor_queue) > 8:
+                self._floor_queue.pop(0)   # 积压丢弃最旧
+            if self._floor_worker_running:
+                return
+            self._floor_worker_running = True
+        threading.Thread(target=self._floor_worker, daemon=True,
+                         name=f"floor-arch-{self.session_id}").start()
+
+    def _floor_worker(self) -> None:
+        while True:
+            with self._floor_q_lock:
+                if not self._floor_queue:
+                    self._floor_worker_running = False
+                    return
+                text, origin, reminder = self._floor_queue.pop(0)
+            self._floor_send(origin, f"（{MAINT_LABEL}接手，正在思考…）")
+            reply = None
+            try:
+                reply = self._floor_arch_dispatch(text, reminder)
+            except Exception:
+                logger.exception("session %s: arch 话语权派发异常", self.session_id)
+            if not reply:
+                self._floor_send(origin, "（arch 暂时不可用——可能正忙于其他任务。）")
+            else:
+                self._floor_send(origin, f"【{MAINT_LABEL}】{reply}")
 
     # ------------------------------------------------------------------
     # channel 挂载与轮发（broadcast）
@@ -167,6 +281,16 @@ class AgentSession:
             self.queue_command("upgrade", {}, req_id=f"{msg.channel_id}")
             self._start_processing()
             return
+
+        # 网络话语权关卡（channel 之前）：持有期间只有持有者响应主人；
+        # 持有者=arch 时消息改投 Architect 派发链（channel-agnostic）
+        if self._floor_state is not None:
+            decision = self._floor_gate(msg)
+            if decision == "handled":
+                return
+            if decision == "dispatch":
+                self._floor_dispatch(msg)
+                return
 
         source = msg.channel_type
         meta_info = ""

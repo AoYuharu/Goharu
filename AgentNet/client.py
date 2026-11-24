@@ -44,13 +44,17 @@ AttentiveProvider = Callable[[], bool]          # 返回是否在关注期（观
 
 
 def default_device_profile() -> dict:
-    """本机设备属性（握手档案用，观察台展示）。"""
+    """本机设备属性（档案用，观察台展示；入网成功后才上报）。"""
     return {
         "host": platform.node(),
         "os": f"{platform.system()} {platform.release()}",
         "arch": platform.machine(),
         "python": platform.python_version(),
     }
+
+
+class HandshakeRejected(ConnectionError):
+    """握手被 hub 拒绝（不在白名单 / 身份不匹配）：非网络故障，长退避重试。"""
 
 
 class AgentNetClient:
@@ -67,6 +71,7 @@ class AgentNetClient:
         on_control: Optional[Callable[[dict], Any]] = None,
         heartbeat_seconds: int = 30,
         reconnect_max_seconds: int = 60,
+        reject_backoff_seconds: int = 600,
         profile: Optional[dict] = None,
         http_base: str = "",
     ):
@@ -74,7 +79,8 @@ class AgentNetClient:
         self.url = url
         self.box = messagebox
         self.http_base = (http_base or "").rstrip("/")
-        # 档案：{focus: 侧重方向文本, tags: [...], device: {...}}——握手时上报
+        # 档案：{focus: 侧重方向文本, tags: [...], device: {...}, security, ...}
+        # 握手成功（welcome）后才经 profile_update 上报——hello 不带任何设备信息
         prof = dict(profile or {})
         prof.setdefault("device", default_device_profile())
         self._profile = prof
@@ -88,6 +94,10 @@ class AgentNetClient:
         self._on_control = on_control
         self._heartbeat_seconds = heartbeat_seconds
         self._reconnect_max = reconnect_max_seconds
+        # 握手被拒（不在 hub 白名单）：不是网络故障，用长退避重试——
+        # 未入网机器不该每分钟轰一次线上 hub
+        self._reject_backoff = max(1, int(reject_backoff_seconds))
+        self._last_backoff = 0.0   # 观测用：最近一次重连退避秒数
 
         self._ws: Any = None
         self._connected = asyncio.Event()
@@ -101,7 +111,7 @@ class AgentNetClient:
         return self._connected.is_set()
 
     async def connect_forever(self) -> None:
-        """重连循环（退避 1s→max）。close() 后退出。"""
+        """重连循环（退避 1s→max；握手被拒走 reject_backoff 长退避）。close() 后退出。"""
         backoff = 1
         while not self._closed:
             try:
@@ -109,9 +119,19 @@ class AgentNetClient:
                 backoff = 1
             except asyncio.CancelledError:
                 raise
+            except HandshakeRejected as e:
+                self._connected.clear()
+                self._last_backoff = float(self._reject_backoff)
+                logger.warning(
+                    "agentnet 握手被拒: %s（本机指纹不在 hub 白名单？%ds 后重试）",
+                    e, self._reject_backoff)
+                if not self._closed:
+                    await asyncio.sleep(self._reject_backoff)
+                backoff = 1
             except Exception as e:
                 logger.warning("agentnet 连接断开: %s（%ds 后重连）", e, backoff)
                 self._connected.clear()
+                self._last_backoff = float(backoff)
                 if not self._closed:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, self._reconnect_max)
@@ -131,24 +151,27 @@ class AgentNetClient:
                 self._ws = None
 
     async def _handshake(self) -> None:
+        # 两段式握手：hello 只出示身份（指纹+公钥+签名），**不带任何设备档案**——
+        # 未入白名单的机器不该把主机名/系统/安全规则等发给线上 hub。
+        # welcome（已入白名单）之后才经 profile_update 上报档案。
         env = make_envelope(
             sender=self.identity.agent_id, to="server", type_="hello",
             payload={
                 "agent_id": self.identity.agent_id,
                 "name": self.identity.name,
                 "pubkey": self.identity.pubkey_b64,
-                "profile": self._profile,
             },
         )
         env["sig"] = self.identity.sign(canonical_bytes(env))
         await self._send(env)
         reply = parse(await self._ws.recv())
         if reply["type"] == "auth_error":
-            raise ConnectionError(f"握手被拒: {reply['payload'].get('reason')}")
+            raise HandshakeRejected(f"{reply['payload'].get('reason')}")
         if reply["type"] != "welcome":
             raise ConnectionError(f"握手应答异常: {reply['type']}")
         self._emit_event("welcome", reply)
-        # 上线即拉离线消息
+        # 已入网：上报档案（设备/侧重/安全规则快照），再拉离线消息
+        await self._send(self._profile_update_env())
         await self._send(make_envelope(
             sender=self.identity.agent_id, to="server", type_="mailbox_pull"))
 
@@ -294,6 +317,18 @@ class AgentNetClient:
         env["sig"] = self.identity.sign(canonical_bytes(env))
         await self._send(env)
 
+    async def set_floor(self, action: str, target: str = "",
+                        persona: str = "main", note: str = "") -> None:
+        """切换网络话语权（action: set|clear；target 空=自己）。
+
+        hub 权威：生效后向全网广播 floor_state；fire-and-forget 不等待回执。
+        """
+        env = make_envelope(
+            sender=self.identity.agent_id, to="server", type_="floor",
+            payload={"action": action, "target": target,
+                     "persona": persona, "note": note})
+        await self._send(env)
+
     async def query_presence(self, timeout: float = 10) -> dict:
         """查状态机快照：{agent_id: {state, last_seen, name}}。"""
         if self._presence_waiter is not None and not self._presence_waiter.done():
@@ -306,6 +341,12 @@ class AgentNetClient:
         finally:
             self._presence_waiter = None
 
+    def _profile_update_env(self) -> dict:
+        """档案上报信封（握手成功后首报 + 后续 update_profile 复用）。"""
+        return make_envelope(
+            sender=self.identity.agent_id, to="server", type_="profile_update",
+            payload={"profile": self._profile})
+
     async def update_profile(self, focus: Optional[str] = None,
                              tags: Optional[list] = None) -> None:
         """更新自己的档案并上报 hub（focus/tags 任一给出才更新对应字段）。"""
@@ -313,9 +354,7 @@ class AgentNetClient:
             self._profile["focus"] = str(focus)
         if tags is not None:
             self._profile["tags"] = [str(t) for t in tags]
-        await self._send(make_envelope(
-            sender=self.identity.agent_id, to="server", type_="profile_update",
-            payload={"profile": self._profile}))
+        await self._send(self._profile_update_env())
 
     # ------------------------------------------------------------- 心跳
     def _presence_payload(self) -> dict:

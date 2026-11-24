@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#171923">
-<title>Poharu Hub · 组网观察台</title>
+<title>HaruNet · 组网观察台</title>
 <style>
   :root {
     --bg: #12131c; --panel: #1a1c27; --panel2: #232634; --line: #2b2f42;
@@ -39,6 +39,23 @@
     animation: pulse 1.2s infinite; } .dot.maintenance { background: var(--orange); }
   .dot.offline { background: #52576b; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+
+  /* ── 话语权条 ─────────────────────────────────────── */
+  #floorBar { flex: 0 0 auto; padding: 6px 12px 0; }
+  .floorLine { display: flex; align-items: center; gap: 8px; }
+  #floorState { font-size: 12px; color: var(--text); }
+  #floorState .fname { color: var(--yellow); font-weight: 650; }
+  .floorChips { display: flex; gap: 6px; overflow-x: auto; padding-top: 6px;
+    scrollbar-width: none; }
+  .floorChips::-webkit-scrollbar { display: none; }
+  .floorChip { flex: 0 0 auto; font-size: 12px; padding: 3px 10px;
+    border-radius: 999px; border: 1px solid var(--line); color: var(--dim);
+    background: var(--panel2); }
+  .floorChip.arch { color: var(--orange);
+    border-color: rgba(255,158,100,.5); }
+  .floorChip.release { color: var(--red); border-color: rgba(247,118,142,.5);
+    background: rgba(247,118,142,.08); }
+  .floorChip:disabled { opacity: .45; }
 
   /* ── 过滤页签 ─────────────────────────────────────── */
   .tabs { display: flex; gap: 8px; padding: 8px 12px 0; flex: 0 0 auto; }
@@ -223,11 +240,15 @@
 <header>
   <div class="topRow">
     <button id="menuBtn" aria-label="智能体菜单">☰</button>
-    <h1>⬡ Poharu Hub</h1>
+    <h1>⬡ HaruNet</h1>
     <span class="sub" id="sub">连接中…</span>
   </div>
   <div class="agents" id="agents"></div>
 </header>
+<div id="floorBar">
+  <div class="floorLine"><span id="floorState">🎙 话语权：—</span></div>
+  <div class="floorChips" id="floorChips"></div>
+</div>
 <div class="tabs" id="tabs">
   <div class="tab on" data-f="all">全部</div>
   <div class="tab" data-f="mention">@ 提及</div>
@@ -247,7 +268,7 @@
 <div id="mask"></div>
 <aside id="drawer">
   <div id="drawerList">
-    <div class="drawerHead"><h2>组网智能体</h2><span class="cnt" id="agentCnt"></span></div>
+    <div class="drawerHead"><h2>HaruNet 智能体</h2><span class="cnt" id="agentCnt"></span></div>
     <div class="agentList" id="agentList"></div>
   </div>
   <div id="agentDetail" style="display:none">
@@ -311,6 +332,7 @@ function renderPresence(agents) {
   document.getElementById('sub').textContent = online + '/' + ids.length + ' 在线';
   document.getElementById('agentCnt').textContent = online + ' 在线 / 共 ' + ids.length;
   renderMentionRow(ids);
+  renderFloorBar(floorData);
   if (drawer.classList.contains('on')) {
     if (document.getElementById('agentDetail').style.display === 'none') renderAgentList();
     else {
@@ -321,6 +343,64 @@ function renderPresence(agents) {
       if (id && !(ae && ae.tagName === 'INPUT' &&
                   document.getElementById('detailBody').contains(ae))) showAgent(id);
     }
+  }
+}
+
+/* ── 话语权条 ─────────────────────────────────────── */
+let floorData = null;
+function renderFloorBar(floor) {
+  floorData = floor || null;
+  const state = document.getElementById('floorState');
+  state.innerHTML = '';
+  if (floorData && floorData.holder_agent_id) {
+    state.appendChild(document.createTextNode('🎙 话语权：'));
+    state.appendChild(el('span', 'fname', floorData.holder_name || floorData.holder_agent_id));
+    state.appendChild(document.createTextNode(
+      floorData.persona === 'arch' ? '（arch）' : '（主）'));
+  } else {
+    state.textContent = '🎙 话语权：无（自由发言）';
+  }
+  const row = document.getElementById('floorChips');
+  row.innerHTML = '';
+  if (floorData && floorData.holder_agent_id) {
+    const b = el('button', 'floorChip release', '收回话语权');
+    b.onclick = () => sendFloor({ action: 'clear' }, b, '收回话语权');
+    row.appendChild(b);
+    return;
+  }
+  for (const id of Object.keys(agentsData)) {
+    const a = agentsData[id];
+    if (!a.online) continue;
+    const nm = a.name || id.slice(0, 8);
+    const c = el('button', 'floorChip', '→ ' + nm);
+    c.onclick = () => sendFloor({ action: 'set', target: id, persona: 'main' }, c,
+                                '把话语权转交给 ' + nm);
+    row.appendChild(c);
+    if ((a.profile || {}).hosts_architect) {
+      const ca = el('button', 'floorChip arch', '→ ' + nm + '·arch');
+      ca.onclick = () => sendFloor({ action: 'set', target: id, persona: 'arch' }, ca,
+                                   '把话语权转交给 ' + nm + ' 的 arch');
+      row.appendChild(ca);
+    }
+  }
+}
+
+async function sendFloor(payload, btn, label) {
+  if (!confirm(label + '？全网立即生效。')) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch(q('/api/floor'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Token': TOKEN },
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) renderFloorBar(j.floor);
+    else alert('操作失败: ' + (j.error || r.status));
+  } catch (e) {
+    alert('网络错误: ' + e);
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -898,6 +978,8 @@ async function poll() {
     if (pr.ok) renderPresence((await pr.json()).agents || {});
     const ar = await fetch(q('/api/requests'));
     if (ar.ok) renderAsks((await ar.json()).requests || []);
+    const fr = await fetch(q('/api/floor'));
+    if (fr.ok) renderFloorBar((await fr.json()).floor);
   } catch (err) {
     document.getElementById('sub').textContent = '连接断开，重试中…';
   }

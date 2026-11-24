@@ -61,7 +61,10 @@ checkpoint:
   - '*.pyc'
   - .git/**
 agentnet:
-  enabled: true
+  # 接入 HaruNet 是显式选择：默认关闭，未接入的智能体对组网一无所知
+  # （system 提示词无组网段、组网工具不注册）。接入 = 此处 true（或环境变量
+  # AGENTNET_ENABLED=true，机器级覆盖不必进 git）+ hub 白名单收录本机指纹。
+  enabled: false
   url: ws://159.75.26.204:6000
   http_base: http://159.75.26.204:6001
   name: goharu
@@ -175,7 +178,8 @@ tools:
   - Tools.builtin.channel_tools
   - Tools.builtin.plan_mode_tools
   - Tools.builtin.checkpoint_tools
-  - Tools.builtin.agentnet_tools
+  # HaruNet 条件工具组（agentnet_tools / floor_tools）不在此静态表：
+  # 由 Gateway 在 agentnet.enabled 时 import 注册——未接入的智能体看不见它们
   ask_user:
     timeout_seconds: 300
   mcp:

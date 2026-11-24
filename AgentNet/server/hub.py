@@ -1,4 +1,4 @@
-"""poharu-hub v2：AgentNet 服务器（relay + mailbox + presence + registry）。
+"""poharu-hub v2：HaruNet（AgentNet）服务器（relay + mailbox + presence + registry）。
 
 单进程 asyncio websockets 服务。白名单制：不在 whitelist 的指纹握手即拒。
 状态机：UNKNOWN → IDENTIFIED（指纹出示）→ CONFIRMED（白名单匹配）→
@@ -314,6 +314,9 @@ class HubServer:
         self.files = FileStore(state_dir / "files")
         # 挂起的询问/确认（agent→server "ask" 信封存入，观察台 /api/answer 回送）
         self.pending_asks: dict[str, dict] = {}
+        # 网络话语权（仅内存）：{holder_agent_id, holder_name, persona, since, note}
+        # hub 重启清零——避免指向离线端的陈腐状态；持有者掉线自动收回
+        self._floor: Optional[dict] = None
         self._online: dict[str, Any] = {}  # agent_id -> websocket
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         # 用户本体身份：观察台输入框以该身份广播（服务器自持私钥，自动进白名单）
@@ -391,6 +394,95 @@ class HubServer:
             return {"ok": True, "msg_id": env["id"], "queued": True}
         return {"ok": True, "msg_id": env["id"], "queued": False}
 
+    # ---------------------------------------------------------- 网络话语权（Floor）
+    def floor_snapshot(self) -> Optional[dict]:
+        """当前话语权公共视图（welcome/presence/观察台轮询用）。"""
+        return dict(self._floor) if self._floor else None
+
+    def _resolve_floor_target(self, target: str) -> Optional[tuple[str, str]]:
+        """target → (agent_id, persona)。支持 agent_id / 白名单名 / 简写 "arch"
+        （= 上报了 hosts_architect 档案的智能体 + persona arch）。"""
+        target = (target or "").strip()
+        if not target:
+            return None
+        if target.lower() == "arch":
+            for aid, info in self.presence.snapshot().items():
+                prof = info.get("profile") or {}
+                if prof.get("hosts_architect"):
+                    return aid, "arch"
+            return None
+        if self.whitelist.agent(target):
+            return target, "main"
+        for aid in self.whitelist.all_agents():
+            rec = self.whitelist.agent(aid) or {}
+            if rec.get("name") == target:
+                return aid, "main"
+        return None
+
+    def submit_floor_request(self, action: str, target: str = "",
+                             persona: str = "main", note: str = "") -> dict:
+        """观察台/HTTP 线程入口：设置或收回话语权（广播由 loop 线程执行）。"""
+        if self.loop is None:
+            return {"ok": False, "error": "hub 未就绪"}
+        try:
+            result = asyncio.run_coroutine_threadsafe(
+                self._apply_floor_async(action, target, persona, note,
+                                        by=self.owner.agent_id),
+                self.loop).result(timeout=10)
+        except Exception as e:
+            logger.warning("话语权请求失败: %s", e)
+            return {"ok": False, "error": str(e)}
+        return result
+
+    async def _apply_floor_async(self, action: str, target: str, persona: str,
+                                 note: str, by: str) -> dict:
+        if action == "clear":
+            had = self._floor is not None
+            self._floor = None
+            if had:
+                await self._broadcast_floor()
+                self._log_floor("话语权已收回（恢复正常发言判断）", by)
+            return {"ok": True, "floor": None}
+        if action != "set":
+            return {"ok": False, "error": f"未知动作: {action}"}
+        persona = "arch" if str(persona).lower() == "arch" else "main"
+        resolved = self._resolve_floor_target(target or by)
+        if resolved is None:
+            return {"ok": False, "error": f"无法解析话语权目标: {target!r}"}
+        holder_id, resolved_persona = resolved
+        if str(persona).lower() == "arch" or resolved_persona == "arch":
+            persona = "arch"
+        else:
+            persona = "main"
+        name = (self.whitelist.agent(holder_id) or {}).get("name", holder_id)
+        self._floor = {
+            "holder_agent_id": holder_id,
+            "holder_name": name,
+            "persona": persona,
+            "since": time.time(),
+            "note": str(note or ""),
+        }
+        await self._broadcast_floor()
+        self._log_floor(
+            f"话语权 → {name}（{'arch' if persona == 'arch' else '主'}）", by)
+        return {"ok": True, "floor": self.floor_snapshot()}
+
+    async def _broadcast_floor(self) -> None:
+        env = make_envelope(sender="server", to="*", type_="floor_state",
+                            payload={"floor": self.floor_snapshot()})
+        for agent_id in list(self._online):
+            await self._send_to(agent_id, env)
+
+    def _log_floor(self, text: str, by: str) -> None:
+        """话语权变更记一条运维流水（观察台消息流可见）。"""
+        try:
+            by_name = (self.whitelist.agent(by) or {}).get("name", "中控")
+            self.message_log.log(by, by_name, "*", "control", None,
+                                 f"🎙 {text}", now_ts())
+        except Exception:
+            logger.exception("话语权流水记录失败")
+        logger.info("话语权: %s", text)
+
     # ---------------------------------------------------------- 挂起询问（观察台作答）
     def pending_asks_snapshot(self) -> list[dict]:
         """观察台轮询用：未过期挂起询问/确认列表（公共视图，不含签名等）。"""
@@ -458,6 +550,11 @@ class HubServer:
                     self.presence.set_offline(agent_id)
                     await self._broadcast_presence()
                     logger.info("下线: %s (last_seen 已落盘)", agent_id)
+                    # 话语权持有者掉线 → 自动收回（否则全网被沉积死掉的话语权锁住）
+                    if self._floor and self._floor.get("holder_agent_id") == agent_id:
+                        self._floor = None
+                        await self._broadcast_floor()
+                        self._log_floor("话语权持有者离线，自动收回", agent_id)
 
     async def _handshake(self, ws):
         """UNKNOWN → IDENTIFIED → CONFIRMED；任一步失败回 auth_error 并断开。
@@ -494,13 +591,13 @@ class HubServer:
             await ws.send(dumps(self._auth_error(env, "bad_signature")))
             return None, None
         welcome = make_envelope(sender="server", to=agent_id, type_="welcome",
-                                payload={"agent_id": agent_id, "server_ts": now_ts()})
+                                payload={"agent_id": agent_id, "server_ts": now_ts(),
+                                         "floor": self.floor_snapshot()})
         await ws.send(dumps(welcome))
         logger.info("确认设备: %s (%s)", agent_id, record.get("name"))
-        profile = payload.get("profile") or {}
-        if not isinstance(profile, dict):
-            profile = {}
-        return agent_id, profile
+        # 两段式握手：hello 里即使带了 profile 也一律忽略（未入白名单的机器不该
+        # 在握手阶段外泄设备信息）；档案由 welcome 后的 profile_update 上报
+        return agent_id, None
 
     def _auth_error(self, env: dict, reason: str) -> dict:
         return make_envelope(sender="server", to=env.get("from", "?"),
@@ -522,7 +619,8 @@ class HubServer:
             return
         if t == "presence_query":
             reply = make_envelope(sender="server", to=sender, type_="presence_state",
-                                  payload={"agents": self.presence.snapshot()})
+                                  payload={"agents": self.presence.snapshot(),
+                                           "floor": self.floor_snapshot()})
             await self._send_to(sender, reply)
             return
         if t == "mailbox_pull":
@@ -566,6 +664,21 @@ class HubServer:
                 "expires": time.time() + min(max(ttl, 30), 1800),
             }
             logger.info("挂起询问登记: %s %s from=%s", kind, request_id, sender)
+            return
+        if t == "floor":
+            # 话语权切换（任何白名单智能体可调用；单主信任网，全量记日志）
+            record = self.whitelist.agent(sender)
+            if record is None or not Identity.verify(
+                    record["pubkey"], canonical_bytes(env), env.get("sig", "")):
+                logger.warning("floor 验签失败 from=%s", sender)
+                return
+            p = env.get("payload") or {}
+            await self._apply_floor_async(
+                str(p.get("action") or ""),
+                str(p.get("target") or ""),
+                str(p.get("persona") or "main"),
+                str(p.get("note") or ""),
+                by=sender)
             return
         if t == "message":
             # 验签（防冒充）；白名单公钥
@@ -613,7 +726,8 @@ class HubServer:
 
     async def _broadcast_presence(self) -> None:
         env = make_envelope(sender="server", to="*", type_="presence_state",
-                            payload={"agents": self.presence.snapshot()})
+                            payload={"agents": self.presence.snapshot(),
+                                     "floor": self.floor_snapshot()})
         for agent_id in list(self._online):
             await self._send_to(agent_id, env)
 
@@ -656,6 +770,8 @@ def main() -> None:
             on_control=server.submit_owner_control,
             pending_asks=server.pending_asks_snapshot,
             on_answer=server.submit_answer,
+            on_floor=server.submit_floor_request,
+            floor_snapshot=server.floor_snapshot,
         )
         observer.start()
     asyncio.run(server.serve())

@@ -193,7 +193,7 @@ def strip_stale_image_blocks(messages):
 
 class ActorAgent(LargeLanguageModel):
     def __init__(self, tool_runtime, working, llm=None, document_builder=None,
-                 verify_gate_enabled=True):
+                 verify_gate_enabled=True, prompt_loader=None):
         # llm 注入（独立部署）：结构化接口对象，需提供 query(messages, on_retry, **kwargs)，
         # 返回带 .content(text/tool_use/thinking 块) 与 .stop_reason 的响应。
         # 注入时跳过 LLMCore 单例构造（不依赖全局 configurationLoader）。
@@ -204,7 +204,9 @@ class ActorAgent(LargeLanguageModel):
         self._injected_llm = llm
         self.tool_runtime = tool_runtime
         self.working = working
-        self.prompt_assembler = PromptAssembler()
+        # prompt_loader 注入缝（组合根决定"哪些提示词段进 system"）：None →
+        # PromptAssembler 默认加载器（全局配置的 prompt.system.*）
+        self.prompt_assembler = PromptAssembler(prompt_loader=prompt_loader)
         self.prompt_renderer = PromptRenderer()
         # document_builder（子代理等宿主注入）：可替换的消息组装策略，
         # 签名 build(history, tool_definitions) -> list[dict]。None 时走

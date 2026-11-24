@@ -595,8 +595,12 @@ def step_choose_channels() -> dict:
             out["qq"] = {"app_id": app_id, "secret": secret}
         else:
             warn("QQ app_id / secret 不全，跳过 QQ 配置")
-    if confirm("配置 HaruNet 组网？", default=False):
-        out["harunet"] = ask("HaruNet hub 地址", "ws://159.75.26.204:6000")
+    if confirm("接入 HaruNet 组网？（默认不接入：未接入的智能体对组网一无所知）", default=False):
+        url = ask("HaruNet hub 地址", "ws://159.75.26.204:6000")
+        name = ask("网络昵称（回车用 config.yaml 的 agentnet.name）", "")
+        out["harunet"] = {"url": url, "name": name}
+        info("接入 = 开关 + hub 白名单：首次启动后日志会打印 agent_id，"
+             "把它加进 hub 的 whitelist.json 才能真正入网（此前每 10 分钟重试一次）")
     out["proxy"] = ask("出站代理地址（如 socks5://127.0.0.1:7890，留空跳过）")
     return out
 
@@ -626,17 +630,28 @@ def step_write_channels(ch: dict) -> None:
         open(env_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
         info("已写入 QQ Bot 凭据到 .env")
     cfg_path = os.path.join(REPO_DIR, "config.yaml")
+    # HaruNet 接入开关：.env AGENTNET_ENABLED=true（机器级覆盖；config 默认 false）
+    if ch.get("harunet"):
+        env_path = os.path.join(REPO_DIR, ".env")
+        lines = (open(env_path, encoding="utf-8").read().splitlines()
+                 if os.path.exists(env_path) else [])
+        lines = _set_env_line(lines, "AGENTNET_ENABLED", "true")
+        if ch["harunet"].get("name"):
+            lines = _set_env_line(lines, "AGENTNET_NAME", ch["harunet"]["name"])
+        open(env_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+        info("已写入 AGENTNET_ENABLED=true 到 .env")
     if not os.path.exists(cfg_path):
         return
     txt = open(cfg_path, encoding="utf-8").read()
     changed = False
     # HaruNet → agentnet.url（config 里唯一 ws:// 的那行）
     if ch.get("harunet"):
+        hub_url = ch["harunet"]["url"]
         t2 = re.sub(r"(?m)^(\s*url:\s*)ws://\S+",
-                    lambda m: m.group(1) + ch["harunet"], txt, count=1)
+                    lambda m: m.group(1) + hub_url, txt, count=1)
         if t2 != txt:
             txt, changed = t2, True
-            info(f"agentnet.url → {ch['harunet']}")
+            info(f"agentnet.url → {hub_url}")
     # 代理 → network.proxy.url（4 空格缩进、空引号的那行）
     if ch.get("proxy"):
         t2 = re.sub(r'(?m)^(    url:\s*)""',

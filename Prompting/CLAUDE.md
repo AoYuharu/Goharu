@@ -57,6 +57,10 @@ ActorAgent 持有 `_reminder_state`）。不传 state → 无状态退化（date
    已渲染内容；新内容只能出现在当轮。
 2. **PromptLoader 依赖配置对象的 `.get` 与 `.path`**：`api.py` 的 `_PipelineConfig`
    适配器是唯一外部注入点；不要新增对 configurationLoader 的直接引用。
+   门面 `create_prompt_loader(config=)` 供宿主把加载器注入 ActorAgent 等组装器；
+   宿主可传"叠加配置对象"（只改 `prompt.system.<key>` 列表，其余键委托）来
+   按功能启停追加提示词段——**Prompting 不认识任何具体功能，段文件取舍属于
+   组合根**（Goharu 的叠加层在 Gateway/prompt_sections.py）。
 3. **Goharu 特有注入可关**：`include_git_status` / `include_skills`（默认开，
    保持 Goharu 行为；facade 默认关）。
 4. 渲染器纯函数：PromptRenderer 不许引入状态/IO。

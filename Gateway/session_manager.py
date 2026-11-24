@@ -22,11 +22,22 @@ from configurationLoader import config
 
 from Gateway.channels import create_channel, load_plugins
 from Gateway.channels.base import ChannelMessage
+from Gateway.names import EXEC_LABEL, MAINT_LABEL, NET_NAME, nick_token
+from Gateway.prompt_sections import PromptSectionsOverlay
 from Gateway.session import AgentSession
 from Gateway.session_memory import SessionMemoryView
 from Gateway.plan_mode import PlanModeGate
 
 logger = logging.getLogger(__name__)
+
+
+def _agentnet_enabled() -> bool:
+    """是否接入 HaruNet：环境变量 AGENTNET_ENABLED 优先（机器级覆盖不必进 git），
+    其次 config agentnet.enabled（仓库默认 false——接入是显式选择）。"""
+    env = os.environ.get("AGENTNET_ENABLED")
+    if env is not None and env.strip():
+        return env.strip().lower() in ("1", "true", "yes", "on")
+    return bool(config.get("agentnet.enabled", False))
 
 
 class SessionManager:
@@ -155,6 +166,14 @@ class SessionManager:
         # ── 上下文管理器（压缩阶梯工具，session 共享实例）──
         self.ctx_manager = create_context_manager()
 
+        # ── 功能段提示词：未接入 HaruNet 的智能体对组网一无所知（system 里零相关文本）
+        #    决策在组合根；Prompting/Agent 只认"加载器"这个通用缝 ──
+        self.agentnet_enabled = _agentnet_enabled()
+        from Prompting.api import create_prompt_loader
+        prompt_loader = create_prompt_loader(PromptSectionsOverlay(
+            config, actor=["./prompts/actor/agentnet.md"]
+            if self.agentnet_enabled else []))
+
         # ── 外部 channel 插件 ──
         load_plugins(config.get("channels.plugins", []))
 
@@ -167,7 +186,8 @@ class SessionManager:
             max_messages = scfg.get("max_messages", 10)
             view = SessionMemoryView(sid, self.memory, max_messages=max_messages)
             gate = PlanModeGate(self.runtime)
-            agent = await create_agent(tools=gate, memory=view)
+            agent = await create_agent(tools=gate, memory=view,
+                                       prompt_loader=prompt_loader)
             session = AgentSession(
                 sid, view, agent.actor, self.pipeline_manager,
                 self.bg_tasks, self.ctx_manager, loop=self.loop,
@@ -218,8 +238,11 @@ class SessionManager:
                         [f"{c.channel_type}#{c.channel_id}" for c in session.channels])
 
         # ── AgentNet 组网 channel（可选，挂到 default session）──
-        if config.get("agentnet.enabled", False):
+        if self.agentnet_enabled:
             try:
+                # 条件工具组：未接入时模型看不见任何组网工具（连描述都不进上下文）。
+                # import 即注册（Tools 不变量 2），决策权在组合根而非 config 静态表。
+                from Tools.builtin import agentnet_tools, floor_tools
                 session = self.sessions[self.default_session_id]
                 ch = create_channel("agentnet", "agentnet_main", {
                     "url": config.get("agentnet.url", "ws://127.0.0.1:7878"),
@@ -247,8 +270,14 @@ class SessionManager:
                 session.attach_channel(ch)
                 ch.bind(session.enqueue)
                 ch.start()
+                # 网络话语权入队关卡（channel 之前）+ FloorControl 工具句柄
+                try:
+                    session.set_floor_context(
+                        ch.floor, ch.identity.agent_id, self._arch_floor_dispatch)
+                    floor_tools.set_floor_handle(ch)
+                except Exception as e:
+                    logger.warning("floor gate 装配失败（话语权功能关闭）: %s", e)
                 # 工具句柄 + 状态自报（任一会话处理中即 working）+ 摘要便利贴
-                from Tools.builtin import agentnet_tools
                 agentnet_tools.set_agentnet_handle(ch)
                 ch.set_state_provider(
                     lambda: "working" if any(s._processing for s in self.sessions.values())
@@ -258,9 +287,11 @@ class SessionManager:
                 ch.set_control_handler(self._agentnet_control)
                 ch.set_summarize_fn(self._agentnet_summarize)
                 def _agentnet_turn_extras():
-                    # 名字身份行常驻（改名后下一条消息即生效）+ messagebox 摘要
-                    line = (f"你在智能体组网中的名字是「{ch.name}」——主人和同事用"
-                            "这个名字称呼/@你，自我介绍时也用它。")
+                    # 身份行常驻（改名后下一条消息即生效，昵称格式 «名字» 全提示词可 grep）
+                    line = (f"你在 {NET_NAME} 的网络昵称是 {nick_token(ch.name)}——"
+                            "主人和同事用这个名字称呼/@你，自我介绍时也用它。"
+                            f"你隶属 {EXEC_LABEL}（日常执行）；{MAINT_LABEL} 负责"
+                            "本项目的管理、升级与维护。")
                     return [line] + ch.turn_extras()
 
                 session.memory.set_turn_extras_provider(_agentnet_turn_extras)
@@ -356,12 +387,49 @@ class SessionManager:
             return "messagebox 已由 channel 清空"
         return f"未知动作: {action}"
 
+    def _arch_floor_dispatch(self, question: str, reminder: str | None = None):
+        """话语权=arch：把主人消息交给 Architect 派发链（worker 线程调用，可阻塞）。"""
+        try:
+            from Architect.hub import get_default_hub
+            from Architect.wake import (KIND_FLOOR_CHAT, REASON_MANUAL,
+                                        WakeRequest)
+        except Exception as e:
+            logger.warning("arch 话语权派发不可用: %s", e)
+            return None
+        context = {
+            "source": "owner_chat",
+            "question": str(question),
+            "note": f"【话语权对话模式】主人正在直接和 {MAINT_LABEL} 聊天，你的回复"
+                    "会原样广播到群聊（观察台可见）。像普通人聊天一样口头回答，"
+                    "保持简短自然；不要输出 Changes/Verification 等审计报告格式，"
+                    "不要贴文件清单。只有主人明确要求审计/改动报告时才按报告格式输出。",
+        }
+        if reminder:
+            context["reminder"] = reminder
+        try:
+            res = get_default_hub().request_wake(
+                WakeRequest(reason=REASON_MANUAL, kind=KIND_FLOOR_CHAT,
+                            context=context),
+                background=False)
+        except Exception:
+            logger.exception("arch 话语权派发异常")
+            return None
+        status = (res or {}).get("status")
+        content = ((res or {}).get("result") or {}).get("content")
+        logger.info("arch 话语权派发: status=%s content=%s", status,
+                    "有" if content else "无")
+        if content:
+            return str(content)
+        if status == "busy":
+            return "（arch 正忙，请稍后再发或收回话语权。）"
+        return None
+
     def _agentnet_summarize(self, agent_name: str, lines: list) -> str:
         """群消息压缩（arch 角色）：大体量群消息摘要，关注与接收方相关的信息。"""
         from Agent.LargeLanguageModel import LargeLanguageModel
         joined = "\n".join(lines)
         prompt = (
-            f"你是 {agent_name} 的消息整理员。以下是它所在的智能体组网里错过的一批"
+            f"你是 {agent_name} 的消息整理员。以下是它在 {NET_NAME} 里错过的一批"
             "群消息（格式 [时间] 发送者: 内容）。请压缩成简洁摘要：\n"
             "1. 重点保留可能与该智能体相关/需要它关注/需要它行动的信息；\n"
             "2. 无关闲聊一笔带过；\n"

@@ -42,9 +42,23 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "create_context_manager",
     "create_context_pipeline",  # 兼容别名
+    "create_prompt_loader",
     "ContextManager",
     "ContextPipeline",  # 兼容别名
 ]
+
+
+def create_prompt_loader(config=None, base_dir=None) -> PromptLoader:
+    """创建提示词文件加载器（供宿主注入到 ActorAgent 等组装器）。
+
+    config: dict（按 prompt.system.<key> 读文件列表）或任何带 .get/.path 的
+    配置对象（宿主可叠加"功能段"——如启用某功能时追加 actor 段文件）；
+    None → 回退 Goharu 全局配置。
+    本模块不认识任何具体功能，功能启停的决策属于组合根（宿主）。
+    """
+    if config is None or hasattr(config, "get"):
+        return PromptLoader(config)
+    return PromptLoader(_PipelineConfig(config, base_dir))
 
 
 class _PipelineConfig:

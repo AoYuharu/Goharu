@@ -37,7 +37,8 @@ class ObserverServer:
     def __init__(self, message_log, presence, host: str = "0.0.0.0",
                  port: int = 6001, token: str = "",
                  file_store=None, whitelist=None, on_send=None,
-                 on_control=None, pending_asks=None, on_answer=None):
+                 on_control=None, pending_asks=None, on_answer=None,
+                 on_floor=None, floor_snapshot=None):
         self.message_log = message_log
         self.presence = presence
         self.token = token or ""
@@ -47,6 +48,8 @@ class ObserverServer:
         self.on_control = on_control  # hub.submit_owner_control(target, action, name)
         self.pending_asks = pending_asks  # hub.pending_asks_snapshot() -> list
         self.on_answer = on_answer  # hub.submit_answer(request_id, answer) -> dict
+        self.on_floor = on_floor  # hub.submit_floor_request(action, target, persona, note)
+        self.floor_snapshot = floor_snapshot  # hub.floor_snapshot() -> dict|None
         self._httpd = ThreadingHTTPServer((host, port), self._make_handler())
         self._thread = None
 
@@ -91,6 +94,10 @@ class ObserverServer:
                         return
                     if url.path == "/api/requests":
                         data = {"requests": outer.pending_asks() if outer.pending_asks else []}
+                        self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"))
+                        return
+                    if url.path == "/api/floor":
+                        data = {"floor": outer.floor_snapshot() if outer.floor_snapshot else None}
                         self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"))
                         return
                     if url.path == "/api/messages":
@@ -145,6 +152,9 @@ class ObserverServer:
                         return
                     if url.path == "/api/control":
                         self._handle_control(qs)
+                        return
+                    if url.path == "/api/floor":
+                        self._handle_floor(qs)
                         return
                     if url.path == "/api/files":
                         self._handle_upload(qs)
@@ -204,6 +214,37 @@ class ObserverServer:
                 code = 200 if result.get("ok") else 500
                 self._send(code, json.dumps(result, ensure_ascii=False).encode("utf-8"))
                 logger.info("观察台中控: %s → %s", action, target)
+
+            def _handle_floor(self, qs: dict):
+                """话语权切换（仅 token 持有人）：set/clear，hub 广播全网。"""
+                if outer.on_floor is None:
+                    self._send(503, b'{"ok":false,"error":"floor disabled"}')
+                    return
+                if not outer.token or not self._authed(qs):
+                    self._send(403, b'{"ok":false,"error":"token required for floor"}')
+                    return
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length <= 0 or length > 4096:
+                    self._send(413, b'{"ok":false,"error":"bad size"}')
+                    return
+                try:
+                    req = json.loads(self.rfile.read(length).decode("utf-8"))
+                except ValueError:
+                    self._send(400, b'{"ok":false,"error":"bad json"}')
+                    return
+                action = str(req.get("action") or "")
+                if action not in ("set", "clear"):
+                    self._send(400, b'{"ok":false,"error":"unknown action"}')
+                    return
+                result = outer.on_floor(
+                    action,
+                    str(req.get("target") or ""),
+                    str(req.get("persona") or "main"),
+                    str(req.get("note") or ""))
+                code = 200 if result.get("ok") else 500
+                self._send(code, json.dumps(result, ensure_ascii=False).encode("utf-8"))
+                logger.info("观察台话语权: %s target=%s persona=%s",
+                            action, req.get("target"), req.get("persona"))
 
             def _handle_answer(self, qs: dict):
                 """观察台作答：把答案回送给挂起询问的发起智能体（须 token）。"""

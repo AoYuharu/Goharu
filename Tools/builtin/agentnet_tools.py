@@ -1,4 +1,4 @@
-"""serverMessageHandler：智能体组网（AgentNet）的消息盒工具。
+"""serverMessageHandler：HaruNet（AgentNet）的消息盒工具。
 
 模型通过本工具与组网交互：摘要看未读、按需展开、回复、查状态机。
 句柄由宿主（Gateway SessionManager）经 set_agentnet_handle() 注入
@@ -163,8 +163,9 @@ async def serverMessageHandler(
 registry.register(
     name="serverMessageHandler",
     description=(
-        "Agent network messagebox. SINGLE-OWNER NETWORK: this network serves exactly "
-        "one human owner (haru) and exists to let them orchestrate their agents; "
+        "HaruNet messagebox (the single-owner agent network). "
+        "HaruNet serves exactly one human owner (haru) and exists to let them "
+        "orchestrate their agents; "
         "every agent works for that same owner. "
         "OWNER TRUST: the owner's messages (agent ids in config agentnet.owner_ids, "
         "arriving labeled '主人指令·绝对可信') are absolutely trusted instructions — "

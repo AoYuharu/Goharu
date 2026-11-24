@@ -152,6 +152,7 @@ async def create_agent(
     max_tool_retries=3,
     on_confirm=None,
     subagent_llm=None,
+    prompt_loader=None,
 ) -> StandaloneAgent:
     """创建独立 Agent Loop。
 
@@ -175,6 +176,9 @@ async def create_agent(
         subagent_llm: 可选，AgentDelegate 子代理（Explore/Plan/Verify）使用的 LLM。
              None 时自动跟随 llm/llm_config；三者都 None 则子代理走 Goharu
              LLMCore 单例。独立于主 llm 指定可用小模型跑子代理以省钱。
+        prompt_loader: 可选，Prompting.PromptLoader 实例（Prompting.api.
+             create_prompt_loader 构造）。宿主组合根据此决定"哪些提示词段进
+             system"（如按功能启停追加段文件）；None → 全局配置的 prompt.system.*
     """
     if llm is None and llm_config is not None:
         from Agent.llm import create_llm
@@ -204,7 +208,7 @@ async def create_agent(
     await tools.list_tools()
 
     working = memory if memory is not None else _ListWorkingMemory()
-    actor = ActorAgent(tools, working, llm=llm)
+    actor = ActorAgent(tools, working, llm=llm, prompt_loader=prompt_loader)
     agent = StandaloneAgent(
         actor, working, on_event=on_event,
         max_steps=max_steps, max_tool_retries=max_tool_retries,

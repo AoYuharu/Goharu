@@ -227,3 +227,18 @@
   覆盖式登记不踢旧线，临时客户端（测试/脚本）退出时把仍在用的原连接
   标离线，原连接不断不重连 → 幽灵离线。修复方向（待做）：注册新连接时
   主动 close 旧 ws，让旧端 connect_forever 感知断开立即重连。
+- **网络话语权（Floor）**：hub 内存态（唯一权威，重启清零；持有者掉线自动
+  收回）+ `floor_state` 广播 + welcome/presence 快照；`AgentSession.enqueue`
+  前置关卡（channel 之前，任何 channel 入站统一拦截）——他人持权：本地直连
+  输入回透明提示、agentnet 副本静默；自己·arch：worker 线程串行派发给
+  Architect `request_wake(REASON_MANUAL, kind=floor_chat, background=False)`，
+  回复经**来源 channel** 回送（不碰 _active_channel/_processing）。
+  long-hold：turns>3 或 >600s 注入 reminder（epoch 变化即重置计数）。
+- **坑：channel 出站钩子有隐式状态**——agentnet 的 send_answer 依赖
+  `_reply_target`（正常 turn 的中继语状态），floor 派发这类"旁路回复"
+  直接调会被静默丢弃。约定：旁路回复传 `meta={"floor": True}` 走
+  `_broadcast_text` 直发；先发 ack 再发结果（透明化）。
+- **arch 聊天口吻**：architect 子代理提示词强制结构化审计报告
+  （Changes/Verification），话语权对话时必须在 task context 末尾显式
+  以"【话语权对话模式】…不要输出 Changes/Verification 报告格式"覆盖，
+  否则会回审计体。context 在任务文本末尾，是可靠的覆盖位置。

@@ -1,4 +1,4 @@
-"""AgentNet channel：把智能体组网接入 Goharu 的 channel 体系。
+"""AgentNet channel：把 HaruNet 组网接入 Goharu 的 channel 体系。
 
 入站：AgentNetClient 收消息 → MessageBox 落盒（全部）→ mention/dm 额外
 emit_inbound 唤醒 turn；group 静默入盒（摘要经 SessionMemoryView 的
@@ -26,6 +26,8 @@ from AgentNet.messagebox import MessageBox
 from AgentNet.protocol import CLASS_DM, CLASS_GROUP, CLASS_MENTION
 from Gateway.channels.base import Channel
 from Gateway.channels.registry import register_channel
+from Gateway.floor import FloorState
+from Gateway.names import NET_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,8 @@ class AgentNetChannel(Channel):
         self._agent_streak = 0
         # 群体意识：peer agent_id → 名字（presence_state 广播维护，用于@对象标注）
         self._peer_names: dict = {}
+        # 网络话语权本地快照（floor_state 事件同步；SessionManager 装配给入队关卡）
+        self.floor = FloorState()
         identity_dir = self.params.get("identity_dir", "./runtime_memory/agentnet/identity")
         box_path = self.params.get("messagebox_path", "./runtime_memory/agentnet/messagebox.db")
         self.identity = Identity.load_or_create(identity_dir, name=self.name)
@@ -143,6 +147,11 @@ class AgentNetChannel(Channel):
             security = get_security_checker().snapshot()
         except Exception:
             security = None   # 无 Tools 环境（纯 AgentNet 测试）不上报
+        try:
+            import Architect.hub  # noqa: F401——arch 可被转交话语权的宿主标记
+            hosts_architect = True
+        except Exception:
+            hosts_architect = False
         self._client = AgentNetClient(
             self.identity, self.url, messagebox=self.box,
             state_provider=lambda: self._state_provider(),
@@ -154,6 +163,7 @@ class AgentNetChannel(Channel):
                 "focus": self.params.get("focus", ""),
                 "tags": list(self.params.get("tags") or []),
                 "security": security,
+                "hosts_architect": hosts_architect,
             },
             http_base=self.http_base,
         )
@@ -217,12 +227,19 @@ class AgentNetChannel(Channel):
         if kind == "welcome":
             self._connected.set()
             logger.info("agentnet 已上线: %s", self.identity.agent_id)
+            self.floor.update((env.get("payload") or {}).get("floor"))
         elif kind == "presence_state":
-            agents = (env.get("payload") or {}).get("agents") or {}
+            payload = env.get("payload") or {}
+            agents = payload.get("agents") or {}
             for aid, info in agents.items():
                 name = (info or {}).get("name")
                 if aid and name:
                     self._peer_names[aid] = str(name)
+            self.floor.update(payload.get("floor"))
+        elif kind == "floor_state":
+            snap = self.floor.update((env.get("payload") or {}).get("floor"))
+            logger.info("话语权更新: %s（%s）",
+                        snap.holder_name or "无", snap.persona if snap.held else "-")
 
     def _fmt_mentions(self, mentions: list) -> str:
         """mentions（agent_id 列表）→ '@名字1 @名字2'（名字缺失用短 id）。"""
@@ -349,6 +366,14 @@ class AgentNetChannel(Channel):
             self._agent_streak = 0   # 主人说话重置乒乓计数
         urgent = (class_ in (CLASS_MENTION, CLASS_DM)
                   or (class_ == CLASS_GROUP and in_attention))
+        # 网络话语权（绝对优先）：持有期间只有持有者响应老板消息
+        snap = self.floor.snapshot()
+        if snap.held:
+            if snap.holder_agent_id != self.identity.agent_id:
+                return   # 话语权在别处：照常入盒，静默不唤醒
+            if not is_owner:
+                return   # 我持有话语权：只响应主人，同事消息不打断对话
+            urgent = True   # 持有期间主人所有消息都是对你说
         # 乒乓刹车：关注期内的同事普通群聊，连续 N 轮无主人参与后不再唤醒
         if urgent and not is_owner and class_ == CLASS_GROUP:
             if self._agent_streak >= self._agent_pingpong_limit:
@@ -414,9 +439,14 @@ class AgentNetChannel(Channel):
         attentive_chat = [i for i in items if i["class"] == CLASS_GROUP and not i["is_owner"]]
         t0, t1 = items[0]["ts"][11:19] or "?", items[-1]["ts"][11:19] or "?"
         parts = [
-            f"[agentnet 组网消息整理 · {len(items)} 条"
+            f"[{NET_NAME} 组网消息整理 · {len(items)} 条"
             f"{'（含主人消息）' if owners else ''}（{t0} → {t1}）]"
         ]
+        snap = self.floor.snapshot()
+        if snap.held and snap.holder_agent_id == self.identity.agent_id:
+            parts.append("🎙 你正持有 HaruNet 话语权：主人在和你直接对话"
+                         + ("（arch 人格）。" if snap.persona == "arch" else "。")
+                         + "回复会广播到群聊。")
         if directed:
             parts.append("【@你的消息 · ⚡重点】你被点名，已进入关注期，需处理或回应"
                          "（按时间顺序）：")
@@ -477,9 +507,15 @@ class AgentNetChannel(Channel):
                  f"{'（主人）' if r['sender'] in self.owner_ids else ''}"
                  f"{_note(r)}: {r['text']}"
                  for r in rows]
+        snap = self.floor.snapshot()
+        floor_line = []
+        if snap.held and snap.holder_agent_id != self.identity.agent_id:
+            floor_line = [f"🎙 The floor is held by @{snap.holder_name or snap.holder_agent_id}"
+                          " — this conversation is not for you; stay silent unless "
+                          "explicitly asked."]
         total = sum(len(l) for l in lines)
         if total <= self._group_inline_max_chars:
-            return [f"【群消息】（{len(rows)} 条，按时间顺序）"] + lines
+            return floor_line + [f"【群消息】（{len(rows)} 条，按时间顺序）"] + lines
         # 大体量：压缩智能体后台摘要，完成后补送进消息队列
         logger.info("群消息 %d 条共 %d 字，交压缩智能体摘要", len(rows), total)
         threading.Thread(target=self._summarize_groups,
@@ -514,9 +550,15 @@ class AgentNetChannel(Channel):
         去重：模型本 turn 已经用 serverMessageHandler reply 发过消息时不再中继
         （否则同一条回答出现两遍）。中继/跳过之后清空回复目标——防止后续与
         组网无关的 turn（如 TUI 私聊）把回答误广播到全网。
+
+        meta.floor=true：话语权对话回复（arch 派发/透明提示），不依赖
+        _reply_target 的私聊中继语义，直接广播。
         """
         target = self._reply_target
         self._reply_target = None
+        if meta and meta.get("floor"):
+            self._broadcast_text(text)
+            return
         if target is None:
             return
         if self._agent_replied:
@@ -527,13 +569,15 @@ class AgentNetChannel(Channel):
         if not target.get("auto_relay", True):
             logger.info("agentnet: 同事触发的回答不自动中继（防乒乓）")
             return
+        self._broadcast_text(text, mentions=[target["sender"]])
+
+    def _broadcast_text(self, text: str, mentions: list | None = None) -> None:
         if not self._client or not self._loop:
             return
         try:
             fut = asyncio.run_coroutine_threadsafe(
                 self._client.send_message(
-                    "grp:main", text, kind="group",
-                    mentions=[target["sender"]]),
+                    "grp:main", text, kind="group", mentions=mentions),
                 self._loop)
             fut.result(timeout=10)
         except Exception as e:
@@ -573,6 +617,15 @@ class AgentNetChannel(Channel):
         if not self._client or not self._loop or not self._connected.is_set():
             return None
         return asyncio.run_coroutine_threadsafe(self._client.query_presence(), self._loop)
+
+    def net_set_floor_fut(self, action: str, target: str = "",
+                          persona: str = "main", note: str = ""):
+        """切换网络话语权（FloorControl 工具调用）：set|clear，hub 广播全网。"""
+        if not self._client or not self._loop or not self._connected.is_set():
+            return None
+        return asyncio.run_coroutine_threadsafe(
+            self._client.set_floor(action, target=target, persona=persona,
+                                   note=note), self._loop)
 
     def _report_profile(self) -> None:
         """把最新 profile（含安全规则快照）上报 hub：更新内存档案并触发广播。"""

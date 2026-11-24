@@ -21,11 +21,12 @@ REASON_SCHEDULED = "scheduled"       # 定时自省（未实现）
 REASON_IDLE = "idle"                 # 空闲探索（未实现）
 REASON_MANUAL = "manual"             # 人工点名
 
-# kind 决定任务模板：守护 / 审计 / 自省 / 探索
+# kind 决定任务模板：守护 / 审计 / 自省 / 探索 / 话语权对话
 KIND_GUARDIAN = "guardian"
 KIND_AUDIT = "audit"
 KIND_INTROSPECT = "introspect"
 KIND_EXPLORE = "explore"
+KIND_FLOOR_CHAT = "floor_chat"       # 话语权=arch：主人直接对话
 
 
 @dataclass
