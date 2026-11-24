@@ -584,11 +584,56 @@ def step_register_command() -> bool:
     return True
 
 
+def _mask_secret(secret: str) -> str:
+    if not secret:
+        return "未设置"
+    return "****" + secret[-4:] if len(secret) > 4 else "****"
+
+
+def _configure_harunet(current: dict | None) -> dict | None:
+    """HaruNet 子配置菜单：逐项修改、支持随时返回/放弃（输错密码可重输）。
+
+    返回新的配置 dict；用户选「放弃修改」时返回 current（保持原状）。
+    """
+    state = {
+        "enabled": bool((current or {}).get("enabled", True)),
+        "url": (current or {}).get("url") or "ws://159.75.26.204:6000",
+        "name": (current or {}).get("name", ""),
+        "password": (current or {}).get("password", ""),
+    }
+    while True:
+        idx = choose("HaruNet 配置（↑↓ 选择，回车修改；选「保存」返回）", [
+            f"接入开关：{'是' if state['enabled'] else '否'}",
+            f"hub 地址：{state['url']}",
+            f"网络昵称：{state['name'] or '（默认 config agentnet.name）'}",
+            f"接入密码：{_mask_secret(state['password'])}",
+            "保存并返回",
+            "放弃修改返回",
+        ], default=4)
+        if idx == 0:
+            state["enabled"] = not state["enabled"]
+        elif idx == 1:
+            state["url"] = ask("HaruNet hub 地址", state["url"])
+        elif idx == 2:
+            state["name"] = ask("网络昵称（回车保持）", state["name"])
+        elif idx == 3:
+            new_pw = ask_secret("接入密码（回车保持不变；输入 - 清空）")
+            if new_pw == "-":
+                state["password"] = ""
+            elif new_pw:
+                state["password"] = new_pw
+        elif idx == 4:
+            return state
+        else:
+            return current
+
+
 def step_choose_channels() -> dict:
     """Channel 配置：↑↓ 选择进入对应项，回车开始输入；高级选项独立成组。
 
     QQ Bot 与 HaruNet 在 Channel 一栏；出站代理放进「高级选项」（用户主动回车
-    进入后才出现输入框），交互与系统设置界面一致。
+    进入后才出现输入框），交互与系统设置界面一致。HaruNet 用子菜单逐项配置，
+    输错密码可以返回重新输入。
     """
     title("通道与代理（可选，都可跳过）")
     out = {"qq": None, "harunet": None, "proxy": ""}
@@ -608,13 +653,7 @@ def step_choose_channels() -> dict:
                 else:
                     warn("QQ app_id / secret 不全，跳过 QQ 配置")
         elif idx == 1:
-            if confirm("接入 HaruNet 组网？（默认不接入：未接入的智能体对组网一无所知）", default=False):
-                url = ask("HaruNet hub 地址", "ws://159.75.26.204:6000")
-                name = ask("网络昵称（回车用 config.yaml 的 agentnet.name）", "")
-                password = ask_secret("接入密码（hub --join-password，留空=仅白名单模式）")
-                out["harunet"] = {"url": url, "name": name, "password": password}
-                info("接入 = 密码（或白名单）+ 开关：若握手被拒，检查接入密码，"
-                     "或把日志里的 agent_id 加入 hub 白名单")
+            out["harunet"] = _configure_harunet(out["harunet"])
         elif idx == 2:
             adv = choose("高级选项（↑↓ 选择，回车进入）", ["出站代理", "返回"], default=1)
             if adv == 0:
@@ -649,18 +688,22 @@ def step_write_channels(ch: dict) -> None:
         open(env_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
         info("已写入 QQ Bot 凭据到 .env")
     cfg_path = os.path.join(REPO_DIR, "config.yaml")
-    # HaruNet 接入开关：.env AGENTNET_ENABLED=true（机器级覆盖；config 默认 false）
-    if ch.get("harunet"):
+    # HaruNet 接入开关：.env AGENTNET_ENABLED=true/false（机器级覆盖；config 默认 false）
+    if ch.get("harunet") is not None:
+        har = ch["harunet"]
+        enabled = bool(har.get("enabled", True))
         env_path = os.path.join(REPO_DIR, ".env")
         lines = (open(env_path, encoding="utf-8").read().splitlines()
                  if os.path.exists(env_path) else [])
-        lines = _set_env_line(lines, "AGENTNET_ENABLED", "true")
-        if ch["harunet"].get("name"):
-            lines = _set_env_line(lines, "AGENTNET_NAME", ch["harunet"]["name"])
-        if ch["harunet"].get("password"):
-            lines = _set_env_line(lines, "AGENTNET_PASSWORD", ch["harunet"]["password"])
+        lines = _set_env_line(lines, "AGENTNET_ENABLED",
+                              "true" if enabled else "false")
+        if enabled:
+            if har.get("name"):
+                lines = _set_env_line(lines, "AGENTNET_NAME", har["name"])
+            if har.get("password"):
+                lines = _set_env_line(lines, "AGENTNET_PASSWORD", har["password"])
         open(env_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
-        info("已写入 AGENTNET_ENABLED=true 到 .env")
+        info("已写入 AGENTNET_ENABLED=%s 到 .env" % ("true" if enabled else "false"))
     if not os.path.exists(cfg_path):
         return
     txt = open(cfg_path, encoding="utf-8").read()
