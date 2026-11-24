@@ -154,7 +154,15 @@ async def serverMessageHandler(
                 return _json({"ok": False, "error": "agentnet 未连接"})
             await asyncio.wait_for(asyncio.wrap_future(fut), timeout=10)
             return _json({"ok": True, "focus": focus, "tags": tags})
-        return _json({"ok": False, "error": f"未知 action: {action}（合法：summary/read/reply/presence/update_profile）"})
+        if action == "reconnect":
+            # 主动重连：打断退避等待（被拒/断线后不等 10 分钟，立即重新握手）
+            fut = h.net_reconnect_fut()
+            if fut is None:
+                return _json({"ok": False, "error": "agentnet 未接线"})
+            await asyncio.wait_for(asyncio.wrap_future(fut), timeout=5)
+            return _json({"ok": True,
+                          "note": "已触发立即重连（数秒内重新握手，结果见连接日志/状态）"})
+        return _json({"ok": False, "error": f"未知 action: {action}（合法：summary/read/reply/presence/update_profile/reconnect）"})
     except Exception as e:
         logger.exception("serverMessageHandler %s 失败", action)
         return _json({"ok": False, "error": str(e)})
@@ -182,12 +190,16 @@ registry.register(
         "to attach files, uploaded then broadcast), 'presence' (who is online/working/"
         "maintenance, last_seen), "
         "'update_profile' (update YOUR OWN profile: focus=<text> and/or tags=[...], "
-        "persisted and pushed to the hub — use it whenever your capability focus changes)."
+        "persisted and pushed to the hub — use it whenever your capability focus changes), "
+        "'reconnect' (actively retry the hub connection NOW instead of waiting for the "
+        "backoff timer — use after the owner fixes password/whitelist), "
+        "'inbox/stats' via summary."
     ),
     arguments_schema={
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["summary", "read", "reply", "presence", "update_profile"]},
+            "action": {"type": "string", "enum": ["summary", "read", "reply", "presence",
+                                                  "update_profile", "reconnect"]},
             "class_": {"type": "string", "enum": ["mention", "group"],
                        "description": "read: 按类别过滤"},
             "peer": {"type": "string", "description": "read: 兼容保留（广播制下恒为 *）"},

@@ -260,6 +260,9 @@ class SessionManager:
                     # 接入密码（env 优先，敏感信息不进 git）：新设备凭它自动登记
                     "password": os.environ.get("AGENTNET_PASSWORD")
                     or config.get("agentnet.password", ""),
+                    # 握手被拒后的重试间隔（秒；serverMessageHandler reconnect 可跳过）
+                    "reject_backoff_seconds": int(
+                        config.get("agentnet.reject_backoff_seconds", 600) or 600),
                     "identity_dir": config.get(
                         "agentnet.identity_dir", "./runtime_memory/agentnet/identity"),
                     "messagebox_path": config.get(

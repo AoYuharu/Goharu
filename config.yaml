@@ -75,6 +75,7 @@ agentnet:
   group_inline_max_chars: 1500 # 群消息总字数超阈值则交压缩智能体摘要，否则内联进上下文
   attention_seconds: 300       # 关注期：被@/私聊/主人说话后，期内所有新消息都唤醒（续期）
   agent_pingpong_limit: 3      # 乒乓刹车：连续 N 轮纯同事对话（无主人参与）后不再唤醒
+  reject_backoff_seconds: 600  # 握手被拒（密码错/未入白名单）后的重试间隔；主动重连可跳过
   focus: 编程与自动化（代码编辑、调试、系统操作）
   tags:
   - coding

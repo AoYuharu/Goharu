@@ -105,6 +105,8 @@ class AgentNetClient:
         self._ws: Any = None
         self._connected = asyncio.Event()
         self._close_event = asyncio.Event()  # close() 可立即唤醒重连退避
+        self._kick_event = asyncio.Event()   # 主动重连：打断退避立即重试
+        self.attempt_count = 0               # 累计连接尝试次数（观测用）
         self._closed = False
         self._presence_waiter: Optional[asyncio.Future] = None
         self._write_lock = asyncio.Lock()
@@ -116,15 +118,35 @@ class AgentNetClient:
     def connected(self) -> bool:
         return self._connected.is_set()
 
+    async def kick_reconnect(self) -> None:
+        """主动重连：打断当前退避等待，立即进入下一轮连接尝试。
+
+        用途：被拒（密码错/未入白名单）后用户已修正配置，不想等长退避。
+        """
+        self._kick_event.set()
+
     async def _wait_backoff(self, seconds: float) -> bool:
-        """等待退避；close() 被调用则立即返回 True 退出重连循环。"""
+        """等待退避。返回值：True=退出重连循环（close）；False=超时或主动重连。"""
         if self._closed:
             return True
-        try:
-            await asyncio.wait_for(self._close_event.wait(), timeout=seconds)
-            return True
-        except asyncio.TimeoutError:
+        if self._kick_event.is_set():
+            self._kick_event.clear()
             return False
+        close_task = asyncio.create_task(self._close_event.wait())
+        kick_task = asyncio.create_task(self._kick_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {close_task, kick_task}, timeout=seconds,
+                return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            close_task.cancel()
+            kick_task.cancel()
+        if self._closed or close_task in done:
+            return True
+        if kick_task in done:
+            self._kick_event.clear()
+            logger.info("agentnet 主动重连：立即重试")
+        return False
 
     async def connect_forever(self) -> None:
         """重连循环（退避 1s→max；握手被拒走长退避）。close() 后立即退出。"""
@@ -159,6 +181,7 @@ class AgentNetClient:
                 backoff = min(backoff * 2, self._reconnect_max)
 
     async def _run_once(self) -> None:
+        self.attempt_count += 1
         async with websockets.connect(self.url, ping_interval=20, ping_timeout=20) as ws:
             self._ws = ws
             try:

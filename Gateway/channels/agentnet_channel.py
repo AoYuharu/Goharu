@@ -160,6 +160,8 @@ class AgentNetChannel(Channel):
             on_event=self._on_net_event,
             on_control=self._on_control,
             password=self.params.get("password", ""),
+            reject_backoff_seconds=int(
+                self.params.get("reject_backoff_seconds", 600) or 600),
             profile={
                 "focus": self.params.get("focus", ""),
                 "tags": list(self.params.get("tags") or []),
@@ -632,6 +634,13 @@ class AgentNetChannel(Channel):
         if not self._client or not self._loop or not self._connected.is_set():
             return None
         return asyncio.run_coroutine_threadsafe(self._client.query_presence(), self._loop)
+
+    def net_reconnect_fut(self):
+        """主动重连：打断当前退避等待，立即重新握手（工具/TUI 可触发）。"""
+        if not self._client or not self._loop:
+            return None
+        return asyncio.run_coroutine_threadsafe(
+            self._client.kick_reconnect(), self._loop)
 
     def net_set_floor_fut(self, action: str, target: str = "",
                           persona: str = "main", note: str = ""):

@@ -154,6 +154,7 @@ def main():
         # ------------------------------------------- 14. 接入边界（握手/退避）
         print("\n[14] 接入边界：两段式握手 + 白名单拒绝长退避")
         asyncio.run(handshake_test(root))
+        reconnect_tool_test()
 
         # ------------------------------------------- 15. 可靠性修复回归
         print("\n[15] 可靠性：mailbox/共享状态/重连/生命周期")
@@ -1512,6 +1513,40 @@ async def handshake_test(root: Path):
         check("默认拒绝退避为 10 分钟",
               AgentNetClient(b, f"ws://127.0.0.1:{port}")._reject_backoff == 600)
 
+        # 主动重连：不等长退避，kick 后立即重新握手
+        e = Identity.load_or_create(root / "hs_e", name="epsilon")
+        ce = AgentNetClient(e, f"ws://127.0.0.1:{port}", heartbeat_seconds=3600,
+                            reject_backoff_seconds=60)
+        te = asyncio.create_task(ce.connect_forever())
+        try:
+            ok = False
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                if ce.attempt_count >= 1 and ce._last_backoff == 60.0:
+                    ok = True
+                    break
+                await asyncio.sleep(0.05)
+            check("被拒后进入长退避", ok,
+                  f"attempts={ce.attempt_count} backoff={ce._last_backoff}")
+            n0 = ce.attempt_count
+            await ce.kick_reconnect()
+            ok = False
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                if ce.attempt_count >= n0 + 1:
+                    ok = True
+                    break
+                await asyncio.sleep(0.05)
+            check("主动重连立即重试（不等 60s）", ok,
+                  f"attempts {n0} -> {ce.attempt_count}")
+        finally:
+            await ce.close()
+            te.cancel()
+            try:
+                await te
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # 接入密码：非白名单设备凭密码自动登记入网（旧成员免密）
         check("被拒时白名单无该指纹", hub.whitelist.agent(d.agent_id) is None)
         cd2 = AgentNetClient(d, f"ws://127.0.0.1:{port}", heartbeat_seconds=3600,
@@ -1732,6 +1767,33 @@ async def security_control_test(root: Path):
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+
+
+def reconnect_tool_test():
+    """serverMessageHandler(action=reconnect) → channel.net_reconnect_fut。"""
+    import asyncio as _aio
+    from concurrent.futures import Future
+
+    from Tools.builtin import agentnet_tools
+
+    class FakeHandle:
+        def __init__(self):
+            self.kicked = False
+
+        def net_reconnect_fut(self):
+            self.kicked = True
+            fut = Future()
+            fut.set_result(None)
+            return fut
+
+    h = FakeHandle()
+    old = agentnet_tools._handle
+    try:
+        agentnet_tools.set_agentnet_handle(h)
+        out = _aio.run(agentnet_tools.serverMessageHandler(action="reconnect"))
+        check("工具触发主动重连", h.kicked and '"ok": true' in out, out)
+    finally:
+        agentnet_tools.set_agentnet_handle(old)
 
 
 def security_unit_test():
