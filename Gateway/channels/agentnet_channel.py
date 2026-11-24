@@ -159,6 +159,7 @@ class AgentNetChannel(Channel):
             on_message=self._on_any_message,
             on_event=self._on_net_event,
             on_control=self._on_control,
+            password=self.params.get("password", ""),
             profile={
                 "focus": self.params.get("focus", ""),
                 "tags": list(self.params.get("tags") or []),
@@ -177,6 +178,13 @@ class AgentNetChannel(Channel):
     def stop(self):
         if self._client and self._loop:
             asyncio.run_coroutine_threadsafe(self._client.close(), self._loop)
+
+    def health(self) -> dict:
+        """HaruNet 连通状态：online / offline（含最近失败原因）。"""
+        if self._connected.is_set():
+            return {"ok": True, "state": "online", "detail": f"已连接 {self.url}"}
+        err = (self._client.last_error if self._client else "") or "尚未连接（等待重试）"
+        return {"ok": False, "state": "offline", "detail": err}
 
     def set_state_provider(self, fn) -> None:
         """SessionManager 装配后注入：() -> idle|working|maintenance。"""
@@ -240,6 +248,9 @@ class AgentNetChannel(Channel):
             snap = self.floor.update((env.get("payload") or {}).get("floor"))
             logger.info("话语权更新: %s（%s）",
                         snap.holder_name or "无", snap.persona if snap.held else "-")
+        elif kind == "disconnected":
+            self._connected.clear()
+            logger.info("agentnet 已离线: %s", self.identity.agent_id)
 
     def _fmt_mentions(self, mentions: list) -> str:
         """mentions（agent_id 列表）→ '@名字1 @名字2'（名字缺失用短 id）。"""
@@ -554,15 +565,18 @@ class AgentNetChannel(Channel):
         meta.floor=true：话语权对话回复（arch 派发/透明提示），不依赖
         _reply_target 的私聊中继语义，直接广播。
         """
-        target = self._reply_target
-        self._reply_target = None
+        with self._urgent_lock:
+            target = self._reply_target
+            self._reply_target = None
+            agent_replied = self._agent_replied
+            if agent_replied:
+                self._agent_replied = False
         if meta and meta.get("floor"):
             self._broadcast_text(text)
             return
         if target is None:
             return
-        if self._agent_replied:
-            self._agent_replied = False
+        if agent_replied:
             logger.info("agentnet: 模型已自行广播，跳过 send_answer 中继")
             return
         # 纯同事触发的 turn 不自动中继（防反弹循环）：要回应必须用 reply 工具
@@ -607,7 +621,8 @@ class AgentNetChannel(Channel):
                 attachments.append(await self._client.upload_file(str(p)))
             msg_id = await self._client.send_message(
                 to, text, kind=kind, mentions=mentions, attachments=attachments)
-            self._agent_replied = True  # send_answer 据此去重
+            with self._urgent_lock:
+                self._agent_replied = True  # send_answer 据此去重
             return msg_id
 
         return asyncio.run_coroutine_threadsafe(_coro(), self._loop)
@@ -637,11 +652,17 @@ class AgentNetChannel(Channel):
         except Exception:
             pass
         try:
-            asyncio.run_coroutine_threadsafe(
-                self._client.update_profile(), self._loop).result(timeout=10)
-            logger.info("profile 已上报 hub（含安全规则快照）")
+            fut = asyncio.run_coroutine_threadsafe(
+                self._client.update_profile(), self._loop)
+            def _done(f):
+                try:
+                    f.result()
+                    logger.info("profile 已上报 hub（含安全规则快照）")
+                except Exception:
+                    logger.exception("profile 上报 hub 失败")
+            fut.add_done_callback(_done)
         except Exception:
-            logger.exception("profile 上报 hub 失败")
+            logger.exception("profile 上报 hub 调度失败")
 
     def net_update_profile_fut(self, focus: str | None = None, tags: list | None = None):
         """更新自己的档案（focus/tags）并上报 hub；同时落盘 profile.json。"""

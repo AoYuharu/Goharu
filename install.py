@@ -585,23 +585,42 @@ def step_register_command() -> bool:
 
 
 def step_choose_channels() -> dict:
-    """可选：QQ Bot / HaruNet 组网 / 出站代理。都可跳过，跨平台（.env + config 文本写入）。"""
+    """Channel 配置：↑↓ 选择进入对应项，回车开始输入；高级选项独立成组。
+
+    QQ Bot 与 HaruNet 在 Channel 一栏；出站代理放进「高级选项」（用户主动回车
+    进入后才出现输入框），交互与系统设置界面一致。
+    """
     title("通道与代理（可选，都可跳过）")
     out = {"qq": None, "harunet": None, "proxy": ""}
-    if confirm("配置 QQ Bot channel？", default=False):
-        app_id = ask("QQBOT_APP_ID")
-        secret = ask_secret("QQBOT_CLIENT_SECRET")
-        if app_id and secret:
-            out["qq"] = {"app_id": app_id, "secret": secret}
+    while True:
+        idx = choose("Channel 配置（↑↓ 选择，回车进入；选「完成」继续安装）", [
+            "QQ Bot（官方频道机器人）",
+            "HaruNet 组网（接入密码 + hub）",
+            "高级选项（出站代理等）",
+            "完成，继续安装",
+        ], default=3)
+        if idx == 0:
+            if confirm("配置 QQ Bot channel？", default=False):
+                app_id = ask("QQBOT_APP_ID")
+                secret = ask_secret("QQBOT_CLIENT_SECRET")
+                if app_id and secret:
+                    out["qq"] = {"app_id": app_id, "secret": secret}
+                else:
+                    warn("QQ app_id / secret 不全，跳过 QQ 配置")
+        elif idx == 1:
+            if confirm("接入 HaruNet 组网？（默认不接入：未接入的智能体对组网一无所知）", default=False):
+                url = ask("HaruNet hub 地址", "ws://159.75.26.204:6000")
+                name = ask("网络昵称（回车用 config.yaml 的 agentnet.name）", "")
+                password = ask_secret("接入密码（hub --join-password，留空=仅白名单模式）")
+                out["harunet"] = {"url": url, "name": name, "password": password}
+                info("接入 = 密码（或白名单）+ 开关：若握手被拒，检查接入密码，"
+                     "或把日志里的 agent_id 加入 hub 白名单")
+        elif idx == 2:
+            adv = choose("高级选项（↑↓ 选择，回车进入）", ["出站代理", "返回"], default=1)
+            if adv == 0:
+                out["proxy"] = ask("出站代理地址（如 socks5://127.0.0.1:7890，留空跳过）")
         else:
-            warn("QQ app_id / secret 不全，跳过 QQ 配置")
-    if confirm("接入 HaruNet 组网？（默认不接入：未接入的智能体对组网一无所知）", default=False):
-        url = ask("HaruNet hub 地址", "ws://159.75.26.204:6000")
-        name = ask("网络昵称（回车用 config.yaml 的 agentnet.name）", "")
-        out["harunet"] = {"url": url, "name": name}
-        info("接入 = 开关 + hub 白名单：首次启动后日志会打印 agent_id，"
-             "把它加进 hub 的 whitelist.json 才能真正入网（此前每 10 分钟重试一次）")
-    out["proxy"] = ask("出站代理地址（如 socks5://127.0.0.1:7890，留空跳过）")
+            break
     return out
 
 
@@ -638,6 +657,8 @@ def step_write_channels(ch: dict) -> None:
         lines = _set_env_line(lines, "AGENTNET_ENABLED", "true")
         if ch["harunet"].get("name"):
             lines = _set_env_line(lines, "AGENTNET_NAME", ch["harunet"]["name"])
+        if ch["harunet"].get("password"):
+            lines = _set_env_line(lines, "AGENTNET_PASSWORD", ch["harunet"]["password"])
         open(env_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
         info("已写入 AGENTNET_ENABLED=true 到 .env")
     if not os.path.exists(cfg_path):

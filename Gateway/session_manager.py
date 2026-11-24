@@ -137,6 +137,12 @@ class SessionManager:
         except Exception as e:
             logger.warning("Migration failed (non-critical): %s", e)
 
+        # ── 条件工具组必须在首次工具定义快照前注册（import 即注册）──
+        # 决策在组合根；未接入 HaruNet 时连工具描述都不进上下文。
+        self.agentnet_enabled = _agentnet_enabled()
+        if self.agentnet_enabled:
+            from Tools.builtin import agentnet_tools, floor_tools
+
         # ── 工具运行时（hooks 把全局工具事件路由到目标 session 广播）──
         self.runtime = await create_tools(
             enable_mcp=True,
@@ -168,7 +174,6 @@ class SessionManager:
 
         # ── 功能段提示词：未接入 HaruNet 的智能体对组网一无所知（system 里零相关文本）
         #    决策在组合根；Prompting/Agent 只认"加载器"这个通用缝 ──
-        self.agentnet_enabled = _agentnet_enabled()
         from Prompting.api import create_prompt_loader
         prompt_loader = create_prompt_loader(PromptSectionsOverlay(
             config, actor=["./prompts/actor/agentnet.md"]
@@ -240,9 +245,6 @@ class SessionManager:
         # ── AgentNet 组网 channel（可选，挂到 default session）──
         if self.agentnet_enabled:
             try:
-                # 条件工具组：未接入时模型看不见任何组网工具（连描述都不进上下文）。
-                # import 即注册（Tools 不变量 2），决策权在组合根而非 config 静态表。
-                from Tools.builtin import agentnet_tools, floor_tools
                 session = self.sessions[self.default_session_id]
                 ch = create_channel("agentnet", "agentnet_main", {
                     "url": config.get("agentnet.url", "ws://127.0.0.1:7878"),
@@ -250,6 +252,9 @@ class SessionManager:
                     # 环境变量优先：多机部署时机器专属身份名不必进 git
                     "name": os.environ.get("AGENTNET_NAME")
                     or config.get("agentnet.name", "goharu"),
+                    # 接入密码（env 优先，敏感信息不进 git）：新设备凭它自动登记
+                    "password": os.environ.get("AGENTNET_PASSWORD")
+                    or config.get("agentnet.password", ""),
                     "identity_dir": config.get(
                         "agentnet.identity_dir", "./runtime_memory/agentnet/identity"),
                     "messagebox_path": config.get(
@@ -386,6 +391,24 @@ class SessionManager:
         if action == "clear_messagebox":
             return "messagebox 已由 channel 清空"
         return f"未知动作: {action}"
+
+    def channels_health(self) -> list:
+        """全部 session 挂载 channel 的连通/配置状态（gateway status / TUI 设置用）。"""
+        rows = []
+        for sid, session in self.sessions.items():
+            for ch in session.channels:
+                try:
+                    h = ch.health()
+                except Exception as e:
+                    h = {"ok": False, "state": "error", "detail": str(e)}
+                rows.append({
+                    "session": sid,
+                    "type": ch.channel_type,
+                    "channel_id": ch.channel_id,
+                    "name": getattr(ch, "name", ch.channel_id),
+                    **h,
+                })
+        return rows
 
     def _arch_floor_dispatch(self, question: str, reminder: str | None = None):
         """话语权=arch：把主人消息交给 Architect 派发链（worker 线程调用，可阻塞）。"""

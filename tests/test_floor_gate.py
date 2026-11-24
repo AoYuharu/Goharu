@@ -84,6 +84,24 @@ def main():
     check("清空 + epoch 增", not snap.held and snap.epoch > e1)
     check("held_by", st.update(floor_of("agt_b", "arch")).held_by("agt_b", "arch"))
 
+    # 相同语义快照必须幂等：presence 周期广播不得反复重置持有期
+    st2 = FloorState()
+    first = st2.update(floor_of("agt_b", "arch", since=123.0))
+    again = st2.update(floor_of("agt_b", "arch", since=123.0))
+    check("相同快照幂等", again.epoch == first.epoch and again.since == first.since,
+          f"{first.epoch} -> {again.epoch}")
+    no_since = st2.update({"holder_agent_id": "agt_b", "holder_name": "haru-box",
+                           "persona": "arch", "note": ""})
+    check("缺省 since 不刷新", no_since.epoch == first.epoch
+          and no_since.since == 123.0, f"{no_since.since}/{no_since.epoch}")
+    changed = st2.update(floor_of("agt_b", "main", since=123.0))
+    check("人格变化才增 epoch", changed.epoch == first.epoch + 1,
+          f"{first.epoch} -> {changed.epoch}")
+    st2.update(None)
+    epoch_cleared = st2.snapshot().epoch
+    st2.update(None)
+    check("重复清空幂等", st2.snapshot().epoch == epoch_cleared)
+
     # ------------------------------------------------- 2. 无话语权 → process
     print("\n[2] 无话语权透传")
     floor = FloorState()

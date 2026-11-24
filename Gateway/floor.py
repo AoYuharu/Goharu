@@ -46,22 +46,33 @@ class FloorState:
     def update(self, floor: dict | None) -> FloorSnapshot:
         """应用 hub 下发的 floor 载荷（None/空 dict = 无话语权）。
 
-        载荷形如 {holder_agent_id, holder_name, persona, since, note}；
-        epoch 在本地自增（hub 载荷不必带），用于持有期计数重置。
+        相同语义快照幂等：presence 周期广播不得反复重置持有期 epoch。
+        仅首次持有、语义字段变化或清除时 epoch +1；缺少 since 的相同快照沿用旧值。
         """
         f = dict(floor or {})
         with self._lock:
-            epoch = self._snap.epoch
-            if f.get("holder_agent_id"):
-                epoch += 1
-            elif self._snap.held:
-                epoch += 1
+            old = self._snap
+            since_raw = f.get("since")
+            if since_raw:
+                since = float(since_raw)
+            elif f.get("holder_agent_id") and f.get("holder_agent_id") == old.holder_agent_id:
+                since = old.since
+            else:
+                since = time.time() if f.get("holder_agent_id") else 0.0
+            candidate = (
+                str(f.get("holder_agent_id", "") or ""),
+                str(f.get("holder_name", "") or ""),
+                str(f.get("persona", "main") or "main"),
+                since,
+                str(f.get("note", "") or ""),
+            )
+            previous = (old.holder_agent_id, old.holder_name, old.persona,
+                        old.since, old.note)
+            if candidate == previous:
+                return old
             self._snap = FloorSnapshot(
-                holder_agent_id=str(f.get("holder_agent_id", "") or ""),
-                holder_name=str(f.get("holder_name", "") or ""),
-                persona=str(f.get("persona", "main") or "main"),
-                since=float(f.get("since") or (time.time() if f.get("holder_agent_id") else 0.0)),
-                note=str(f.get("note", "") or ""),
-                epoch=epoch,
+                holder_agent_id=candidate[0], holder_name=candidate[1],
+                persona=candidate[2], since=candidate[3], note=candidate[4],
+                epoch=old.epoch + 1,
             )
             return self._snap

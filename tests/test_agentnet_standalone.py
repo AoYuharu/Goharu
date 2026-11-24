@@ -136,6 +136,8 @@ def main():
         check("页面含键盘焦点守卫", "activeElement" in page)
         check("页面含安全策略区", "buildSecuritySection" in page
               and "action: 'security'" in page)
+        check("feed 重置保留 askDock", "function clearFeed()" in page
+              and "feed.innerHTML = ''" not in page)
 
         # ------------------------------------------- 11. 安全规则中控链路
         print("\n[11] 安全策略观察台链路")
@@ -152,6 +154,10 @@ def main():
         # ------------------------------------------- 14. 接入边界（握手/退避）
         print("\n[14] 接入边界：两段式握手 + 白名单拒绝长退避")
         asyncio.run(handshake_test(root))
+
+        # ------------------------------------------- 15. 可靠性修复回归
+        print("\n[15] 可靠性：mailbox/共享状态/重连/生命周期")
+        asyncio.run(reliability_test(root))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1059,9 +1065,23 @@ async def big_upload_test(root: Path):
         check("sha256 一致", meta.get("sha256") == expect_sha)
         check("内容寻址 id", (meta.get("id") or "").startswith(expect_sha[:16]))
 
-        got = await asyncio.to_thread(
-            urllib.request.urlopen, f"http://127.0.0.1:{oport}{meta['url']}", timeout=10)
-        check("下载内容一致", got.read() == payload)
+        from unittest.mock import patch
+
+        with patch.object(Path, "read_bytes",
+                          side_effect=AssertionError("下载不得整文件 read_bytes")):
+            got = await asyncio.to_thread(
+                urllib.request.urlopen,
+                f"http://127.0.0.1:{oport}{meta['url']}", timeout=10)
+            check("下载 Content-Length 正确",
+                  got.headers.get("Content-Length") == str(len(payload)),
+                  got.headers.get("Content-Length"))
+            sha = hashlib.sha256()
+            while True:
+                chunk = got.read(1024 * 1024)
+                if not chunk:
+                    break
+                sha.update(chunk)
+            check("分块下载内容一致", sha.hexdigest() == expect_sha)
     finally:
         await ca.close()
         ta.cancel()
@@ -1229,6 +1249,195 @@ async def floor_test(root: Path):
                 pass
 
 
+async def reliability_test(root: Path):
+    """本轮可靠性修复：mailbox 至少一次投递、共享状态锁、同身份重连、
+    close 唤醒退避、channel 离线状态与同 loop 非阻塞 profile 上报。"""
+    import websockets
+
+    from AgentNet.client import AgentNetClient
+    from AgentNet.server.hub import HubServer, Mailbox, Presence
+
+    # ---------- Mailbox.pending/ack：第二条发送失败时后续消息保留 ----------
+    a = Identity.load_or_create(root / "rel_a", name="alpha")
+    wl_path = root / "wl_rel.json"
+    wl_path.write_text(json.dumps({
+        "agents": {a.agent_id: {"name": "alpha", "pubkey": a.pubkey_b64}},
+        "groups": {}}), encoding="utf-8")
+    hub = HubServer("127.0.0.1", free_port(), wl_path, root / "hub_state_rel")
+    for i in range(3):
+        hub.mailbox.put(a.agent_id, make_envelope(
+            sender="agt_x", to=a.agent_id, type_="message", kind="dm",
+            payload={"text": f"离线{i}"}))
+    pull = dumps(make_envelope(sender=a.agent_id, to="server", type_="mailbox_pull"))
+    calls = {"n": 0}
+
+    async def flaky(_id, _env):
+        calls["n"] += 1
+        return calls["n"] == 1
+
+    hub._send_to = flaky
+    await hub._route(a.agent_id, pull)
+    left = hub.mailbox.pending(a.agent_id)
+    check("失败停止后仅首条 ack", len(left) == 2 and left[0][1]["payload"]["text"] == "离线1",
+          str([e["payload"]["text"] for _, e in left]))
+
+    async def succeed(_id, _env):
+        return True
+
+    hub._send_to = succeed
+    await hub._route(a.agent_id, pull)
+    check("重试后余下消息按序投完", not hub.mailbox.pending(a.agent_id))
+
+    async def explode(_id, _env):
+        raise ConnectionError("socket closed")
+
+    hub.mailbox.put(a.agent_id, make_envelope(
+        sender="agt_x", to=a.agent_id, type_="message", kind="dm",
+        payload={"text": "不能丢"}))
+    hub._send_to = explode
+    try:
+        await hub._route(a.agent_id, pull)
+    except ConnectionError:
+        pass
+    check("发送异常时当前消息仍保留",
+          [e["payload"]["text"] for _, e in hub.mailbox.pending(a.agent_id)] == ["不能丢"])
+    check("legacy drain 兼容", len(hub.mailbox.drain(a.agent_id)) == 1
+          and not hub.mailbox.pending(a.agent_id))
+
+    # ---------- Presence 并发读写 ----------
+    presence = Presence(root / "presence_stress.json")
+    presence.set_online(a.agent_id, "alpha")
+
+    def writer():
+        for i in range(80):
+            presence.set_state(a.agent_id, "working" if i % 2 else "idle", i % 2 == 0)
+            presence.set_profile(a.agent_id, {"focus": f"f{i}"})
+
+    def reader():
+        for _ in range(80):
+            snap = presence.snapshot()
+            assert a.agent_id in snap
+
+    await asyncio.gather(asyncio.to_thread(writer), asyncio.to_thread(reader))
+    check("Presence 并发读写无撕裂", a.agent_id in presence.snapshot())
+
+    # ---------- submit_answer：False 入盒、异常恢复、重复作答只成功一次 ----------
+    hub.loop = asyncio.get_running_loop()
+
+    def pending(rid):
+        return {"request_id": rid, "kind": "question", "agent_id": a.agent_id,
+                "agent_name": "alpha", "data": {}, "ts": time.time(),
+                "expires": time.time() + 300}
+
+    hub.pending_asks["r1"] = pending("r1")
+    hub._send_to = lambda _id, _env: asyncio.sleep(0, result=False)
+    res = await asyncio.to_thread(hub.submit_answer, "r1", "甲")
+    queued = hub.mailbox.pending(a.agent_id)
+    check("answer 发送失败自动入盒", res.get("ok") and res.get("queued")
+          and queued and queued[-1][1]["payload"]["action"] == "answer", str(res))
+
+    hub.pending_asks["r2"] = pending("r2")
+
+    async def fail_answer(_id, _env):
+        raise ConnectionError("send failed")
+
+    hub._send_to = fail_answer
+    res = await asyncio.to_thread(hub.submit_answer, "r2", "乙")
+    check("answer 异常恢复挂起", not res.get("ok") and "r2" in hub.pending_asks, str(res))
+
+    hub.pending_asks["r3"] = pending("r3")
+    hub._send_to = lambda _id, _env: asyncio.sleep(0, result=True)
+    first = await asyncio.to_thread(hub.submit_answer, "r3", "丙")
+    second = await asyncio.to_thread(hub.submit_answer, "r3", "丙")
+    check("同一请求仅第一次作答成功", first.get("ok") and not second.get("ok"),
+          f"{first} / {second}")
+
+    # ---------- 同身份重连：新连接替换并关闭旧连接，旧清理不污染新状态 ----------
+    port = free_port()
+    hub2 = HubServer("127.0.0.1", port, wl_path, root / "hub_state_rel2")
+    serve_task = asyncio.create_task(hub2.serve())
+    await asyncio.sleep(0.3)
+
+    async def raw_hello():
+        ws = await websockets.connect(f"ws://127.0.0.1:{port}")
+        env = make_envelope(sender=a.agent_id, to="server", type_="hello",
+                            payload={"agent_id": a.agent_id, "name": "alpha",
+                                     "pubkey": a.pubkey_b64})
+        env["sig"] = a.sign(canonical_bytes(env))
+        await ws.send(dumps(env))
+        reply = parse(await ws.recv())
+        return ws, reply
+
+    ws1, r1 = await raw_hello()
+    registered1 = hub2._online.get(a.agent_id)
+    ws2, r2 = await raw_hello()
+    registered2 = hub2._online.get(a.agent_id)
+    check("同身份第二条握手成功", r1["type"] == "welcome" and r2["type"] == "welcome")
+    await ws1.wait_closed()
+    await asyncio.sleep(0.2)
+    check("旧连接被替换关闭且新连接仍在线",
+          registered2 is not None and registered2 is not registered1
+          and hub2.presence.snapshot()[a.agent_id]["online"] is True)
+    await ws2.close()
+    deadline = time.time() + 5
+    while time.time() < deadline and hub2.presence.snapshot()[a.agent_id]["online"]:
+        await asyncio.sleep(0.05)
+    check("新连接正常关闭才下线", not hub2.presence.snapshot()[a.agent_id]["online"])
+    serve_task.cancel()
+    try:
+        await serve_task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    # ---------- close 立即唤醒长退避 ----------
+    client = AgentNetClient(a, f"ws://127.0.0.1:{port}", reject_backoff_seconds=60)
+
+    async def fail_run():
+        raise ConnectionError("test disconnect")
+
+    client._run_once = fail_run
+    task = asyncio.create_task(client.connect_forever())
+    deadline = time.time() + 5
+    while time.time() < deadline and client._last_backoff == 0:
+        await asyncio.sleep(0.02)
+    started = time.time()
+    await client.close()
+    await asyncio.wait_for(task, timeout=2)
+    check("close 立即打断重连退避", time.time() - started < 1.5,
+          f"{time.time()-started:.2f}s")
+
+    # ---------- channel 离线与同 loop 非阻塞 profile 上报 ----------
+    from Gateway.channels.agentnet_channel import AgentNetChannel
+
+    ch = AgentNetChannel.__new__(AgentNetChannel)
+    ch.identity = a
+    ch._connected = asyncio.Event()
+    ch._connected.set()
+    ch._on_net_event("disconnected", {})
+    check("disconnected 清 channel 状态", not ch._connected.is_set())
+
+    called = asyncio.Event()
+
+    class FakeProfileClient:
+        def __init__(self):
+            self._profile = {}
+
+        async def update_profile(self):
+            called.set()
+
+    ch._client = FakeProfileClient()
+    ch._loop = asyncio.get_running_loop()
+    ch._connected.set()
+    started = time.time()
+    ch._report_profile()
+    check("同 loop profile 上报不阻塞", time.time() - started < 0.2,
+          f"{time.time()-started:.3f}s")
+    deadline = time.time() + 2
+    while time.time() < deadline and not called.is_set():
+        await asyncio.sleep(0.02)
+    check("profile 上报实际完成", called.is_set())
+
+
 async def handshake_test(root: Path):
     """接入边界：hello 不带/不采信设备档案（入白名单后才 profile_update 上报）；
     不在白名单的机器握手被拒后走长退避，不刷屏。"""
@@ -1246,7 +1455,8 @@ async def handshake_test(root: Path):
         "agents": {b.agent_id: {"name": "beta", "pubkey": b.pubkey_b64},
                    c.agent_id: {"name": "gamma", "pubkey": c.pubkey_b64}},
         "groups": {}}), encoding="utf-8")
-    hub = HubServer("127.0.0.1", port, wl_path, root / "hub_state_hs")
+    hub = HubServer("127.0.0.1", port, wl_path, root / "hub_state_hs",
+                    join_password="testpw")
     serve_task = asyncio.create_task(hub.serve())
     await asyncio.sleep(0.3)
 
@@ -1297,6 +1507,23 @@ async def handshake_test(root: Path):
               f"last_backoff={cd._last_backoff} connected={cd.connected}")
         check("默认拒绝退避为 10 分钟",
               AgentNetClient(b, f"ws://127.0.0.1:{port}")._reject_backoff == 600)
+
+        # 接入密码：非白名单设备凭密码自动登记入网（旧成员免密）
+        check("被拒时白名单无该指纹", hub.whitelist.agent(d.agent_id) is None)
+        cd2 = AgentNetClient(d, f"ws://127.0.0.1:{port}", heartbeat_seconds=3600,
+                             password="testpw")
+        td2 = asyncio.create_task(cd2.connect_forever())
+        try:
+            ok = await wait_conn(cd2)
+            check("凭接入密码入网", ok and cd2.connected, str(cd2.last_error))
+            check("密码正确后自动登记白名单", hub.whitelist.agent(d.agent_id) is not None)
+        finally:
+            await cd2.close()
+            td2.cancel()
+            try:
+                await td2
+            except (asyncio.CancelledError, Exception):
+                pass
     finally:
         await cb.close()
         await cd.close()

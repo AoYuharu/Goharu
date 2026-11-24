@@ -40,6 +40,7 @@ _INJECTABLES = {
     # 2026-11-22 事故：ReloadTools 重跑模块级代码把 _handle 置 None，
     # serverMessageHandler 五个动作全部报"未接线"
     "Tools.builtin.agentnet_tools": ("_handle", "set_agentnet_handle"),
+    "Tools.builtin.floor_tools": ("_handle", "set_floor_handle"),
 }
 
 

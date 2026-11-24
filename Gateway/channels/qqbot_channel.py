@@ -329,6 +329,7 @@ class QQBotChannel(Channel):
         self._last_conversation = None
         self._session_id = None
         self._last_seq = None
+        self._last_error = ""            # 最近一次 ws 断开原因（health() 展示用）
         # 已知会话持久化（主动消息的寻址依据）
         self._peers_path = self.params.get(
             "peers_path",
@@ -407,6 +408,19 @@ class QQBotChannel(Channel):
             except Exception:
                 pass
 
+    def health(self) -> dict:
+        """QQ Bot 连通状态：缺凭据 / online / connecting / error。"""
+        if not self.app_id or not self.app_secret:
+            return {"ok": False, "state": "not_configured",
+                    "detail": "缺少 QQBOT_APP_ID / QQBOT_CLIENT_SECRET"}
+        if self._session_id:
+            return {"ok": True, "state": "online", "detail": "已连接 QQ 官方 WebSocket"}
+        if self._thread and self._thread.is_alive():
+            return {"ok": False, "state": "connecting",
+                    "detail": self._last_error or "连接中…"}
+        return {"ok": False, "state": "error",
+                "detail": self._last_error or "未启动"}
+
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
@@ -435,6 +449,7 @@ class QQBotChannel(Channel):
                 break
             except Exception as e:
                 delay = _RECONNECT_DELAYS[min(attempt, len(_RECONNECT_DELAYS) - 1)]
+                self._last_error = str(e)
                 logger.warning("QQBot ws disconnected (%s), reconnect in %ss",
                                e, delay)
                 attempt += 1

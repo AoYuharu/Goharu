@@ -242,3 +242,5 @@
   （Changes/Verification），话语权对话时必须在 task context 末尾显式
   以"【话语权对话模式】…不要输出 Changes/Verification 报告格式"覆盖，
   否则会回审计体。context 在任务文本末尾，是可靠的覆盖位置。
+- **可靠性修复（2026-11-24）**：条件工具必须**在 create_tools/create_agent 快照之前** import；注册进 registry ≠ 出现在 last_tool_definitions。Channel 的 control 回调跑在 client loop，绝不能 `.result()` 等同 loop Future（profile 上报用 done_callback）。Mailbox 投递改 pending→逐条 send 成功→ack，失败保留；这是**有序至少一次**，不是 exactly-once。同身份重连先替换 `_online` 再 close 旧 ws，旧 finally 才能不误下线新连接。Presence/pending_asks/Mailbox 都要锁，但锁不跨 await。
+- **UI 与状态细节**：`feed.innerHTML=''` 会连 askDock 一起删，feed 重置必须 `clearFeed()` 保留 Dock 节点身份；FloorState 对 presence 的重复快照必须幂等，否则 epoch 被不断重置、long-hold 永不触发；ReloadTools 对 agentnet/floor 两个模块级句柄都要保存恢复。

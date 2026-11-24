@@ -92,6 +92,16 @@ export interface ToolInfo {
 }
 export interface ListToolsResult { count: number; tools: ToolInfo[] }
 
+export interface ChannelHealthRow {
+  session: string;
+  type: string;
+  channel_id: string;
+  name: string;
+  ok: boolean;
+  state: string;
+  detail: string;
+}
+
 export interface RpcMethods {
   "agent.send_message": { params: SendMessageParams; result: QueuedResult };
   "agent.clear_session": { params: SessionParams; result: QueuedResult };
@@ -111,6 +121,7 @@ export interface RpcMethods {
   "browser_llm.set_config": { params: { enabled: boolean }; result: BrowserLlmSetResult };
   "model.get_status": { params: Record<string, never>; result: ModelStatus };
   "model.set_config": { params: ModelSetConfigParams; result: ModelSetConfigResult };
+  "channels.health": { params: Record<string, never>; result: ChannelHealthRow[] };
 }
 
 export type MethodName = keyof RpcMethods;

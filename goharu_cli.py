@@ -171,6 +171,17 @@ def gateway_status() -> int:
     if r and r.get("ok"):
         print(f"[+] 网关运行中  pid={r.get('pid')}  daemon={r.get('daemon')}"
               f"  sessions={r.get('sessions')}")
+        # 各 channel 连通/配置状态（哪些配通了哪些失败）
+        rows = _rpc("channels.health", timeout=3.0)
+        if rows is not None:
+            print("通道状态：")
+            if not rows:
+                print("  （未挂载 channel）")
+            for c in rows:
+                mark = "✓" if c.get("ok") else "✗"
+                detail = c.get("detail") or c.get("state")
+                print(f"  {mark} {c.get('type')}#{c.get('channel_id')}"
+                      f"（{c.get('name')}）  {c.get('state')}  {detail}")
         return 0
     print("[+] 网关未运行")
     return 1

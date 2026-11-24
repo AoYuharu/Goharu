@@ -1719,6 +1719,12 @@ export function App({ mock = false }: { mock?: boolean }) {
         onClose={() => setScreen(null)}
         onSave={saveConfig}
         onResult={(msg) => addRef.current({ kind: "system", text: msg })}
+        onHealth={() => (gatewayRef.current
+          ? gatewayRef.current.call("channels.health", {})
+          : Promise.resolve([])) as Promise<Array<{
+          session: string; type: string; channel_id: string; name: string;
+          ok: boolean; state: string; detail: string;
+        }>>}
       />
       <ToolsScreen
         active={screen === "tools"}

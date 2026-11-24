@@ -491,10 +491,14 @@ function renderMsg(m) {
   return d;
 }
 function nearBottom() { return feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80; }
+function clearFeed() {
+  // 保留待答卡片区：节点身份、输入值、焦点和事件监听器都不能因消息刷新丢失
+  feed.replaceChildren(document.getElementById('askDock'));
+}
 function append(ms) {
   if (!ms.length) return;
   const wasFollow = follow && nearBottom();
-  if (filter === 'all' && feed.querySelector('.empty')) feed.innerHTML = '';
+  if (filter === 'all' && feed.querySelector('.empty')) clearFeed();
   for (const m of ms) {
     if (filter === 'mention' && !(m.mentions || []).length) continue;
     feed.appendChild(renderMsg(m));
@@ -507,7 +511,7 @@ pill.addEventListener('click', () => { follow = true; feed.scrollTop = feed.scro
 document.getElementById('tabs').addEventListener('click', e => {
   const t = e.target.closest('.tab'); if (!t) return;
   document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x === t));
-  filter = t.dataset.f; feed.innerHTML = ''; lastId = 0;
+  filter = t.dataset.f; clearFeed(); lastId = 0;
   feed.appendChild(el('div', 'empty', '加载中…'));
   poll();
 });

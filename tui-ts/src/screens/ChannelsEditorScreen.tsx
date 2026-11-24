@@ -18,6 +18,16 @@ interface SessionEntry {
   [key: string]: unknown;
 }
 
+interface HealthRow {
+  session: string;
+  type: string;
+  channel_id: string;
+  name: string;
+  ok: boolean;
+  state: string;
+  detail: string;
+}
+
 function readConfig(): Record<string, unknown> {
   const p = path.join(PROJECT_ROOT, "config.yaml");
   if (!existsSync(p)) return {};
@@ -48,17 +58,20 @@ export function ChannelsEditorScreen({
   onClose,
   onSave,
   onResult,
+  onHealth,
 }: {
   active: boolean;
   onClose: () => void;
   onSave: (key: string, value: unknown) => Promise<string>;
   onResult: (msg: string) => void;
+  onHealth?: () => Promise<HealthRow[]>;
 }) {
   const [sessions, setSessions] = useState<SessionEntry[]>([]);
   const [index, setIndex] = useState(0);
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState("");
   const [dirty, setDirty] = useState(false);
+  const [health, setHealth] = useState<HealthRow[]>([]);
 
   useEffect(() => {
     if (active) {
@@ -70,6 +83,19 @@ export function ChannelsEditorScreen({
       setDirty(false);
     }
   }, [active]);
+
+  // 连通状态轮询（每 5s 一次，只在面板打开时）——哪些配通了哪些失败一目了然
+  useEffect(() => {
+    if (!active || !onHealth) return;
+    let cancelled = false;
+    const tick = () => {
+      onHealth().then((rows) => { if (!cancelled) setHealth(rows ?? []); })
+        .catch(() => { /* 网关未就绪时忽略，下轮再试 */ });
+    };
+    tick();
+    const timer = setInterval(tick, 5000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [active, onHealth]);
 
   // 展平：[(sessionIdx, channelIdx, channel)]
   const flat: Array<{ si: number; ci: number; ch: ChannelEntry; sid: string }> = [];
@@ -158,6 +184,18 @@ export function ChannelsEditorScreen({
       <Text dimColor backgroundColor="#1c1e2b">
         {dirty ? "● 有未保存修改（s 保存 / Esc 保存并返回）" : "已保存"}
       </Text>
+      {health.length > 0 && (
+        <Box flexDirection="column" marginBottom={0}>
+          <Text bold color="gray" backgroundColor="#1c1e2b">连通状态：</Text>
+          {health.map((h, i) => (
+            <Text key={i} backgroundColor="#1c1e2b" wrap="truncate"
+                  color={h.ok ? "green" : "yellow"}>
+              {h.ok ? "✓" : "✗"} {h.type}#{h.channel_id}（{h.name}）  {h.state}
+              {h.detail ? `  ${h.detail}` : ""}
+            </Text>
+          ))}
+        </Box>
+      )}
       {flat.length === 0 && (
         <Text color="yellow" backgroundColor="#1c1e2b">（无通道，按 a 新增）</Text>
       )}

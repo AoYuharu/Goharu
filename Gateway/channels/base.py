@@ -115,6 +115,16 @@ class Channel:
                          is_error: bool = False, meta: dict | None = None):
         """工具执行结果。"""
 
+    # ── 健康状态（gateway status / TUI 设置面板的"是否配通"展示）─────────
+
+    def health(self) -> dict:
+        """连通/配置状态：{ok: bool, state: str, detail: str}。
+
+        默认实现 = 无长连接的 channel 一律 ready；长连接型（agentnet/qqbot）
+        覆写为在线/连接中/失败三态并附最近错误原因。
+        """
+        return {"ok": True, "state": "ready", "detail": ""}
+
     def send_event(self, event_type: str, payload: dict):
         """通用事件逃生口（token.stats / 确认请求 / 后台任务面板等）。
 

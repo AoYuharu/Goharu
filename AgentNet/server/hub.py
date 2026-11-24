@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -95,6 +96,7 @@ class Presence:
 
     def __init__(self, path: Path):
         self._path = path
+        self._lock = threading.Lock()
         self._table: dict[str, dict] = {}
         if path.exists():
             try:
@@ -108,53 +110,59 @@ class Presence:
         tmp.replace(self._path)
 
     def set_online(self, agent_id: str, name: str, profile: Optional[dict] = None) -> None:
-        prev = self._table.get(agent_id) or {}
-        self._table[agent_id] = {
-            "state": "idle", "online": True,
-            "last_seen": now_ts(), "name": name,
-            "online_since": now_ts(),
-            "attentive": False,
-            "profile": profile if profile is not None else (prev.get("profile") or {}),
-        }
-        self._persist()
+        with self._lock:
+            prev = self._table.get(agent_id) or {}
+            self._table[agent_id] = {
+                "state": "idle", "online": True,
+                "last_seen": now_ts(), "name": name,
+                "online_since": now_ts(),
+                "attentive": False,
+                "profile": profile if profile is not None else (prev.get("profile") or {}),
+            }
+            self._persist()
 
     def set_profile(self, agent_id: str, profile: dict) -> bool:
         """智能体自报档案更新（profile_update 消息驱动）。"""
-        if agent_id not in self._table:
-            return False
-        self._table[agent_id]["profile"] = dict(profile)
-        self._table[agent_id]["last_seen"] = now_ts()
-        self._persist()
-        return True
-
-    def set_offline(self, agent_id: str) -> None:
-        if agent_id in self._table:
-            self._table[agent_id]["online"] = False
+        with self._lock:
+            if agent_id not in self._table:
+                return False
+            self._table[agent_id]["profile"] = dict(profile)
             self._table[agent_id]["last_seen"] = now_ts()
             self._persist()
+            return True
+
+    def set_offline(self, agent_id: str) -> None:
+        with self._lock:
+            if agent_id in self._table:
+                self._table[agent_id]["online"] = False
+                self._table[agent_id]["last_seen"] = now_ts()
+                self._persist()
 
     def rename(self, agent_id: str, name: str) -> bool:
         """主人中控改名：状态机表同步更新并广播（白名单由调用方改）。"""
-        if agent_id not in self._table or not name:
-            return False
-        self._table[agent_id]["name"] = name
-        self._table[agent_id]["last_seen"] = now_ts()
-        self._persist()
-        return True
+        with self._lock:
+            if agent_id not in self._table or not name:
+                return False
+            self._table[agent_id]["name"] = name
+            self._table[agent_id]["last_seen"] = now_ts()
+            self._persist()
+            return True
 
     def set_state(self, agent_id: str, state: str,
                   attentive: Optional[bool] = None) -> bool:
-        if agent_id not in self._table or state not in RUNTIME_STATES:
-            return False
-        self._table[agent_id]["state"] = state
-        if attentive is not None:
-            self._table[agent_id]["attentive"] = bool(attentive)
-        self._table[agent_id]["last_seen"] = now_ts()
-        self._persist()
-        return True
+        with self._lock:
+            if agent_id not in self._table or state not in RUNTIME_STATES:
+                return False
+            self._table[agent_id]["state"] = state
+            if attentive is not None:
+                self._table[agent_id]["attentive"] = bool(attentive)
+            self._table[agent_id]["last_seen"] = now_ts()
+            self._persist()
+            return True
 
     def snapshot(self) -> dict:
-        return json.loads(json.dumps(self._table))
+        with self._lock:
+            return json.loads(json.dumps(self._table))
 
 
 class Mailbox:
@@ -167,27 +175,46 @@ class Mailbox:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_mb_rcpt ON mailbox(recipient)")
         self._conn.commit()
+        self._lock = threading.Lock()
         self._gc()
 
     def _gc(self) -> None:
-        self._conn.execute("DELETE FROM mailbox WHERE ts < ?",
-                           (time.time() - MAILBOX_TTL_SECONDS,))
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("DELETE FROM mailbox WHERE ts < ?",
+                               (time.time() - MAILBOX_TTL_SECONDS,))
+            self._conn.commit()
 
     def put(self, recipient: str, envelope: dict) -> None:
-        self._conn.execute(
-            "INSERT INTO mailbox(recipient, envelope, ts) VALUES (?,?,?)",
-            (recipient, dumps(envelope), time.time()))
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO mailbox(recipient, envelope, ts) VALUES (?,?,?)",
+                (recipient, dumps(envelope), time.time()))
+            self._conn.commit()
 
     def drain(self, recipient: str) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT id, envelope FROM mailbox WHERE recipient = ? ORDER BY id",
-            (recipient,)).fetchall()
-        if rows:
-            self._conn.execute("DELETE FROM mailbox WHERE recipient = ?", (recipient,))
+        """兼容旧接口：取出即删。新投递路径应使用 pending/ack。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, envelope FROM mailbox WHERE recipient = ? ORDER BY id",
+                (recipient,)).fetchall()
+            if rows:
+                self._conn.execute("DELETE FROM mailbox WHERE recipient = ?", (recipient,))
+                self._conn.commit()
+            return [json.loads(r[1]) for r in rows]
+
+    def pending(self, recipient: str) -> list[tuple[int, dict]]:
+        """只读未投消息，(row_id, envelope)；成功发送后才 ack。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, envelope FROM mailbox WHERE recipient = ? ORDER BY id",
+                (recipient,)).fetchall()
+            return [(r[0], json.loads(r[1])) for r in rows]
+
+    def ack(self, row_id: int) -> None:
+        """确认单行已写入 socket；不影响投递期间新插入的消息。"""
+        with self._lock:
+            self._conn.execute("DELETE FROM mailbox WHERE id = ?", (row_id,))
             self._conn.commit()
-        return [json.loads(r[1]) for r in rows]
 
 
 class MessageLog:
@@ -303,10 +330,13 @@ class FileStore:
 
 class HubServer:
     def __init__(self, host: str, port: int, whitelist_path: Path, state_dir: Path,
-                 owner_name: str = "haru"):
+                 owner_name: str = "haru", join_password: str = ""):
         self.host = host
         self.port = port
         self.whitelist = Whitelist(whitelist_path)
+        # 接入密码：未在白名单的设备凭它自动登记入网；空 = 仅白名单模式。
+        # 白名单已有成员免密（向后兼容，无需给存量设备补密码）。
+        self.join_password = join_password or ""
         state_dir.mkdir(parents=True, exist_ok=True)
         self.presence = Presence(state_dir / "presence.json")
         self.mailbox = Mailbox(state_dir / "mailbox.db")
@@ -314,6 +344,7 @@ class HubServer:
         self.files = FileStore(state_dir / "files")
         # 挂起的询问/确认（agent→server "ask" 信封存入，观察台 /api/answer 回送）
         self.pending_asks: dict[str, dict] = {}
+        self._pending_asks_lock = threading.Lock()
         # 网络话语权（仅内存）：{holder_agent_id, holder_name, persona, since, note}
         # hub 重启清零——避免指向离线端的陈腐状态；持有者掉线自动收回
         self._floor: Optional[dict] = None
@@ -487,18 +518,20 @@ class HubServer:
     def pending_asks_snapshot(self) -> list[dict]:
         """观察台轮询用：未过期挂起询问/确认列表（公共视图，不含签名等）。"""
         now = time.time()
-        for rid in [k for k, v in self.pending_asks.items() if v["expires"] < now]:
-            del self.pending_asks[rid]
-        return [
-            {"request_id": v["request_id"], "kind": v["kind"],
-             "agent_id": v["agent_id"], "agent_name": v["agent_name"],
-             "data": v["data"], "expires_in": int(v["expires"] - now)}
-            for v in self.pending_asks.values()
-        ]
+        with self._pending_asks_lock:
+            for rid in [k for k, v in self.pending_asks.items() if v["expires"] < now]:
+                del self.pending_asks[rid]
+            return [
+                {"request_id": v["request_id"], "kind": v["kind"],
+                 "agent_id": v["agent_id"], "agent_name": v["agent_name"],
+                 "data": v["data"], "expires_in": int(v["expires"] - now)}
+                for v in self.pending_asks.values()
+            ]
 
     def submit_answer(self, request_id: str, answer) -> dict:
         """观察台作答（HTTP 线程调用）：control 信封回送目标智能体并放行其工具线程。"""
-        pending = self.pending_asks.pop(request_id, None)
+        with self._pending_asks_lock:
+            pending = self.pending_asks.pop(request_id, None)
         if pending is None:
             return {"ok": False, "error": "请求不存在或已过期"}
         if pending["kind"] == "confirm":
@@ -511,14 +544,17 @@ class HubServer:
             sender=self.owner.agent_id, to=pending["agent_id"],
             type_="control", payload=payload)
         env["sig"] = self.owner.sign(canonical_bytes(env))
-        if pending["agent_id"] not in self._online:
-            self.mailbox.put(pending["agent_id"], env)
-            return {"ok": True, "queued": True}
         try:
-            asyncio.run_coroutine_threadsafe(
+            delivered = asyncio.run_coroutine_threadsafe(
                 self._send_to(pending["agent_id"], env), self.loop).result(timeout=10)
+            if not delivered:
+                self.mailbox.put(pending["agent_id"], env)
+                return {"ok": True, "queued": True}
         except Exception as e:
-            logger.warning("答案回送失败: %s", e)
+            # 回送失败时恢复挂起，观察台可重试；不得静默吞掉主人作答
+            with self._pending_asks_lock:
+                self.pending_asks.setdefault(request_id, pending)
+            logger.warning("答案回送失败（已恢复挂起）: %s", e)
             return {"ok": False, "error": str(e)}
         logger.info("答案已回送: %s → %s", request_id, pending["agent_id"])
         return {"ok": True}
@@ -530,7 +566,15 @@ class HubServer:
             agent_id, profile = await self._handshake(ws)
             if agent_id is None:
                 return
+            old_ws = self._online.get(agent_id)
             self._online[agent_id] = ws
+            if old_ws is not None and old_ws is not ws:
+                # 先登记新连接再关闭旧连接：旧 handler 的 finally 看到登记已替换，
+                # 不会把仍在线的新连接误判离线
+                try:
+                    await old_ws.close(code=1000, reason="replaced by reconnect")
+                except Exception:
+                    logger.warning("关闭重复身份旧连接失败", exc_info=True)
             self.presence.set_online(
                 agent_id, self.whitelist.agent(agent_id).get("name", ""), profile)
             await self._broadcast_presence()
@@ -581,8 +625,16 @@ class HubServer:
         except Exception:
             await ws.send(dumps(self._auth_error(env, "identity_mismatch")))
             return None, None
-        # CONFIRMED：白名单 + 签名验证
+        # CONFIRMED：白名单已有成员直接过；未收录的设备凭"接入密码"自动登记。
+        # 签名验证始终强制（防伪造身份），密码只解决"新设备入网"这一步。
         record = self.whitelist.agent(agent_id)
+        if record is None and self.join_password:
+            if str(payload.get("password") or "") == self.join_password:
+                self.whitelist.ensure_agent(
+                    agent_id, str(payload.get("name") or agent_id[:12]), pubkey)
+                record = self.whitelist.agent(agent_id)
+                logger.info("新设备凭接入密码自动登记: %s (%s)",
+                            agent_id, record.get("name") if record else "?")
         if record is None or record.get("pubkey") != pubkey:
             await ws.send(dumps(self._auth_error(env, "not_in_whitelist")))
             logger.warning("拒绝未知设备: %s", agent_id)
@@ -624,8 +676,11 @@ class HubServer:
             await self._send_to(sender, reply)
             return
         if t == "mailbox_pull":
-            for queued in self.mailbox.drain(sender):
-                await self._send_to(sender, queued)
+            # 有序至少一次投递：只有 socket 写入成功才 ack；失败保留当前及后续消息
+            for row_id, queued in self.mailbox.pending(sender):
+                if not await self._send_to(sender, queued):
+                    break
+                self.mailbox.ack(row_id)
             return
         if t == "profile_update":
             # 智能体自报档案更新（验签后生效并广播新状态机表）
@@ -654,15 +709,16 @@ class HubServer:
             if not request_id or kind not in ("question", "confirm"):
                 return
             ttl = float(p.get("ttl") or 400)
-            self.pending_asks[request_id] = {
-                "request_id": request_id,
-                "kind": kind,
-                "agent_id": sender,
-                "agent_name": record.get("name", sender),
-                "data": p.get("data") or {},
-                "ts": time.time(),
-                "expires": time.time() + min(max(ttl, 30), 1800),
-            }
+            with self._pending_asks_lock:
+                self.pending_asks[request_id] = {
+                    "request_id": request_id,
+                    "kind": kind,
+                    "agent_id": sender,
+                    "agent_name": record.get("name", sender),
+                    "data": p.get("data") or {},
+                    "ts": time.time(),
+                    "expires": time.time() + min(max(ttl, 30), 1800),
+                }
             logger.info("挂起询问登记: %s %s from=%s", kind, request_id, sender)
             return
         if t == "floor":
@@ -751,11 +807,13 @@ def main() -> None:
                     help="观察台访问 token（空=开放；开放时 /api/send 被禁用）")
     ap.add_argument("--owner-name", default="haru",
                     help="观察台输入框使用的用户身份名")
+    ap.add_argument("--join-password", default="",
+                    help="新设备接入密码（空=仅白名单模式；已有成员免密）")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     server = HubServer(args.host, args.port, Path(args.whitelist), Path(args.state_dir),
-                       owner_name=args.owner_name)
+                       owner_name=args.owner_name, join_password=args.join_password)
     if args.observer_port:
         from AgentNet.server.observer import ObserverServer
         observer = ObserverServer(

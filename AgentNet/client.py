@@ -74,11 +74,14 @@ class AgentNetClient:
         reject_backoff_seconds: int = 600,
         profile: Optional[dict] = None,
         http_base: str = "",
+        password: str = "",
     ):
         self.identity = identity
         self.url = url
         self.box = messagebox
         self.http_base = (http_base or "").rstrip("/")
+        # 接入密码：未在 hub 白名单的新设备凭它自动登记入网（已有成员免密）
+        self._password = password or ""
         # 档案：{focus: 侧重方向文本, tags: [...], device: {...}, security, ...}
         # 握手成功（welcome）后才经 profile_update 上报——hello 不带任何设备信息
         prof = dict(profile or {})
@@ -101,54 +104,77 @@ class AgentNetClient:
 
         self._ws: Any = None
         self._connected = asyncio.Event()
+        self._close_event = asyncio.Event()  # close() 可立即唤醒重连退避
         self._closed = False
         self._presence_waiter: Optional[asyncio.Future] = None
         self._write_lock = asyncio.Lock()
+        # 最近一次连接/握手失败原因（channel.health() 展示用）
+        self.last_error: str = ""
 
     # ------------------------------------------------------------- 连接
     @property
     def connected(self) -> bool:
         return self._connected.is_set()
 
+    async def _wait_backoff(self, seconds: float) -> bool:
+        """等待退避；close() 被调用则立即返回 True 退出重连循环。"""
+        if self._closed:
+            return True
+        try:
+            await asyncio.wait_for(self._close_event.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     async def connect_forever(self) -> None:
-        """重连循环（退避 1s→max；握手被拒走 reject_backoff 长退避）。close() 后退出。"""
+        """重连循环（退避 1s→max；握手被拒走长退避）。close() 后立即退出。"""
         backoff = 1
         while not self._closed:
             try:
                 await self._run_once()
-                backoff = 1
+                if self._closed:
+                    break
+                self.last_error = ""
+                # 对端正常关闭也走统一退避，避免紧循环重连
+                raise ConnectionError("连接已关闭")
             except asyncio.CancelledError:
                 raise
             except HandshakeRejected as e:
                 self._connected.clear()
+                self.last_error = f"握手被拒: {e}"
                 self._last_backoff = float(self._reject_backoff)
                 logger.warning(
                     "agentnet 握手被拒: %s（本机指纹不在 hub 白名单？%ds 后重试）",
                     e, self._reject_backoff)
-                if not self._closed:
-                    await asyncio.sleep(self._reject_backoff)
+                if await self._wait_backoff(self._reject_backoff):
+                    break
                 backoff = 1
             except Exception as e:
                 logger.warning("agentnet 连接断开: %s（%ds 后重连）", e, backoff)
                 self._connected.clear()
+                self.last_error = str(e)
                 self._last_backoff = float(backoff)
-                if not self._closed:
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, self._reconnect_max)
+                if await self._wait_backoff(backoff):
+                    break
+                backoff = min(backoff * 2, self._reconnect_max)
 
     async def _run_once(self) -> None:
         async with websockets.connect(self.url, ping_interval=20, ping_timeout=20) as ws:
             self._ws = ws
-            await self._handshake()
-            self._connected.set()
-            logger.info("agentnet 已连接: %s (%s)", self.url, self.identity.agent_id)
-            hb = asyncio.create_task(self._heartbeat_loop())
             try:
-                await self._recv_loop()
+                await self._handshake()
+                self._connected.set()
+                logger.info("agentnet 已连接: %s (%s)", self.url, self.identity.agent_id)
+                hb = asyncio.create_task(self._heartbeat_loop())
+                try:
+                    await self._recv_loop()
+                finally:
+                    hb.cancel()
             finally:
-                hb.cancel()
                 self._connected.clear()
                 self._ws = None
+                self._emit_event("disconnected",
+                                 {"type": "disconnected", "payload": {}})
 
     async def _handshake(self) -> None:
         # 两段式握手：hello 只出示身份（指纹+公钥+签名），**不带任何设备档案**——
@@ -160,6 +186,7 @@ class AgentNetClient:
                 "agent_id": self.identity.agent_id,
                 "name": self.identity.name,
                 "pubkey": self.identity.pubkey_b64,
+                **({"password": self._password} if self._password else {}),
             },
         )
         env["sig"] = self.identity.sign(canonical_bytes(env))
@@ -380,6 +407,7 @@ class AgentNetClient:
 
     async def close(self) -> None:
         self._closed = True
+        self._close_event.set()
         if self._ws is not None:
             try:
                 await self._ws.close()

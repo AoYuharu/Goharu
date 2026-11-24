@@ -83,6 +83,16 @@ def main():
     check("registry 无 serverMessageHandler", "serverMessageHandler" not in names)
     check("registry 无 FloorControl", "FloorControl" not in names)
 
+    print("\n[3.1] 启用时：条件工具在首次定义快照前注册")
+    # 与 SessionManager 的真实顺序一致：先 import 条件模块，再 create_tools。
+    from Tools.builtin import agentnet_tools, floor_tools  # noqa: F401
+    enabled_tools = asyncio.run(create_tools())
+    enabled_defs = asyncio.run(enabled_tools.list_tools())
+    enabled_names = {d["name"] for d in enabled_defs}
+    check("启用快照含 serverMessageHandler", "serverMessageHandler" in enabled_names,
+          str(sorted(enabled_names)))
+    check("启用快照含 FloorControl", "FloorControl" in enabled_names)
+
     print("\n[4] 接入开关：默认关闭，环境变量覆盖")
     check("config 默认 agentnet.enabled=false", cfg["agentnet"]["enabled"] is False)
     from Gateway.session_manager import _agentnet_enabled

@@ -128,7 +128,7 @@ class ObserverServer:
 
                 mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
                 inline = mime.startswith(("image/", "video/", "audio/"))
-                data = p.read_bytes()
+                size = p.stat().st_size
                 self.send_response(200)
                 self.send_header("Content-Type", mime)
                 if inline:
@@ -136,9 +136,12 @@ class ObserverServer:
                 else:
                     self.send_header("Content-Disposition",
                                      f"attachment; filename*=UTF-8''{file_id}")
-                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Length", str(size))
                 self.end_headers()
-                self.wfile.write(data)
+                # 与上传对称的流式下载：2GB 附件不整读进内存
+                with p.open("rb") as src:
+                    for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                        self.wfile.write(chunk)
 
             def do_POST(self):
                 url = urlparse(self.path)

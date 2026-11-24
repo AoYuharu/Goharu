@@ -191,6 +191,10 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             logger.info("gateway.shutdown requested via RPC")
             _bg_reader_running = False   # 主循环退出 → finally 走完整收尾
             return {"jsonrpc": "2.0", "result": {"shutting_down": True}, "id": req_id}
+        if method == "channels.health":
+            return {"jsonrpc": "2.0",
+                    "result": _manager.channels_health() if _manager else [],
+                    "id": req_id}
         if method == "agent.send_message":
             message = params.get("message", "")
             session_id = params.get("session_id", "default")

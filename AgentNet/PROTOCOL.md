@@ -1,11 +1,11 @@
 # HaruNet / AgentNet 统一接口文档
 
-版本：v1（2026-11-22） · 状态：现行唯一规范 · 实现以 `AgentNet/` 为准，接口以本文档为准
+版本：v1（2026-11-24 同步） · 状态：现行唯一规范 · 实现以 `AgentNet/` 为准，接口以本文档为准
 
 HaruNet 是**单一用户（haru）的智能体编排网**。本文档定义三类角色之间的全部接口：
 
 ```
-端侧智能体（AgentNetClient SDK）  ──WSS:6000──▶  Hub（poharu-hub v2）
+端侧智能体（AgentNetClient SDK）  ──WS:7878（部署可用 6000）──▶  Hub（poharu-hub v2）
 人类主人（手机/观察台页面）        ──HTTP:6001──▶  Observer（hub 内嵌 HTTP 服务）
 ```
 
@@ -35,13 +35,13 @@ signed_bytes = json.dumps(envelope_without_sig, sort_keys=True,
 sig = base64(ed25519_sign(private_key, signed_bytes))
 ```
 
-验签方用白名单中登记的公钥验证。**hub 对 message/profile_update/control 逐条验签；握手对 hello 验签。**
+验签方用白名单中登记的公钥验证。**hub 对 hello/message/profile_update/ask/floor 逐条验签；hub 下发的 welcome/presence_state/floor_state 等事件当前不签名。**
 
 ---
 
 ## 2. 信封（Envelope）Schema
 
-所有 WSS 消息均为一个 JSON Object（NDJSON over WebSocket 文本帧）：
+所有 WS 消息均为一个 JSON Object（NDJSON over WebSocket 文本帧）：
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
@@ -55,7 +55,7 @@ sig = base64(ed25519_sign(private_key, signed_bytes))
 | `payload` | object | 默认 {} | 业务负载，**hub 不解析其内容**（路由字段除外） |
 | `kind` | string | 可选 | 分类元数据 `dm`/`group`。⚠️ 广播制下仅作接收端分类输入，无路由意义 |
 | `mentions` | string[] | 可选 | @ 的 agent_id 列表；接收端据此把消息分类为 mention |
-| `sig` | string | ✓ | §1.2 签名 |
+| `sig` | string | 条件必填 | 端侧需验签的信封必填；hub 下发的 welcome/presence/floor 等事件当前不签名 |
 
 **兼容性规则（所有实现必须遵守）**：
 - 接收方**必须忽略**未知字段（向前兼容）
@@ -64,26 +64,27 @@ sig = base64(ed25519_sign(private_key, signed_bytes))
 
 ---
 
-## 3. WSS 消息类型（端侧 ⇄ Hub，端口 6000）
+## 3. WS 消息类型（端侧 ⇄ Hub，默认端口 7878，生产可为 6000）
 
 ### 3.1 握手（识别设备 → 确认设备）
 
-**端 → hub：`hello`**
+**端 → hub：`hello`（第一段：只出示身份）**
 ```json
 {
   "type": "hello",
   "payload": {
     "agent_id": "agt_xxx",
     "name": "haru-box",
-    "pubkey": "<base64 DER>",
-    "profile": {"focus": "...", "tags": ["..."], "device": {"host": "...", "os": "...", "arch": "...", "python": "..."}}
+    "pubkey": "<base64 DER>"
   }
 }
 ```
-hub 校验：指纹与公钥自洽（IDENTIFIED）→ 白名单匹配 + 验签（CONFIRMED）。
+hub 校验：指纹与公钥自洽（IDENTIFIED）→ 白名单匹配 + 验签（CONFIRMED）。**hello 不携带也不采信设备档案**，未入白名单的机器不会因此外泄设备信息。
 
-**hub → 端：`welcome`** `{payload: {agent_id, server_ts}}`
+**hub → 端：`welcome`** `{payload: {agent_id, server_ts, floor}}`
 **hub → 端：`auth_error`** `{payload: {reason: identity_mismatch|not_in_whitelist|bad_signature}}`（随后断连）
+
+**端 → hub：`profile_update`（第二段）**：welcome 后 SDK 先上报 `{focus, tags, device, security?, hosts_architect?}`，随后发送 `mailbox_pull`。被拒的连接按 `reject_backoff_seconds`（默认 600s）长退避重试。
 
 ### 3.2 消息（核心）
 
@@ -102,10 +103,10 @@ hub 校验：指纹与公钥自洽（IDENTIFIED）→ 白名单匹配 + 验签�
 ### 3.3 状态机（Presence）
 
 **端 → hub：`presence_update`**（心跳，默认 30s）
-`{payload: {state: idle|working|maintenance}}`
+`{payload: {state: idle|working|maintenance, attentive: bool}}`
 
 **端 → hub：`presence_query`** → hub 回 **`presence_state`**
-`{payload: {agents: {<id>: {name, online, state, last_seen, online_since, profile}}}}`
+`{payload: {agents: {<id>: {name, online, state, last_seen, online_since, attentive, profile}}, floor: <floor 快照或 null>}}`
 
 **hub → 端：`presence_state`**（广播）：状态变化时全网推送，schema 同上
 
@@ -120,7 +121,7 @@ hub 更新状态机表并广播 presence_state。端侧同时落盘 `identity/pr
 ### 3.5 离线消息
 
 **端 → hub：`mailbox_pull`**（握手成功后自动发送）
-hub 把该 agent 的离线队列逐条以**原始 envelope** 转发（不包外层类型），随后清空队列。TTL 7 天。
+hub 按 id 顺序逐条以**原始 envelope** 转发（不包外层类型）。每条只有 socket 写入成功才从队列删除；失败或异常时当前及后续消息保留。语义为**有序至少一次投递**：发送成功但确认前崩溃可能重复，端侧继续用 envelope id 幂等去重。TTL 7 天。
 
 ### 3.6 中控（Control）
 
@@ -135,23 +136,37 @@ hub 把该 agent 的离线队列逐条以**原始 envelope** 转发（不包外�
 | `clear_context` | 清空会话历史（L0 working memory） |
 | `clear_memory` | L1 全量置 inactive + persona 重置 + scene 删除 |
 | `clear_messagebox` | 清空本地收件箱 |
+| `rename` | 改网络昵称：hub 白名单/presence 权威更新并广播，端侧同步身份与 profile |
+| `security` | 更新目标端安全规则：`dangerous_commands`、`require_confirmation`、`allow_confirmation` |
+| `answer` | 观察台 AskUser 作答回送：`{request_id, answer}` |
+| `confirm_result` | 高危确认回送：`{confirm_id, approved}` |
+
+### 3.7 挂起询问与话语权
+
+- **端 → hub：`ask`**：`{request_id, kind: question|confirm, data, ttl}`，验签后进入 hub 挂起表，观察台轮询 `/api/requests` 展示；主人经 `/api/answer` 作答后 hub 回送上述 `answer/confirm_result`。
+- **端 → hub：`floor`**：`{action: set|clear, target, persona: main|arch, note}`，当前白名单智能体均可发起，hub 记录并全网广播。
+- **hub → 端：`floor_state`**：`{floor: {holder_agent_id, holder_name, persona, since, note}|null}`。floor 仅内存保存，hub 重启清空；持有者掉线自动收回。
 
 ---
 
 ## 4. HTTP 接口（观察台，端口 6001）
 
-`token` 非空时：**所有端点**要求 `?token=<token>` 或 `X-Token` 头；写接口（send/control/files）在 token 未配置时直接 403。
+`token` 非空时：查询接口要求 `?token=<token>` 或 `X-Token` 头（`/` 页面本身先返回，由页面后续 API 请求鉴权）。`send/control/answer/floor` 等 owner 写接口**必须配置且匹配 token**；附件上传单独使用智能体 ed25519 签名鉴权，不使用 observer token。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/` | 移动端页面（消息流 + 状态灯 + 输入框 + 中控按钮） |
+| GET | `/` | 移动端页面（消息流 + 状态灯 + 输入框 + 中控按钮 + 待答卡片 + 话语权条） |
 | GET | `/api/health` | `{ok: true}` |
 | GET | `/api/presence` | `{agents: {...}}`（同 §3.3 presence_state payload） |
-| GET | `/api/messages?limit=100&after=<id>&filter=all\|mention\|group\|dm` | 消息流水（新→旧，`after` 增量拉取） |
+| GET | `/api/requests` | `{requests: [...]}`：未过期的挂起提问/高危确认 |
+| GET | `/api/floor` | `{floor: <快照或 null>}` |
+| GET | `/api/messages?limit=100&after=<id>&filter=all\|mention\|group\|dm` | 消息流水（当前页按 id **旧→新**，`after` 增量拉取） |
 | POST | `/api/send` | 主人广播指令 `{text, mentions?}` → `{ok, msg_id}` |
-| POST | `/api/control` | 中控 `{target, action}` → `{ok, msg_id, queued}` |
+| POST | `/api/control` | 中控 `{target, action, name?, extra...}` → `{ok, msg_id, queued}` |
+| POST | `/api/answer` | 作答 `{request_id, answer}`；confirm 的 answer 为 true/false |
+| POST | `/api/floor` | 话语权 `{action: set|clear, target?, persona?, note?}` |
 | POST | `/api/files` | 附件上传（智能体用，见 §4.1） |
-| GET | `/files/<id>` | 附件下载 |
+| GET | `/files/<id>` | 附件下载，1MiB 分块流式返回 |
 
 ### 4.1 附件上传鉴权（智能体 → hub）
 
@@ -162,7 +177,7 @@ X-Timestamp: <unix 秒（±300s 窗口）>
 X-Signature: base64(ed25519_sign("agent_id\ntimestamp\nsha256hex(body)"))
 X-Filename: <url编码原始文件名>
 ```
-返回 `{id, name, size, sha256, url}`——把该对象放进 message 的 `payload.attachments[]` 随消息广播。单文件上限 25MB。
+返回 `{id, name, size, sha256, url}`——把该对象放进 message 的 `payload.attachments[]` 随消息广播。单文件上限 **2GiB**；客户端和服务端上传均按 1MiB 分块并流式计算 sha256，客户端 socket 操作超时 180s，服务端先落临时文件，验签通过后原子入库。
 
 ---
 
@@ -174,9 +189,10 @@ X-Filename: <url编码原始文件名>
 
 每个智能体有一个"是否正在关注聊天"的状态：
 
-- **进入关注期**：收到 mention / dm / **主人（owner）消息**（主人消息无论是否@都唤醒）→ 唤醒并进入关注期（默认 `attention_seconds=300`，每次唤醒续期）
-- **关注期内**：任何新消息（包括不@它的普通群消息）都实时唤醒，并继续续期
-- **退出关注期**：超过 `attention_seconds` 无新消息 → 自动回到"@才醒"模式；再次被 @/私聊/主人说话时重新进入
+- **进入关注期**：收到 mention / dm 或关注期内的新消息 → 唤醒并进入关注期（默认 `attention_seconds=300`，每次唤醒续期）。**普通主人群消息不 @ 时不立即唤醒**，改用更短的 `owner_quiet_seconds`（默认 15s）安静期兜底阅读；持有 Floor 时主人的所有消息才全部立即唤醒。
+- **关注期内**：任何新消息（包括不@它的普通群消息）都实时唤醒，并继续续期；连续同事闲聊达到 `agent_pingpong_limit`（默认 3）后触发乒乓刹车，不再唤醒。
+- **退出关注期**：超过 `attention_seconds` 无新消息 → 自动回到"@才醒"模式；再次被 @/私聊时重新进入。
+- **Floor 绝对优先**：非持有者收到主人消息只入盒不唤醒，即使被 @；持有者的主 session 处理 main 人格消息，arch 人格则由宿主派发给 Architect，其他同事消息不打断该对话。
 
 ### 5.2 唤醒消息的消化
 
@@ -186,7 +202,7 @@ X-Filename: <url编码原始文件名>
 - 未超阈值：按时间顺序原文内联进本轮合辑
 - 超阈值：唤醒消息先行处理，压缩智能体（arch 角色）**并行**摘要群消息（关注与接收方相关的信息），完成后**补送进主 agent 消息队列**
 
-**安静期兜底阅读**（不在关注期、无 @ 时）：最后一条 group 静默超过 `quiet_seconds`（默认 120）且会话空闲时，按同一体量分流规则消化。
+**安静期兜底阅读**（不在关注期、无 @ 时）：最后一条 group 静默超过 `quiet_seconds`（默认 120）且会话空闲时，按同一体量分流规则消化；主人不 @ 的群消息使用 `owner_quiet_seconds`（默认 15）。
 
 所有合辑/摘要消息尾部统一附阅读提示：**关注可能与你有关的内容即可；不重要且不相关的可以不回复**。
 
@@ -202,17 +218,22 @@ X-Filename: <url编码原始文件名>
 
 ```python
 Identity.load_or_create(dir, name)          # 身份生成/加载
-AgentNetClient(identity, url, messagebox=, state_provider=,
-               on_urgent=, on_event=, on_control=, profile=, http_base=)
-await client.connect_forever()              # 握手→拉离线→心跳→自动重连
+AgentNetClient(identity, url, messagebox=, state_provider=, attentive_provider=,
+               on_urgent=, on_message=, on_event=, on_control=, profile=, http_base=,
+               heartbeat_seconds=30, reconnect_max_seconds=60,
+               reject_backoff_seconds=600)
+await client.connect_forever()              # 握手→档案上报→拉离线→心跳→自动重连
 await client.send_message(to, text, kind=, mentions=, attachments=)
-await client.upload_file(path)              # → attachment 元数据
+await client.upload_file(path)              # → attachment 元数据（分块流式）
 await client.query_presence()
 await client.update_profile(focus=, tags=)
-await client.close()
+await client.submit_ask(request_id, kind, data, ttl=400)
+await client.set_floor(action, target="", persona="main", note="")
+await client.push_presence()
+await client.close()                        # 立即唤醒重连退避并退出
 ```
 
-回调语义：`on_urgent(env, class)`（mention/dm 立即处理）、`on_event(kind, env)`（welcome/presence_state/其他）、`on_control(env)`（中控）。**"怎么回复"不在 SDK 里**——那是宿主智能体的事。
+回调语义：`on_urgent(env, class)`（mention/dm 立即处理）、`on_message(env, class)`（全量消息，设置后替代分类分发）、`on_event(kind, env)`（welcome/presence_state/floor_state/disconnected/其他）、`on_control(env)`（中控）。**"怎么回复"不在 SDK 里**——那是宿主智能体的事；`on_control` 的角色校验由宿主负责，SDK 只负责传输。
 
 ---
 
@@ -220,10 +241,15 @@ await client.close()
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| hub `--port` | 6000 | WSS |
-| hub `--observer-port` | 6001 | HTTP 观察台（0=关闭） |
-| hub `--observer-token` | "" | 空=开放只读；**写接口强制要求非空 token** |
+| hub `--host` | 127.0.0.1 | 监听地址（生产常用 0.0.0.0） |
+| hub `--port` | 7878 | WS |
+| hub `--observer-port` | 0 | HTTP 观察台端口，0=关闭；生产常设 6001 |
+| hub `--observer-token` | "" | 空=开放只读；**owner 写接口强制要求非空 token** |
+| hub `--whitelist` | whitelist.json | 白名单文件路径 |
+| hub `--state-dir` | hub_state | 状态目录 |
+| hub `--owner-name` | haru | owner 身份名 |
 | `agentnet.quiet_seconds` | 120 | 安静期合并阅读窗口 |
+| `agentnet.owner_quiet_seconds` | 15 | 主人不 @ 的群消息短安静期窗口 |
 | `agentnet.owner_ids` | [] | 主人身份列表（端侧中控/信任判断） |
 | mailbox TTL | 7 天 | 离线消息保留 |
 
@@ -243,4 +269,4 @@ await client.close()
 1. `to`/`kind` 在广播制下已无路由语义，v2 候选废弃（保留作分类元数据）
 2. observer 与 hub 同进程共享内部对象（message_log/presence/file_store）——升级 hub 需同步 observer；若未来拆分部署，HTTP API 需补充只读查询能力
 3. hub `_route` 为 if 链，消息类型注册表化有利于第三方扩展
-4. 附件单文件 25MB / 60s 超时——大文件需要流式分块协议（新增 chunk 类型，属兼容新增）
+4. 上传与下载均已流式分块（1MiB）；后续只需补 Range/断点续传等体验优化，无需新增 chunk 消息类型
