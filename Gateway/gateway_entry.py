@@ -37,6 +37,12 @@ _real_stdout = sys.stdout
 _stdout_lock = threading.Lock()
 
 from Tools.api import reconnect_mcp_server
+from Agent.providers.errors import (
+    LLMProviderError,
+    classify_failure,
+    explain_exception,
+    failure_message,
+)
 from configurationLoader import config
 from Gateway.channels.base import ChannelMessage
 from Gateway.session_manager import SessionManager
@@ -62,6 +68,22 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _dumps_safe(obj: Dict[str, Any]) -> str:
+    """RPC 回包序列化：结果含不可序列化对象（函数/句柄）时不能让守护崩——
+    改发 JSON-RPC internal error 并记录（2026-11-24 事故：channels.health 的
+    params 带 transport 函数，json.dumps 炸穿主循环，gateway status 杀死守护）。"""
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except (TypeError, ValueError) as e:
+        logger.error("RPC result not JSON-serializable: %s (method result keys=%s)",
+                     e, list(obj.keys()) if isinstance(obj, dict) else type(obj).__name__)
+        return json.dumps({
+            "jsonrpc": "2.0",
+            "error": {"code": -32603, "message": f"internal error: result not serializable ({e})"},
+            "id": obj.get("id") if isinstance(obj, dict) else None,
+        }, ensure_ascii=False)
+
+
 def write_json(obj: Dict[str, Any]) -> bool:
     """
     Write a JSON-RPC message to stdout.
@@ -70,7 +92,7 @@ def write_json(obj: Dict[str, Any]) -> bool:
         bool: True on success, False if pipe is broken
     """
     try:
-        line = json.dumps(obj, ensure_ascii=False) + "\n"
+        line = _dumps_safe(obj) + "\n"
         with _stdout_lock:
             _real_stdout.write(line)
             _real_stdout.flush()
@@ -131,16 +153,23 @@ def _classify_switch_failure(err: str):
     """把模型切换失败的原始异常串归类成一句用户可读的短消息。
 
     返回 (error_kind, message)。auto 探测的原始错误里混着 OpenAI 协议探测
-    的预期失败（如对 anthropic 路由的 404），不能原样抛给用户。
+    的预期失败（如对 anthropic 路由的 404），不能原样抛给用户；归类规则与
+    安装向导 / 对话轮共用 Agent.providers.errors。
     """
-    low = (err or "").lower()
-    if "authenticationerror" in low or "401" in low or "login fail" in low:
-        return "auth", "API Key 认证失败（401）：key 缺失或无效，请重新输入正确的 key 后重试"
-    if "apitimeouterror" in low or "timeout" in low or "connection error" in low:
-        return "network", "无法连接目标端点（超时或网络错误），请检查 API URL 与网络后重试"
-    if "notfounderror" in low or "404" in low:
-        return "route", "端点路由不存在（404）：请检查 API URL 是否正确"
-    return "unknown", f"切换失败：{(err or '')[:160]}"
+    kind, status = classify_failure(None, err)
+    if kind == "unknown":
+        return "unknown", f"切换失败：{(err or '')[:160]}"
+    return kind, failure_message(kind, status)
+
+
+def _friendly_init_error(exc: BaseException) -> tuple[str, str]:
+    """启动失败 → (给用户看的一句话, 原始细节)。仅翻译模型服务不可用这一类，
+    其余异常（MCP / 记忆库 / 配置文件等）原样透出，不乱猜原因。"""
+    if isinstance(exc, LLMProviderError):
+        kind, reason = explain_exception(exc)
+        if kind != "unknown":
+            return f"模型服务不可用：{reason}", str(exc)
+    return str(exc), ""
 
 
 # Global session manager（多 session 装配根；TUI 请求经它路由到目标 session）
@@ -712,7 +741,7 @@ class TuiRpcServer:
 
     def _send_line(self, sock, obj):
         try:
-            sock.sendall((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+            sock.sendall((_dumps_safe(obj) + "\n").encode("utf-8"))
             return True
         except OSError:
             return False
@@ -1096,6 +1125,7 @@ def main():
         if root_state["init_error"] is not None:
             init_err = root_state["init_error"]
             error_msg = str(init_err)
+            shown, detail = _friendly_init_error(init_err)
             _blocking, _cause = classify_startup_error(error_msg)
             report_fatal_early(
                 f"Gateway initialization failed: {error_msg}",
@@ -1110,7 +1140,7 @@ def main():
                 "method": "event",
                 "params": {
                     "type": "gateway.init_error",
-                    "payload": {"message": error_msg}
+                    "payload": {"message": shown, "detail": detail}
                 }
             })
             sys.exit(1)

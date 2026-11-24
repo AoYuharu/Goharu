@@ -55,6 +55,22 @@ def _harunet_enabled() -> bool:
     return bool(_hcfg("enabled", False))
 
 
+def _jsonable(value, _depth: int = 0):
+    """把任意值收敛为可 JSON 序列化的形态：函数/对象 → 其 repr 字符串，
+    递归处理 dict/list，过深则截断。给 RPC 回包用——绝不能让回包炸掉守护。"""
+    if _depth > 6:
+        return "…"
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v, _depth + 1) for k, v in list(value.items())[:64]}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v, _depth + 1) for v in list(value)[:128]]
+    if callable(value):
+        return f"<callable {getattr(value, '__name__', type(value).__name__)}>"
+    return repr(value)[:200]
+
+
 def _write_env_var(key: str, value: str) -> None:
     """行级写入仓库根 .env（保留其他行），供 harunet_set_password 持久化。"""
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
@@ -527,6 +543,9 @@ class SessionManager:
         """全部 session 挂载 channel 的连通/配置状态（gateway status / TUI 设置用）。
 
         含 params（TUI 详情页展示/编辑用；敏感字段由前端按键名脱敏显示）。
+        params 经 _jsonable 过滤：channel params 里可能有回调/传输函数
+        （如 tui 的 transport），原样返回会让 RPC 回包 json.dumps 炸掉——
+        这个异常会穿透到守护主循环导致整个网关退出（2026-11-24 事故）。
         """
         rows = []
         for sid, session in self.sessions.items():
@@ -540,8 +559,8 @@ class SessionManager:
                     "type": ch.channel_type,
                     "channel_id": ch.channel_id,
                     "name": getattr(ch, "name", ch.channel_id),
-                    "params": dict(getattr(ch, "params", {}) or {}),
-                    **h,
+                    "params": _jsonable(dict(getattr(ch, "params", {}) or {})),
+                    **_jsonable(h),
                 })
         return rows
 

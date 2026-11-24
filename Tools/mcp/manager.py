@@ -81,7 +81,9 @@ def _serialize_result(result):
         elif getattr(block, "type", None) == "image":
             from Tools.config_proxy import get_config
             vision = bool(get_config().get("model.large-language-model.vision", False))
-            mime = getattr(block, "mimeType", None) or "image"
+            # mcp 1.x: mimeType；2.x: mime_type
+            mime = (getattr(block, "mime_type", None)
+                    or getattr(block, "mimeType", None) or "image")
             data = getattr(block, "data", "") or ""
             if vision and data:
                 # 视觉链路：图像块暂存，ActorAgent 组装 tool_result 时取出并附加，
@@ -107,7 +109,7 @@ def _serialize_result(result):
             except Exception:
                 parts.append(str(block))
     text = "\n".join(p for p in parts if p).strip()
-    if getattr(result, "isError", False):
+    if getattr(result, "is_error", None) or getattr(result, "isError", False):
         return json.dumps({"error": text or "MCP tool returned an error"}, ensure_ascii=False)
     return text or json.dumps({"result": "ok"}, ensure_ascii=False)
 
@@ -226,10 +228,13 @@ class MCPClientManager:
                                      for k, v in spec["headers"].items()},
                             follow_redirects=True)
                     )
-                read, write, _ = await stack.enter_async_context(
+                # mcp 1.x 的 streamable_http_client 返回 (read, write, get_session_id)
+                # 三元组，2.x 去掉 get_session_id 只返回二元组——按下标取前两个，两版兼容
+                streams = await stack.enter_async_context(
                     streamable_http_client(_expand_env(spec["url"]),
                                            http_client=http_client)
                 )
+                read, write = streams[0], streams[1]
             else:
                 raise ValueError(f"Unsupported MCP transport: {transport} (supported: stdio, http)")
 
@@ -244,10 +249,13 @@ class MCPClientManager:
         conn.tool_names = []
         for tool in tools.tools:
             full_name = f"mcp__{_safe(conn.name)}__{_safe(tool.name)}"
+            # mcp 1.x 用 inputSchema，2.x 改成 input_schema（pydantic v2 风格）
+            schema = (getattr(tool, "input_schema", None)
+                      or getattr(tool, "inputSchema", None) or {})
             registry.register(
                 name=full_name,
                 description=f"[MCP:{conn.name}] {tool.description or ''}".strip(),
-                arguments_schema=dict(tool.inputSchema or {}),
+                arguments_schema=dict(schema),
                 handler=self._make_handler(conn.name, tool.name),
                 group="mcp",
                 is_async=True,

@@ -62,6 +62,15 @@ const LABELS: Record<string, string> = {
 };
 const SECRET_RE = /secret|password|token|api_key|app_secret/i;
 
+/** 通道类型 → 用户能看懂的名字与一句话说明（列表/详情都用） */
+const TYPE_INFO: Record<string, { label: string; desc: string }> = {
+  tui: { label: "终端界面", desc: "当前这个 TUI 本身，无需配置" },
+  harunet: { label: "HaruNet 组网", desc: "接入智能体组网：hub 地址 / 昵称 / 接入密码" },
+  qqbot: { label: "QQ 频道机器人", desc: "QQ 官方机器人；需 .env 的 QQBOT_APP_ID / CLIENT_SECRET" },
+  architect_telemetry: { label: "架构师遥测", desc: "内部通道：把运行事件喂给 arch，自动工作，无需配置" },
+};
+function typeLabel(type: string) { return TYPE_INFO[type]?.label ?? type; }
+
 function readConfig(): Record<string, unknown> {
   const p = path.join(PROJECT_ROOT, "config.yaml");
   if (!existsSync(p)) return {};
@@ -309,7 +318,8 @@ export function ChannelsEditorScreen({
   return (
     <Box flexDirection="column" borderStyle="round" borderColor="cyan" backgroundColor="#1c1e2b" paddingX={1}>
       <Text bold color="cyan" backgroundColor="#1c1e2b">
-        📡 通道{view === "detail" && current ? ` › ${current.type}#${current.channel_id}` : ""}
+        📡 通道{view === "detail" && current
+          ? ` › ${typeLabel(current.type)}（${current.type}#${current.channel_id}）` : ""}
       </Text>
       {view === "list" && (
         <>
@@ -322,14 +332,22 @@ export function ChannelsEditorScreen({
           {rows.map((row, i) => {
             const selected = i === index;
             const h = row.health;
-            const name = h?.name && h.name !== row.channel_id ? `  ${h.name}` : "";
+            const info = TYPE_INFO[row.type];
             const st = h ? `${stateText(h)}${h.detail ? ` · ${h.detail}` : ""}` : "未运行";
-            const line = `${selected ? "› " : "  "}● ${row.type}#${row.channel_id}${name}  ${st}`;
+            const line = `${selected ? "› " : "  "}● ${typeLabel(row.type).padEnd(8)} ${st}`;
             return (
-              <Text key={row.key} backgroundColor={selected ? "cyan" : "#1c1e2b"}
-                    color={selected ? "black" : stateColor(h)} wrap="truncate">
-                {line}
-              </Text>
+              <Box key={row.key} flexDirection="column" backgroundColor={selected ? "cyan" : "#1c1e2b"}>
+                <Text backgroundColor={selected ? "cyan" : "#1c1e2b"}
+                      color={selected ? "black" : stateColor(h)} wrap="truncate">
+                  {line}
+                </Text>
+                {(selected || !info) && (
+                  <Text backgroundColor={selected ? "cyan" : "#1c1e2b"}
+                        color={selected ? "black" : "gray"} dimColor={!selected} wrap="truncate">
+                    {`    ${row.type}#${row.channel_id}${info ? ` — ${info.desc}` : ""}`}
+                  </Text>
+                )}
+              </Box>
             );
           })}
           <Text dimColor backgroundColor="#1c1e2b">
@@ -344,7 +362,9 @@ export function ChannelsEditorScreen({
           </Text>
           <Text dimColor backgroundColor="#1c1e2b">─ 配置 ─</Text>
           {items.length === 0 && (
-            <Text dimColor backgroundColor="#1c1e2b">  （该通道无可编辑字段）</Text>
+            <Text dimColor backgroundColor="#1c1e2b">
+              {`  ${TYPE_INFO[current.type]?.desc ?? "内部通道"}（无需配置）`}
+            </Text>
           )}
           {items.map((it, i) => {
             const selected = i === sel;

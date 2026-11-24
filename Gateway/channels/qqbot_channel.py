@@ -386,8 +386,10 @@ class QQBotChannel(Channel):
 
     def start(self):
         if not self.app_id or not self.app_secret:
-            logger.error("QQBot channel %s: 缺少 app_id/app_secret，未启动",
-                         self.channel_id)
+            # 新装机器 .env 里 QQBOT_* 为空属正常"未配置"，不是故障：记一条
+            # 可读提示即可（曾用 error 级别，启动日志满屏报错误导排查）
+            logger.warning("QQ Bot 未配置（.env 的 QQBOT_APP_ID / QQBOT_CLIENT_SECRET 为空），"
+                           "通道 %s 跳过；要启用请在安装向导「通道」栏填写", self.channel_id)
             return
         if self._thread and self._thread.is_alive():
             return
