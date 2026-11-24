@@ -114,8 +114,12 @@ def gateway_start(wait: int = 60) -> bool:
     log = open(LOGFILE, "a", encoding="utf-8")
     kwargs: dict = {}
     if IS_WIN:
-        # Windows：分离进程，关掉本终端也不影响守护
-        kwargs["creationflags"] = (subprocess.DETACHED_PROCESS
+        # Windows：独立进程组 + 隐藏控制台，关掉本终端也不影响守护。
+        # 不能用 DETACHED_PROCESS：venv 的 python.exe 只是跳板，它再拉起真正的
+        # 解释器时用默认标志——跳板没有控制台，系统就会给真身新开一个可见的
+        # 空白终端窗口（关掉它 = 杀死守护）。CREATE_NO_WINDOW 给跳板一个隐藏
+        # 控制台，真身继承它，既无窗口也不随用户终端关闭而死。
+        kwargs["creationflags"] = (subprocess.CREATE_NO_WINDOW
                                    | subprocess.CREATE_NEW_PROCESS_GROUP)
     else:
         kwargs["start_new_session"] = True   # 脱离当前会话，关终端不挂
