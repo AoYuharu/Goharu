@@ -51,11 +51,13 @@ goharu gateway status       # 探活（pid / 是否守护 / sessions）
 goharu gateway log [N]      # 看守护日志末尾 N 行
 ```
 
-关 TUI **不会**关网关（常驻守护）；要停用 `goharu gateway stop`。安装向导里可选配置 QQ Bot / HaruNet 组网 / 出站代理（都可跳过）。
+关 TUI **不会**关网关（常驻守护）；要停用 `goharu gateway stop`。
+
+安装向导是一张**多栏配置表单**：`←→` 切换栏（模型 / 检索 / 运行 / 通道 / 高级 / 执行），`↑↓` 选栏内条目，`Enter` 切换开关与选项、或展开输入框（密码输错可再进来重输）；到「执行」栏选「开始安装」。通道栏可配 QQ Bot 与 HaruNet 组网（接入密码），代理在「高级」栏；全部可跳过。
 
 已克隆仓库则运行 `./install.sh`（Windows 用 `install.bat`），等价进入引导。
 
-卸载：`./uninstall.sh [--all|--purge]`（Windows 用 `uninstall.bat`）。
+卸载：`./uninstall.sh`（默认清干净端机：进程/服务/全局命令/依赖/数据/密钥；`--keep-data` 保留记忆数据）。
 
 ## 配置
 
