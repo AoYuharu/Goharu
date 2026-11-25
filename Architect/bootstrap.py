@@ -1,16 +1,12 @@
-"""Bootstrap —— 裸机首次部署的初始化编排。
+"""Bootstrap：裸机首次部署的初始化编排。
 
-流程（全程 daemon 线程，不阻塞 gateway 启动）：
-  1. HaruNet 最小注册（可注入 register_fn；未接线/失败降级为标记待重试）
-  2. 哑探测层跑 12 类系统探测（probe.py，秒级，零 LLM）
-  3. gaps 非空 → 唤醒 Arch 补漏扫描（Arch 把结果写回 identity.yaml）
-  4. identity.yaml 落盘 = 完成标记（存在即跳过，删除可强制重跑）
-
-HaruNet 注册拆两步的原因：网络不可达时 bootstrap 不能被卡死——
-先本地探测出 identity，注册挂起待 HaruNet 恢复后补。
+identity 缺失时同步完成 L1→L5 哑探测、HaruNet 最小注册和 identity 落盘，
+随后按 gaps 与 initial_exploration 决定是否只唤醒一次 Arch 探索。
+gateway 通过 daemon 线程调用，启动主链路不被阻塞。
 """
 
 import logging
+import platform
 import threading
 import time
 from pathlib import Path
@@ -22,13 +18,63 @@ logger = logging.getLogger(__name__)
 DEFAULT_IDENTITY_PATH = "runtime_memory/identity.yaml"
 
 
+def _initial_exploration(cfg):
+    value = cfg.get("initial_exploration", "")
+    return " ".join(str(value).split()) if value is not None else ""
+
+
+def _layered_gaps(identity, gaps):
+    """按 probe_report 分层；注入的旧式 fake probe 归入 unclassified。"""
+    path_layers = {}
+    for layer, report in identity.get("probe_report", {}).items():
+        for path in report.get("fields", {}):
+            path_layers[path] = layer
+    layered = {}
+    for path in gaps:
+        layered.setdefault(path_layers.get(path, "unclassified"), []).append(path)
+    return layered
+
+
+def _verified_facts(identity):
+    facts = {}
+    for layer, report in identity.get("probe_report", {}).items():
+        for path, field in report.get("fields", {}).items():
+            if field.get("status") != "verified":
+                continue
+            category, key = path.split(".", 1)
+            facts.setdefault(layer, {})[path] = identity.get(category, {}).get(key)
+    return facts
+
+
+def _platform_readonly_commands():
+    system = platform.system()
+    if system == "Windows":
+        return [
+            "powershell -NoProfile -Command \"Get-CimInstance <只读查询>\"",
+            "powershell -NoProfile -Command \"Get-PnpDevice -Class <设备类>\"",
+            "ipconfig /all",
+        ]
+    if system == "Darwin":
+        return [
+            "system_profiler <SPUSBDataType/SPCameraDataType/...>",
+            "sysctl -n <只读键>",
+            "ioreg -l（只读，按需过滤输出）",
+        ]
+    return [
+        "cat /proc/<只读文件>；cat /sys/<只读文件>",
+        "ip -brief addr；ip route show default",
+        "lsusb",
+        "systemctl status <服务>（仅查询，禁止 start/stop/restart）",
+    ]
+
+
 def bootstrap_if_needed(hub=None, config: dict | None = None,
                         register_fn=None, force: bool = False,
                         run_probe_fn=None) -> dict | None:
     """identity 缺失时执行首次部署编排。返回结果 dict；跳过返回 None。
 
     Args:
-        hub: ArchitectHub（gaps 补漏派发；None 时跳过 Arch 步骤）
+        hub: ArchitectHub（探索派发；None 时跳过 Arch 步骤）
         config: dict（读 architect_hub.bootstrap.*）
         register_fn: HaruNet 最小注册 Callable[[identity], dict]（未接线跳过）
         force: True 时无视已有 identity 强制重跑
@@ -37,6 +83,7 @@ def bootstrap_if_needed(hub=None, config: dict | None = None,
     cfg = (config or {}).get("architect_hub", {}).get("bootstrap", {}) \
         if isinstance(config, dict) else {}
     identity_path = Path(cfg.get("identity_path", DEFAULT_IDENTITY_PATH))
+    initial_exploration = _initial_exploration(cfg)
 
     if identity_path.exists() and not force:
         logger.info("bootstrap: identity 已存在（%s），跳过", identity_path)
@@ -49,14 +96,18 @@ def bootstrap_if_needed(hub=None, config: dict | None = None,
     started = time.time()
     result = {"identity_path": str(identity_path), "steps": {}}
 
-    # ── 2. 哑探测层（先本地探，网络无关）──
+    # 先完成全部本地规则探测，再决定是否唤醒 Arch。
     identity, gaps = run_probe_fn()
     identity["probed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     identity["gaps_pending"] = list(gaps)
-    result["steps"]["probe"] = {"gaps": len(gaps)}
-    logger.info("bootstrap: probe done, %d gaps", len(gaps))
+    result["steps"]["probe"] = {
+        "gaps": len(gaps),
+        "initial_exploration": bool(initial_exploration),
+    }
+    logger.info("bootstrap: probe done, %d gaps, initial_exploration=%s",
+                len(gaps), bool(initial_exploration))
 
-    # ── 1. HaruNet 最小注册（探测后；失败不阻塞）──
+    # HaruNet 最小注册保持原语义：未接线或失败只标记待重试，不阻塞本地流程。
     if register_fn is not None:
         try:
             reg = register_fn(identity) or {}
@@ -71,7 +122,7 @@ def bootstrap_if_needed(hub=None, config: dict | None = None,
         identity["harunet"] = {"registered": False, "pending_retry": True}
         result["steps"]["harunet"] = "not_wired"
 
-    # ── 4. identity 落盘（先落盘，Arch 补漏直接改这个文件）──
+    # 先落盘，Arch 只能补写这个 identity 文件。
     identity_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = identity_path.with_suffix(".tmp")
     tmp.write_text(yaml.safe_dump(identity, allow_unicode=True,
@@ -79,25 +130,41 @@ def bootstrap_if_needed(hub=None, config: dict | None = None,
     tmp.replace(identity_path)
     logger.info("bootstrap: identity written → %s", identity_path)
 
-    # ── 3. gaps → Arch 补漏 ──
-    if gaps and hub is not None:
-        from Architect.wake import WakeRequest
+    should_explore = bool(gaps or initial_exploration)
+    if should_explore and hub is not None:
+        from Architect.wake import KIND_EXPLORE, WakeRequest
+
+        layered_gaps = _layered_gaps(identity, gaps)
         hub.request_wake(WakeRequest(
-            reason="bootstrap", kind="guardian", priority=1,
+            reason="bootstrap", kind=KIND_EXPLORE, priority=3,
             context={
-                "trigger": "bootstrap_gaps",
+                "trigger": "bootstrap_exploration",
                 "identity_path": str(identity_path),
+                "os": identity.get("os", {}),
                 "gaps": ", ".join(gaps),
+                "layered_gaps": layered_gaps,
+                "verified_facts": _verified_facts(identity),
+                "initial_exploration": initial_exploration,
+                "platform_readonly_commands": _platform_readonly_commands(),
                 "instruction": (
-                    f"首次部署探测有 {len(gaps)} 个字段没探到（gaps 列表见上）。"
-                    f"请用 run_cmd 在本机补探这些字段，把结果写回 "
-                    f"{identity_path} 对应位置，并把 gaps_pending 清空。"
-                    f"探不到的字段标注 \"unavailable\" 并说明原因。"),
+                    "执行首次部署只读探索。先阅读 verified_facts 和 identity，"
+                    "不要重复已验证探测。initial_exploration 仅表示探索优先级，"
+                    "不是必须完成的操作指令。禁止安装软件、修改源码或配置、驱动或"
+                    "控制真实设备；唯一允许写入的是上述 identity_path。补齐字段时，"
+                    "同步把 probe_report 对应字段更新为 verified 并写精简证据；确认"
+                    "不可用标 unavailable，确认不适用标 not_applicable，仍无法确认"
+                    "则保留 unknown。每解决一个 unknown 就从 gaps_pending 删除对应"
+                    "路径，全部解决后清空。不得在 identity 中保存敏感原始命令输出。"
+                ),
             },
         ))
-        result["steps"]["arch_gapfill"] = f"dispatched ({len(gaps)} gaps)"
+        suffix = ", initial_exploration" if initial_exploration else ""
+        result["steps"]["arch_gapfill"] = (
+            f"dispatched ({len(gaps)} gaps{suffix})")
+    elif should_explore:
+        result["steps"]["arch_gapfill"] = "no_hub"
     else:
-        result["steps"]["arch_gapfill"] = "no_gaps" if not gaps else "no_hub"
+        result["steps"]["arch_gapfill"] = "no_gaps"
 
     result["elapsed_seconds"] = round(time.time() - started, 1)
     logger.info("bootstrap done in %.1fs: %s", result["elapsed_seconds"],

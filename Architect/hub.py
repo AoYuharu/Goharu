@@ -582,17 +582,50 @@ class ArchitectHub:
 def default_dispatch(kind: str, task_text: str):
     try:
         from Agent.SubAgent import SubAgent
+        from Tools.builtin.agent_delegate import notify_output
         from Tools.registry import registry
         from Tools.subagent_config import get_subagent_llm
     except ImportError as exc:
         logger.warning("architect dispatch 不可用（独立部署？）: %s", exc)
         return None
+
+    def _notify(payload):
+        try:
+            notify_output(payload)
+        except Exception:
+            logger.warning("architect 子代理事件发送失败", exc_info=True)
+
     agent_id = f"architect_hub_{uuid.uuid4().hex[:8]}"
-    subagent = SubAgent(
-        agent_type="architect", task=task_text, agent_id=agent_id,
-        tools_registry=registry, llm=get_subagent_llm(),
-    )
-    return subagent.execute()
+    _notify({
+        "agent_id": agent_id,
+        "agent_type": "architect",
+        "task": task_text,
+        "kind": "started",
+        "level": "info",
+        "message": f"启动 architect agent [{agent_id}]",
+    })
+    result = None
+    try:
+        subagent = SubAgent(
+            agent_type="architect", task=task_text, agent_id=agent_id,
+            tools_registry=registry, llm=get_subagent_llm(),
+            output_callback=notify_output,
+        )
+        result = subagent.execute()
+        return result
+    finally:
+        status = result.get("status") if isinstance(result, dict) else "error"
+        if status not in ("success", "partial", "error"):
+            status = "error"
+        _notify({
+            "agent_id": agent_id,
+            "agent_type": "architect",
+            "task": task_text,
+            "kind": "finished",
+            "level": "error" if status == "error" else "info",
+            "message": f"architect agent [{agent_id}] 完成",
+            "status": status,
+        })
 
 
 # ----------------------------------------------------------------------

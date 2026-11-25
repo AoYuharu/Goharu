@@ -41,6 +41,14 @@ async function main() {
     check(all().includes("历史上的回答"), "history replay: assistant message rendered");
   }
 
+  if (!REAL) {
+    stdin.write("/arch");
+    await sleep(100);
+    stdin.write("\r");
+    await sleep(300);
+    check(all().includes("暂无 Architect 上下文"), "/arch without runs shows empty-context hint");
+  }
+
   // 2. Type a message and submit
   stdin.write(REAL ? "用一句话回答：1+1等于几" : "hello mock");
   await sleep(200);
@@ -62,10 +70,24 @@ async function main() {
     check(all().includes("💭 Thinking"), "thinking_content rendered");
     check(all().includes("这是 mock 回答"), "answer rendered");
     check(all().includes("⚙ run_cmd"), "tool.call rendered as tool message");
-    check(all().includes("→ hello"), "tool.result preview rendered");
+    // Tool results are collapsed by default; expansion is covered by mouse/detail tests.
     check(all().includes("Markdown 测试"), "markdown content rendered");
     check(all().includes("Current Tokens:"), "token stats rendered");
     check(/Ready/.test(frames[frames.length - 1] ?? ""), "final status is Ready");
+
+    stdin.write("/arch");
+    await sleep(100);
+    stdin.write("\r");
+    await sleep(400);
+    check((lastFrame() ?? "").includes("Architect [architect_hub_test01]"), "/arch opens dynamic Architect context");
+    check((lastFrame() ?? "").includes("Arch 上下文验收完成"), "Architect final result rendered in context view");
+    check((lastFrame() ?? "").includes("verified_facts"), "Architect task context rendered");
+    stdin.write("/goharu");
+    await sleep(100);
+    stdin.write("\r");
+    await sleep(300);
+    check((lastFrame() ?? "").includes("正在查看 Goharu 主对话"), "/goharu restores main view");
+    check((lastFrame() ?? "").includes("这是 mock 回答"), "main messages preserved across view switches");
 
     // 4. Esc → interrupt (mock replies interrupted:true + agent.interrupted event)
     stdin.write("");
@@ -131,7 +153,7 @@ async function main() {
     check((lastFrame() ?? "").includes("足够长的测试消息"), "cached prompt listed");
     stdin.write("\r"); // Enter → select
     await sleep(300);
-    check((lastFrame() ?? "").includes("> 这是一条足够长的测试消息用于缓存"), "Enter loads prompt into input");
+    check((lastFrame() ?? "").includes("❯ 这是一条足够长的测试消息用于缓存"), "Enter loads prompt into input");
   } else {
     check(answered, "real gateway produced an assistant answer");
     check(all().includes("Current Tokens:"), "token stats rendered");

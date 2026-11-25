@@ -82,7 +82,13 @@ def test_wake():
     check("冷却跳过", r2["status"] == "cooldown_skip")
     r3 = hub2.request_wake(WakeRequest(reason="fatal", kind="guardian"), background=False)
     check("不同 reason 不受他人冷却影响", r3["status"] == "dispatched")
-    check("digest 进入任务文本", True)  # _build_task_text 含遥测，由上行 dispatched 间接覆盖
+    task = hub2._build_task_text(WakeRequest(
+        reason="bootstrap", kind="explore",
+        context={"initial_exploration": "先检查摄像头",
+                 "layered_gaps": "L2: runtime.git"}))
+    check("digest 进入任务文本", "遥测" in task)
+    check("bootstrap 引导与分层缺项进入任务文本",
+          "先检查摄像头" in task and "L2: runtime.git" in task)
 
 
 def test_audit():
@@ -369,6 +375,66 @@ def test_code_update_routing():
         uf.UpdateFlow = orig_flow
 
 
+def test_default_dispatch_events():
+    print("== Architect 默认派发事件流 ==")
+    import Agent.SubAgent as subagent_module
+    import Tools.builtin.agent_delegate as delegate_module
+    import Tools.subagent_config as subagent_config
+    from Architect.hub import default_dispatch
+
+    events = []
+    original = (subagent_module.SubAgent, delegate_module.notify_output,
+                subagent_config.get_subagent_llm)
+
+    class FakeSubAgent:
+        def __init__(self, agent_type, task, agent_id, tools_registry, llm,
+                     output_callback=None):
+            self.agent_type = agent_type
+            self.task = task
+            self.agent_id = agent_id
+            self.output_callback = output_callback
+
+        def execute(self):
+            self.output_callback({
+                "agent_id": self.agent_id, "agent_type": self.agent_type,
+                "task": self.task, "kind": "activity", "level": "info",
+                "category": "iteration", "message": "iteration 1",
+            })
+            return {"status": "partial", "content": "done"}
+
+    def notify(payload):
+        events.append(dict(payload))
+
+    subagent_module.SubAgent = FakeSubAgent
+    delegate_module.notify_output = notify
+    subagent_config.get_subagent_llm = lambda: None
+    try:
+        result = default_dispatch("guardian", "完整 Arch 任务上下文")
+        kinds = [event["kind"] for event in events]
+        check("started→activity→finished", kinds == ["started", "activity", "finished"])
+        check("保留真实 partial 终态", result["status"] == "partial"
+              and events[-1]["status"] == "partial")
+        check("任务全文进入事件", all(
+            event["task"] == "完整 Arch 任务上下文" for event in events))
+        check("动态 Architect id", events[0]["agent_id"].startswith("architect_hub_"))
+
+        class BoomSubAgent(FakeSubAgent):
+            def execute(self):
+                raise RuntimeError("boom")
+
+        subagent_module.SubAgent = BoomSubAgent
+        try:
+            default_dispatch("guardian", "异常任务")
+            check("执行异常继续传播", False)
+        except RuntimeError:
+            check("执行异常继续传播", True)
+        check("异常也有 error 终态", events[-1]["kind"] == "finished"
+              and events[-1]["status"] == "error")
+    finally:
+        (subagent_module.SubAgent, delegate_module.notify_output,
+         subagent_config.get_subagent_llm) = original
+
+
 def main():
     test_digest()
     test_channel_plugin()
@@ -380,6 +446,7 @@ def main():
     test_message_hero_tool()
     test_git_update_source()
     test_code_update_routing()
+    test_default_dispatch_events()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
 

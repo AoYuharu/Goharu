@@ -16,6 +16,7 @@ SubAgent - 子agent执行模块（薄驱动）
 """
 
 import asyncio
+import copy
 import json
 import re
 import shlex
@@ -181,6 +182,7 @@ class SubAgentConfig:
             "先 Read 后 Edit；文件写走 Write/Edit，禁止 shell 重定向写文件；"
             "跨模块改动只走 facade 与注入缝，不碰模块内部；"
             "灰名单命令（del/taskkill/reg 等）会阻塞等人工确认，被拒绝就换方案不要重试；"
+            "独立只读调查可用 AgentDelegate 委托 explore，可并行，禁止其他类型；"
             "改动完成后必须运行对应模块的契约测试并报告真实输出。"
         ),
     }
@@ -205,7 +207,7 @@ class SubAgentConfig:
             # 高危灰名单命令（del/taskkill/reg 等）由 run_cmd 工具内部的
             # confirmation_manager 拦截弹人工确认
             return ["Read", "Grep", "Glob", "run_cmd", "Write", "Edit",
-                    "MessageHero", "SetConfig", "ErrorHook"]
+                    "MessageHero", "SetConfig", "ErrorHook", "AgentDelegate"]
         else:
             raise ValueError(f"Unknown agent type: {agent_type}")
 
@@ -322,10 +324,16 @@ class _SubToolRuntime:
         for tool_name in self.allowed_tools:
             entry = tools_registry.get_entry(tool_name)
             if entry:
+                schema = dict(entry.arguments_schema or {})
+                if self.agent_type.lower() == "architect" and tool_name == "AgentDelegate":
+                    schema = copy.deepcopy(entry.arguments_schema or {})
+                    agent_type_schema = schema.get("properties", {}).get("agent_type")
+                    if agent_type_schema is not None:
+                        agent_type_schema["enum"] = ["explore"]
                 definitions.append({
                     "name": entry.name,
                     "description": entry.description,
-                    "inputSchema": dict(entry.arguments_schema or {}),
+                    "inputSchema": schema,
                 })
         self.last_tool_definitions = definitions
         # 本步已执行调用的全量记录（驱动层用于通知/看板，含完整结果文本——
@@ -345,6 +353,16 @@ class _SubToolRuntime:
                 "error": f"工具 '{tool_name}' 不允许在 {self.agent_type} agent 中使用",
                 "allowed_tools": self.allowed_tools,
             }, ensure_ascii=False)
+
+        if self.agent_type.lower() == "architect" and tool_name == "AgentDelegate":
+            requested_type = tool_args.get("agent_type", "")
+            if not isinstance(requested_type, str) or requested_type.lower() != "explore":
+                return json.dumps({
+                    "error": "Architect 只能委托只读 Explore 子代理",
+                    "hint": ("AgentDelegate.agent_type 必须为 'explore'；"
+                             "禁止 Plan、Verify、Architect 及递归委托。"),
+                    "allowed_agent_types": ["explore"],
+                }, ensure_ascii=False)
 
         if tool_name == "run_cmd":
             command = tool_args.get("cmd", "")

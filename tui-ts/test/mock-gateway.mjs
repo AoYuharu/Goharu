@@ -71,13 +71,17 @@ async function replayScript(message) {
   event("task.background.update", { task_id: 8, tool: "parse_pdf", args: "big_report.pdf, 1-20", status: "running", started_at: Date.now() / 1000 });
   await sleep(200);
   // ── subagent 事件序列（subagent.update 结构化协议演示）──
+  const archTask = "检查 bootstrap verified_facts 与 gaps_pending，禁止重复已验证探测";
   const exploreTask = "Search for config files in E:/Goharu/src which refer to Animation and Rendering";
   const planTask = "Design the rendering pipeline";
+  const base0 = { agent_id: "architect_hub_test01", agent_type: "architect", task: archTask };
   const base1 = { agent_id: "explore_a1b2c3d4", agent_type: "explore", task: exploreTask };
   const base2 = { agent_id: "plan_e5f6a7b8", agent_type: "plan", task: planTask };
+  event("subagent.update", { ...base0, kind: "started", level: "info", message: "启动 Architect [architect_hub_test01]" });
   event("subagent.update", { ...base1, kind: "started", level: "info", message: "🚀 启动 explore agent [explore_a1b2c3d4]" });
   event("subagent.update", { ...base2, kind: "started", level: "info", message: "🚀 启动 plan agent [plan_e5f6a7b8]" });
   await sleep(400);
+  event("subagent.update", { ...base0, kind: "activity", level: "info", category: "iteration", content: "1/40", message: "Arch 迭代 1/40" });
   event("subagent.update", { ...base1, kind: "activity", level: "info", category: "iteration", content: "1/8", message: "🔄 迭代 1/8" });
   event("subagent.update", { ...base1, kind: "activity", level: "debug", category: "thinking", content: "我需要先找到所有 yaml 配置文件，然后逐一检查是否涉及 Animation。\n先从 src 目录开始。", message: "💭 思考" });
   event("subagent.update", { ...base1, kind: "activity", level: "info", category: "tool_call", tool: "Glob", content: '{"pattern": "**/*.yaml"}', message: "🔧 调用工具: Glob" });
@@ -86,6 +90,8 @@ async function replayScript(message) {
   event("subagent.update", { ...base2, kind: "activity", level: "info", category: "iteration", content: "1/5", message: "🔄 迭代 1/5" });
   event("subagent.update", { ...base2, kind: "activity", level: "debug", category: "thinking", content: "渲染管线需要分层设计：数据层、布局层、绘制层。", message: "💭 思考" });
   await sleep(400);
+  event("subagent.update", { ...base0, kind: "activity", level: "info", category: "final", content: "Arch 上下文验收完成", message: "Arch 得出最终结论" });
+  event("subagent.update", { ...base0, kind: "finished", level: "info", message: "Architect 完成", status: "success" });
   event("subagent.update", { ...base1, kind: "activity", level: "info", category: "final", content: "找到 3 个相关配置文件：**src/config.yaml**、src/anim.yaml、src/render.yaml。", message: "✅ 得出最终结论" });
   event("subagent.update", { ...base1, kind: "finished", level: "info", message: "✅ explore agent 完成", status: "success" });
   event("subagent.update", { ...base2, kind: "finished", level: "error", message: "❌ plan agent 完成", status: "error" });

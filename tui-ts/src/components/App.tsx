@@ -135,6 +135,8 @@ function parseTs(raw: string | undefined): string {
 const HISTORY_REPLAY_FALLBACK = 20;
 const SESSION_ID = "default";
 const LIVE_PANEL_ROWS = 12;
+// 模型切换失败里需要用户重填 API Key 的几类（密钥无效 / 配额用完 / 未配置）
+const API_KEY_ERROR_KINDS: ReadonlySet<string> = new Set(["auth", "quota", "missing_key"]);
 
 export function App({ mock = false }: { mock?: boolean }) {
   const { exit } = useApp();
@@ -342,9 +344,11 @@ export function App({ mock = false }: { mock?: boolean }) {
         .catch(() => {});
     });
     gw.on("gateway.init_error", (p) => {
-      showStatic(`FATAL: ${p.message}`, "error");
+      showStatic(`FATAL: ${p.message.split("\n")[0]}`, "error");
       add({ kind: "system", text: "=".repeat(50) });
       add({ kind: "error", text: `Gateway failed to start: ${p.message}` });
+      // 模型服务不可用时 Gateway 附带原始细节（各协议探测的真实报错），便于排查
+      if (p.detail) add({ kind: "system", text: `详细信息: ${p.detail}` });
       add({ kind: "system", text: "Please check config.yaml and restart." });
       add({ kind: "system", text: "=".repeat(50) });
     });
@@ -465,7 +469,12 @@ export function App({ mock = false }: { mock?: boolean }) {
         is_error: p.is_error,
       };
       setSubagents((prev) => {
-        const idx = prev.findIndex((a) => a.agentId === p.agent_id);
+        const isArchStart = p.kind === "started" && String(p.agent_type).toLowerCase() === "architect";
+        const retained = isArchStart
+          ? prev.filter((a) => a.agentType.toLowerCase() !== "architect"
+            || a.status === "running" || a.agentId === viewAgentIdRef.current)
+          : prev;
+        const idx = retained.findIndex((a) => a.agentId === p.agent_id);
         let next: SubagentInfo[];
         if (p.kind === "started" || idx < 0) {
           const info: SubagentInfo = {
@@ -476,9 +485,9 @@ export function App({ mock = false }: { mock?: boolean }) {
             startedAtMs: Date.now(),
             activities: [activity],
           };
-          next = idx >= 0 ? prev.map((a, i) => (i === idx ? info : a)) : [...prev, info];
+          next = idx >= 0 ? retained.map((a, i) => (i === idx ? info : a)) : [...retained, info];
         } else {
-          next = prev.map((a, i) => {
+          next = retained.map((a, i) => {
             if (i !== idx) return a;
             const activities = [...a.activities.slice(-99), activity];
             return p.kind === "finished"
@@ -488,8 +497,8 @@ export function App({ mock = false }: { mock?: boolean }) {
         }
         return next;
       });
-      // Finished agents fade out after 30s (unless currently being viewed)
-      if (p.kind === "finished") {
+      // Architect 完成后仍保留上下文；其他子代理维持 30 秒消退。
+      if (p.kind === "finished" && String(p.agent_type).toLowerCase() !== "architect") {
         const agentId = p.agent_id;
         setTimeout(() => {
           if (viewAgentIdRef.current === agentId) return;
@@ -782,7 +791,7 @@ export function App({ mock = false }: { mock?: boolean }) {
         if (!r.success) {
           // 优雅失败：一句人话 + 保持面板打开聚焦到 API Key 栏，等待修正重试
           showStatic(`❌ ${r.message ?? "模型切换失败"}（已回退，当前仍使用 ${r.fallback_model || "原模型"}）`, "error");
-          if (r.error_kind === "auth") {
+          if (API_KEY_ERROR_KINDS.has(r.error_kind ?? "")) {
             setModelSel(2);
             setModelDraft((d) => ({ ...d, api_key: "" }));
           }
@@ -807,7 +816,7 @@ export function App({ mock = false }: { mock?: boolean }) {
       .then((r) => {
         if (!r.success) {
           showStatic(`❌ ${r.message ?? "模型切换失败"}（已回退，当前仍使用 ${r.fallback_model || "原模型"}）`, "error");
-          if (r.error_kind === "auth") {
+          if (API_KEY_ERROR_KINDS.has(r.error_kind ?? "")) {
             // 认证失败：把面板填充为该条目的手动切换表单，聚焦 key 栏等待重填
             setModelSel(2);
             setModelDraft({ model: entry.model, base_url: entry.base_url, api_key: "" });
@@ -865,6 +874,19 @@ export function App({ mock = false }: { mock?: boolean }) {
         gw.call("voice.download_model", {}).catch(() => {});
       }
     }
+  };
+
+  const switchAgentView = (target: string) => {
+    if (target !== viewAgentIdRef.current) {
+      viewScrollsRef.current.set(viewAgentIdRef.current, scrollRef.current);
+      viewAgentIdRef.current = target;
+      setViewAgentId(target);
+      setScroll(viewScrollsRef.current.get(target) ?? { pinned: false, top: 0 });
+    }
+    setSelRange(null);
+    setHoverId(null);
+    setDetailToolId(null);
+    setBrowseMode("none");
   };
 
   const suggestions = filterCommands(inputValue);
@@ -1080,13 +1102,7 @@ export function App({ mock = false }: { mock?: boolean }) {
       if (key.return) {
         // Switch the whole chat viewport to the selected agent's context
         const target = agentSel === 0 ? "main" : subagents[agentSel - 1]?.agentId ?? "main";
-        viewScrollsRef.current.set(viewAgentId, scroll);
-        setViewAgentId(target);
-        setScroll(viewScrollsRef.current.get(target) ?? { pinned: false, top: 0 });
-        setSelRange(null);
-        setHoverId(null);
-        setDetailToolId(null);
-        setBrowseMode("none");
+        switchAgentView(target);
         return;
       }
       return;
@@ -1130,12 +1146,7 @@ export function App({ mock = false }: { mock?: boolean }) {
     if (key.escape) {
       // Viewing a subagent's context: Esc returns to the main view first
       if (viewAgentId !== "main") {
-        viewScrollsRef.current.set(viewAgentId, scroll);
-        setViewAgentId("main");
-        setScroll(viewScrollsRef.current.get("main") ?? { pinned: false, top: 0 });
-        setSelRange(null);
-        setHoverId(null);
-        setDetailToolId(null);
+        switchAgentView("main");
         return;
       }
       interrupt();
@@ -1148,6 +1159,22 @@ export function App({ mock = false }: { mock?: boolean }) {
     const add = addRef.current;
 
     switch (cmd) {
+      case "/arch": {
+        const architect = [...subagents].reverse().find(
+          (a) => a.agentType.toLowerCase() === "architect",
+        );
+        if (!architect) {
+          add({ kind: "system", text: "暂无 Architect 上下文" });
+        } else {
+          switchAgentView(architect.agentId);
+          setStatus({ kind: "static", text: "正在查看 Architect 上下文 · /goharu 返回", type: "info" });
+        }
+        return true;
+      }
+      case "/goharu":
+        switchAgentView("main");
+        setStatus({ kind: "static", text: "正在查看 Goharu 主对话", type: "info" });
+        return true;
       case "/clear":
         clearAll();
         add({ kind: "system", text: "Chat history cleared" });
@@ -1244,9 +1271,10 @@ export function App({ mock = false }: { mock?: boolean }) {
     setMessages((prev) => [...prev, { id: nextId++, ts: nowHHMMSS(), kind: "user", text: message }]);
     setScroll({ pinned: false, top: 0 }); // 发送新消息后自动回到底部
     historyRef.current.push(`[${nowHHMMSS()}] You: ${message}`);
-    // New turn starts: clear finished agents from the bar (except the one being viewed)
+    // New turn starts: clear finished agents, but retain Architect context for /arch.
     setSubagents((prev) =>
-      prev.filter((a) => a.status === "running" || a.agentId === viewAgentIdRef.current),
+      prev.filter((a) => a.status === "running" || a.agentId === viewAgentIdRef.current
+        || a.agentType.toLowerCase() === "architect"),
     );
 
     const gw = gatewayRef.current;
@@ -1621,7 +1649,6 @@ export function App({ mock = false }: { mock?: boolean }) {
       {screen === null && settingsOpen && (
         <Box
           flexDirection="column"
-          height={7}
           borderStyle="round"
           borderColor="cyan"
           backgroundColor="#1c1e2b"
@@ -1731,6 +1758,9 @@ export function App({ mock = false }: { mock?: boolean }) {
           : Promise.resolve({ ok: false, error: "gateway 未就绪" }))}
         onSetPassword={(channelId, password) => (gatewayRef.current
           ? gatewayRef.current.call("channels.set_password", { channel_id: channelId, password })
+          : Promise.resolve({ ok: false, error: "gateway 未就绪" }))}
+        onSetCredentials={(channelId, appId, appSecret) => (gatewayRef.current
+          ? gatewayRef.current.call("channels.set_qq_credentials", { channel_id: channelId, app_id: appId, app_secret: appSecret })
           : Promise.resolve({ ok: false, error: "gateway 未就绪" }))}
       />
       <ToolsScreen

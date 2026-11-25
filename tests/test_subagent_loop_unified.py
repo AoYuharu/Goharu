@@ -258,6 +258,37 @@ def main():
     )
     check("历史前缀内容跨步逐字节稳定（剥离断点标记）", prefix_stable)
 
+    # ------------------------------------------------------------------
+    # 8. Architect 仅能委托 Explore，其他类型在真实循环中被拦截
+    # ------------------------------------------------------------------
+    print("\n[8] Architect 仅委托 Explore")
+    registry = FakeRegistry(SubAgentConfig.get_allowed_tools("architect"))
+    llm = ScriptedLLM([
+        tool_use_resp("AgentDelegate", {"agent_type": "explore", "task": "只读调查"}, "d1"),
+        tool_use_resp("AgentDelegate", {"agent_type": "plan", "task": "越权"}, "d2"),
+        tool_use_resp("AgentDelegate", {"agent_type": "verify", "task": "越权"}, "d3"),
+        tool_use_resp("AgentDelegate", {"agent_type": "architect", "task": "递归"}, "d4"),
+        answer_resp("委托权限检查完成。"),
+    ])
+    sub5 = make_sub("architect", llm, registry)
+    import Agent.architect_memory as architect_memory
+    old_memory = (architect_memory.retrieve_architect_memory,
+                  architect_memory.format_experience_block,
+                  architect_memory.archive_transcript)
+    architect_memory.retrieve_architect_memory = lambda _messages: None
+    architect_memory.format_experience_block = lambda _pack: ""
+    architect_memory.archive_transcript = lambda _snapshot: None
+    try:
+        result = sub5.execute()
+    finally:
+        (architect_memory.retrieve_architect_memory,
+         architect_memory.format_experience_block,
+         architect_memory.archive_transcript) = old_memory
+    check("Architect 循环正常收官", result["status"] == "success", result)
+    check("只有 Explore 真正 dispatch",
+          registry.dispatched == [("AgentDelegate", {"agent_type": "explore", "task": "只读调查"})],
+          str(registry.dispatched))
+
     print("\n" + "=" * 60)
     if failed:
         print(f"RESULT: FAIL ({passed}/{passed + failed})")

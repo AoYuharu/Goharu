@@ -85,6 +85,13 @@ Architect/
    可关）。Architect 侧的沟通工具是 `MessageHero`（architect 白名单专属，
    SubAgent.py 工具清单同步维护）；Hero 侧入口是 `ConsultArchitect`。
    防聊天循环：提示词约定一次交换内收敛。
+8. **Arch 上下文走只读观测事件**：`default_dispatch` 经
+   `Tools.builtin.agent_delegate.notify_output` 发送 started/finished，并把同一回调
+   交给 SubAgent；TUI `/arch` 查看最近上下文，`/goharu` 返回主对话。事件不是新的
+   对话通道，通知异常不得改变派发返回或异常语义。
+9. **委托只允许 Explore**：Architect 的 AgentDelegate 外露 schema 与
+   `_SubToolRuntime._validate_access` 都必须限定 `agent_type=explore`，禁止
+   Plan/Verify/Architect 和递归委托；Explore 自身不注册 AgentDelegate。
 
 ## 配置（config.yaml）
 
@@ -109,19 +116,33 @@ architect_hub:
 唤醒冷却与 pending 降级 / 审计管线（假 runner + 假 dispatch + 假 merge）。
 改动公共接口后必跑。
 
-## Bootstrap 首次部署（bootstrap.py + probe.py，2026-11-22）
+## Bootstrap 首次部署（bootstrap.py + probe.py，2026-11-25）
 
 裸机部署时 gateway 启动钩子（session_manager）触发：`identity.yaml` 缺失才跑，
-daemon 线程不阻塞启动。流程：哑探测（probe.py 12 类，零 LLM）→ HaruNet 最小
-注册（register_fn 注入，失败降级 pending_retry）→ gaps 非空唤醒 Arch 补漏
-（reason="bootstrap"，Arch 写回 identity.yaml）→ 落盘即完成标记。
+daemon 线程不阻塞启动。probe.py 同步按 L1 系统与硬件基础 → L2 软件与中间件 →
+L3 设备与通信接口 → L4 感知能力 → L5 物理行为能力执行纯规则探测；单类别异常
+记 unknown 并继续。随后 HaruNet 最小注册（register_fn 注入，失败降级
+pending_retry），identity.yaml 落盘即完成标记。
 
-- **探测纪律**：规则判断树 + 正则只做快路径，探不到进 gaps 给 Arch；
-  不在规则层堆发行版适配。
+- **四态报告**：identity 保留原始类别字段，另存 `probe_report[Lx].fields`，
+  每项为 `{status, evidence}`。只有 `unknown` 进入 gaps；`unavailable` 表示
+  确认不存在，`not_applicable` 表示设备无此能力，`verified` 包括 False、0、
+  空列表。evidence 只写探测来源与结论，不保存敏感原始输出。
+- **探测边界**：Windows/Linux 复用轻量规则，macOS 只采用 platform/stdlib 与
+  安全通用命令快路径；无法确认留 unknown，不堆发行版适配。USB/串口、摄像头/
+  音频、GPIO 只枚举或发现，绝不真实驱动。普通设备无执行能力时记 not_applicable。
+- **Arch 唤醒**：全部规则完成后，gaps 非空或配置了
+  `architect_hub.bootstrap.initial_exploration` 时只唤醒一次
+  （reason="bootstrap"，kind=KIND_EXPLORE）；两者皆空不唤醒。引导压缩为单行，
+  只决定探索优先级。上下文含 OS、分层 gaps、verified_facts、identity 路径、
+  平台只读命令与写回约束。Arch 不重复已验证探测，禁止安装软件、改源码/配置或
+  驱动设备，只能写 identity；补值时同步更新 probe_report 状态/证据，并从
+  gaps_pending 移除已解决项。
 - **编码教训（2026-11-22 实测）**：Windows 中文系统的系统工具输出是 GBK——
   `_run` 必须 utf-8→gbk 解码链，且 ipconfig 字段名要中英双语正则
   （"DNS 服务器"/"DNS Servers"、"默认网关"/"Default Gateway"）。
-- identity.yaml 结构：device/os/cpu/memory/gpu/storage/network/runtime/
-  services/peripherals/security/status + probed_at + gaps_pending + harunet。
+- identity.yaml 结构：device/os/cpu/memory/gpu/storage/security/status/runtime/
+  services/network/communication/peripherals/actuation + probe_report + probed_at
+  + gaps_pending + harunet。
 
 契约测试：`tests/test_bootstrap.py`（真实本机探测 + 编排 + 注册缝）。

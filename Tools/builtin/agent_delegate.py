@@ -159,6 +159,14 @@ def set_output_callback(callback):
     _manager.set_output_callback(callback)
 
 
+def notify_output(payload: dict):
+    """供 Architect Hub 等宿主集成方发送 started/finished 事件的安全入口。
+
+    外部不得直接访问 _manager 私有单例；回调异常会静默处理，不阻断调用方。
+    """
+    _manager.notify_output(payload)
+
+
 # 对抗性探测关键词（中英）：verify 报告至少命中一个才算包含 adversarial probe
 _ADVERSARIAL_KEYWORDS = re.compile(
     r"对抗|adversarial|并发|concurren|边界|boundary|幂等|idempoten|孤立|orphan|probe",
@@ -415,6 +423,8 @@ registry.register(
     description="""CRITICAL: For broad search/exploration tasks, you MUST split the work: make MULTIPLE concurrent AgentDelegate calls in parallel, each covering a DIFFERENT target area.
 
 WHY SPLIT: Sub-agents run concurrently (up to 3 Explore at once). Parallel search is much faster than searching one area at a time. After all complete, merge their results.
+
+CALLER-SPECIFIC ACCESS: The main Agent may use all four types: Explore, Plan, Verify, and Architect. When Architect calls this tool, it may ONLY use agent_type='explore' for read-only investigation. Architect must NOT call Plan, Verify, or Architect, and must NOT delegate recursively.
 
 WHEN TO SPLIT:
 - Scanning multiple directories/disks: one agent per directory tree

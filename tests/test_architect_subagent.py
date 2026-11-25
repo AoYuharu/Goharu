@@ -3,6 +3,8 @@
 直接运行：python tests/test_architect_subagent.py
 """
 
+import asyncio
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -31,6 +33,7 @@ def test_registration():
     tools = SubAgentConfig.get_allowed_tools("architect")
     check("工具含 Write/Edit/run_cmd",
           {"Write", "Edit", "run_cmd", "Read", "Grep", "Glob"} <= set(tools))
+    check("工具含 AgentDelegate", "AgentDelegate" in tools)
     check("CRITICAL_REMINDERS 有 architect",
           "architect" in SubAgentConfig.CRITICAL_REMINDERS)
 
@@ -55,6 +58,54 @@ def test_command_policy():
     check("verify 放行 pytest", ok("verify", "python -m pytest tests/"))
     check("verify 拦长 sleep", not ok("verify", "sleep 60"))
     check("verify 拦重定向", not ok("verify", "echo x > a.txt"))
+
+
+def test_delegate_policy():
+    print("== Architect 仅委托 Explore ==")
+    from Agent.SubAgent import _SubToolRuntime
+
+    schema = {
+        "type": "object",
+        "properties": {"agent_type": {"type": "string", "enum": ["explore", "plan"]}},
+    }
+
+    class Entry:
+        name = "AgentDelegate"
+        description = "delegate"
+        arguments_schema = schema
+
+    class Registry:
+        def __init__(self):
+            self.dispatched = []
+
+        def get_entry(self, name):
+            return Entry() if name == "AgentDelegate" else None
+
+        async def dispatch(self, name, args):
+            self.dispatched.append((name, dict(args)))
+            return "ok"
+
+    registry = Registry()
+    runtime = _SubToolRuntime("architect", ["AgentDelegate"], registry)
+    definition = runtime.last_tool_definitions[0]
+    check("Architect 看到的 enum 仅 Explore",
+          definition["inputSchema"]["properties"]["agent_type"]["enum"] == ["explore"])
+    check("registry 原 schema 未被修改",
+          schema["properties"]["agent_type"]["enum"] == ["explore", "plan"])
+    result = asyncio.run(runtime.call_tool(
+        "AgentDelegate", {"agent_type": "Explore", "task": "只读调查"}))
+    check("Explore 大小写不敏感放行", result == "ok" and len(registry.dispatched) == 1)
+    for bad_type in ("plan", "verify", "architect", "", None):
+        result = asyncio.run(runtime.call_tool(
+            "AgentDelegate", {"agent_type": bad_type, "task": "越权"}))
+        check(f"拒绝 {bad_type!r} 委托",
+              "只能委托只读 Explore" in json.loads(result)["error"])
+    check("越权调用零 dispatch", len(registry.dispatched) == 1)
+    explore_runtime = _SubToolRuntime(
+        "explore", SubAgentConfig.get_allowed_tools("explore"), registry)
+    result = asyncio.run(explore_runtime.call_tool(
+        "AgentDelegate", {"agent_type": "explore", "task": "递归"}))
+    check("Explore 不能继续递归委托", "不允许" in result and len(registry.dispatched) == 1)
 
 
 def test_memory_tower_isolation():
@@ -108,6 +159,7 @@ def test_architect_memory_degraded():
 if __name__ == "__main__":
     test_registration()
     test_command_policy()
+    test_delegate_policy()
     test_memory_tower_isolation()
     test_architect_memory_degraded()
     print(f"\n{PASS} passed, {FAIL} failed")

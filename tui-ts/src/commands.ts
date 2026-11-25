@@ -6,6 +6,8 @@ export interface CommandDef {
 
 /** Mirrors TUI/widgets/command_suggestions.py COMMANDS. */
 export const COMMANDS: CommandDef[] = [
+  { name: "/arch", description: "View latest Architect context", usage: "/arch" },
+  { name: "/goharu", description: "Return to main Goharu conversation", usage: "/goharu" },
   { name: "/clear", description: "Clear chat history and context", usage: "/clear" },
   { name: "/compact", description: "Summarize conversation via LLM", usage: "/compact" },
   { name: "/upgrade", description: "Check GitHub for updates and upgrade Goharu (audited, confirm-gated)", usage: "/upgrade" },
@@ -28,6 +30,8 @@ export function filterCommands(input: string): CommandDef[] {
 
 export const HELP_LINES = [
   "Available commands:",
+  "  /arch - View latest Architect context",
+  "  /goharu - Return to main Goharu conversation",
   "  /clear - Clear chat history",
   "  /compact - Summarize conversation via LLM",
   "  /upgrade - Check GitHub and upgrade Goharu (audited)",
