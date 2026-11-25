@@ -61,21 +61,18 @@ checkpoint:
   - '*.pyc'
   - .git/**
 harunet:
-  # 接入 HaruNet 是显式选择：默认关闭，未接入的智能体对组网一无所知
-  # （system 提示词无组网段、组网工具不注册）。接入 = 此处 true（或环境变量
-  # HARUNET_ENABLED=true，机器级覆盖不必进 git）+ hub 白名单收录本机指纹。
   enabled: false
   url: ws://159.75.26.204:6000
   http_base: http://159.75.26.204:6001
   name: goharu
   owner_ids:
   - agt_43346c6e4ef29069
-  quiet_seconds: 120           # 群内无@消息攒到安静期再合并导入的秒数
-  owner_quiet_seconds: 15      # 主人不@的群消息不立即唤醒，但安静期缩短到该秒数快速兜底阅读
-  group_inline_max_chars: 1500 # 群消息总字数超阈值则交压缩智能体摘要，否则内联进上下文
-  attention_seconds: 300       # 关注期：被@/私聊/主人说话后，期内所有新消息都唤醒（续期）
-  agent_pingpong_limit: 3      # 乒乓刹车：连续 N 轮纯同事对话（无主人参与）后不再唤醒
-  reject_backoff_seconds: 600  # 握手被拒（密码错/未入白名单）后的重试间隔；主动重连可跳过
+  quiet_seconds: 120
+  owner_quiet_seconds: 15
+  group_inline_max_chars: 1500
+  attention_seconds: 300
+  agent_pingpong_limit: 3
+  reject_backoff_seconds: 600
   focus: 编程与自动化（代码编辑、调试、系统操作）
   tags:
   - coding
@@ -83,10 +80,11 @@ harunet:
   - windows
   identity_dir: ./runtime_memory/agentnet/identity
   messagebox_path: ./runtime_memory/agentnet/messagebox.db
+  password: 11
 network:
   proxy:
-    url: ""                        # 出站代理地址（如 socks5://127.0.0.1:7897）；空 = 跟随 git config/系统默认
-    rules:                         # 仅命中这些 host 的请求走代理（默认 GitHub + arXiv，可按需扩展）
+    url: ''
+    rules:
     - github.com
     - arxiv.org
 prompt:
@@ -180,8 +178,6 @@ tools:
   - Tools.builtin.channel_tools
   - Tools.builtin.plan_mode_tools
   - Tools.builtin.checkpoint_tools
-  # HaruNet 条件工具组（harunet_tools / floor_tools）不在此静态表：
-  # 由 Gateway 在 harunet.enabled 时 import 注册——未接入的智能体看不见它们
   ask_user:
     timeout_seconds: 300
   mcp:
@@ -190,15 +186,6 @@ tools:
       tavily:
         transport: http
         url: https://mcp.tavily.com/mcp/?tavilyApiKey=${TAVILY_API_KEY}
-      # ── 本机 stdio MCP 示例（按本机实际路径配置后取消注释）──
-      # browser-use:
-      #   command: /path/to/browser-use/.venv/bin/python
-      #   args: [-m, browser_use.mcp]
-      #   env: {ANONYMIZED_TELEMETRY: 'False'}
-      # netease-music:
-      #   command: /path/to/python
-      #   args: [/path/to/netmusic_mcp.py]
-      #   call_timeout_seconds: 30
   security:
     allow_confirmation: true
     dangerous_commands:
@@ -277,8 +264,9 @@ agent_delegate:
 architect_hub:
   digest_window: 200
   bootstrap:
-    enabled: true                  # 裸机首次部署：探测 + identity.yaml
+    enabled: true
     identity_path: runtime_memory/identity.yaml
+    initial_exploration: ""
   guardian:
     not_ready_seconds: 600
   error_hooks:
@@ -289,8 +277,8 @@ architect_hub:
     max_snapshot_mb: 200
     timeout: 600
     repo_dir: .
-    self_check_commands: []        # 修复后的额外自检（如 python tests/test_xxx.py）
-    startup_check_commands: []     # 启动安全自检（可复用同上）
+    self_check_commands: []
+    startup_check_commands: []
   upgrade:
     enabled: true
     check_interval_seconds: 1800
@@ -343,4 +331,4 @@ channels:
   - Architect.channel
 gateway:
   rpc_port: 8791
-  tui_attach_shutdown: false   # 关 TUI 不关网关（常驻守护；用 goharu gateway stop 显式停）
+  tui_attach_shutdown: false
