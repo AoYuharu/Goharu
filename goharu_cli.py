@@ -238,6 +238,18 @@ def _upgrade_commands(changed: list[str]) -> list[tuple[list[str], str, str]]:
     return cmds
 
 
+def _backup_upgrade_file(path: str) -> str:
+    backup_dir = os.path.join(os.path.expanduser("~"), ".goharu", "upgrade_backup")
+    os.makedirs(backup_dir, exist_ok=True)
+    dest = os.path.join(backup_dir, f"{os.path.basename(path)}.{int(time.time())}")
+    shutil.copy2(path, dest)
+    return dest
+
+
+def _restore_upgrade_file(backup: str, path: str) -> None:
+    shutil.copy2(backup, path)
+
+
 def _run_upgrade_command(cmd: list[str], cwd: str, label: str) -> bool:
     print(f"[+] {label}: {' '.join(cmd)}")
     try:
@@ -296,14 +308,41 @@ def upgrade(argv: list[str]) -> int:
         print(f"[x] 本地与远程已分叉（本地领先 {ahead}），拒绝自动升级")
         return 1
     dirty = _git("status", "--porcelain", "--untracked-files=no")
-    if dirty.returncode == 0 and dirty.stdout.strip():
-        print("[x] 仓库有未提交改动，拒绝覆盖；请先提交或备份后重试")
+    dirty_paths = [
+        line[3:].strip() for line in dirty.stdout.splitlines()
+        if line.strip() and len(line) > 3
+    ] if dirty.returncode == 0 else []
+    unexpected = [p for p in dirty_paths if p != "config.yaml"]
+    if unexpected:
+        print("[x] 仓库有未提交改动，拒绝覆盖: " + ", ".join(unexpected[:8]))
         return 1
+    config_backup = None
+    config_path = os.path.join(REPO, "config.yaml")
+    if "config.yaml" in dirty_paths:
+        try:
+            config_backup = _backup_upgrade_file(config_path)
+            checked = _git("checkout", "--", "config.yaml")
+            if checked.returncode != 0:
+                print(f"[x] 暂存 config.yaml 失败: {(checked.stderr or checked.stdout).strip()[:400]}")
+                return 1
+            print(f"[+] 已备份本地 config.yaml → {config_backup}")
+        except OSError as e:
+            print(f"[x] 备份 config.yaml 失败: {e}")
+            return 1
 
     was_alive = _alive()
     if was_alive:
         gateway_stop()
     merged = _git("merge", "--ff-only", remote)
+    if config_backup:
+        try:
+            _restore_upgrade_file(config_backup, config_path)
+            print("[+] 已恢复本地 config.yaml（备份保留）")
+        except OSError as e:
+            print(f"[!] 恢复 config.yaml 失败，备份仍在 {config_backup}: {e}")
+            if was_alive:
+                gateway_start()
+            return 1
     if merged.returncode != 0:
         print(f"[x] 快进失败: {(merged.stderr or merged.stdout).strip()[:500]}")
         if was_alive:

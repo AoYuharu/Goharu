@@ -318,7 +318,8 @@ def test_mcp_http_tuple_compat():
 def test_upgrade(cli):
     print("\n[7] upgrade 比对、快进与依赖重建")
     old = (cli._git, cli._alive, cli.gateway_stop, cli.gateway_start,
-           cli._run_upgrade_command)
+           cli._run_upgrade_command, cli._backup_upgrade_file,
+           cli._restore_upgrade_file)
     state = {
         "local": "a" * 40, "remote": "b" * 40, "behind": "2", "ahead": "0",
         "dirty": "", "merge_rc": 0,
@@ -392,12 +393,27 @@ def test_upgrade(cli):
         check("未提交改动拒绝升级", rc == 1 and "未提交改动" in out.getvalue()
               and not any(c.startswith("merge ") for c in calls))
 
+        state["dirty"] = " M config.yaml\n"
+        restored = []
+        cli._backup_upgrade_file = lambda _path: "/tmp/config.yaml.backup"
+        cli._restore_upgrade_file = lambda backup, path: restored.append((backup, path))
+        calls.clear()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cli.upgrade([])
+        check("受管 config.yaml 改动可升级", rc == 0
+              and "checkout -- config.yaml" in calls and restored,
+              out.getvalue())
+        check("升级后恢复本地配置", restored
+              and restored[0][0] == "/tmp/config.yaml.backup", restored)
+
         cmds = cli._upgrade_commands(["tui-ts/package-lock.json"])
         labels = [label for _, _, label in cmds]
         check("lockfile 变更触发 npm install", "TUI 依赖" in labels)
     finally:
         (cli._git, cli._alive, cli.gateway_stop, cli.gateway_start,
-         cli._run_upgrade_command) = old
+         cli._run_upgrade_command, cli._backup_upgrade_file,
+         cli._restore_upgrade_file) = old
 
 
 # ────────────────────────────────────────────────────────────────────
