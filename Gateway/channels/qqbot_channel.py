@@ -107,6 +107,18 @@ class QQBotClient:
         r = await http.get(f"{self.api_base}/gateway", headers=await self._headers())
         return r.json()["url"]
 
+    async def get_me(self):
+        """机器人自身信息（id/username/avatar）；失败返回 {}（不阻断连接）。"""
+        try:
+            http = await self._get_http()
+            r = await http.get(f"{self.api_base}/users/@me",
+                               headers=await self._headers())
+            data = r.json()
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.debug("QQBot get_me failed: %s", e)
+            return {}
+
     def _next_msg_seq(self):
         # 同一 msg_id 多次回复必须变化 msg_seq，否则平台去重
         self._msg_seq = (self._msg_seq + 1) % 65536
@@ -324,7 +336,10 @@ class QQBotChannel(Channel):
         self._loop = None
         self._thread = None
         self._stop_event = None
+        self._ws = None                  # 当前 ws 连接（set_credentials 强制断连重握手用）
         self._ws_factory = None          # 测试注入：async callable(url) → ws
+        self._env_writer = None          # session_manager 注入：写回 .env
+        self._bot_name = ""              # /users/@me 的 username（health 展示用）
         # 最近活跃会话：{"scene", "id", "msg_id", "ts"}
         self._last_conversation = None
         self._session_id = None
@@ -412,16 +427,63 @@ class QQBotChannel(Channel):
 
     def health(self) -> dict:
         """QQ Bot 连通状态：缺凭据 / online / connecting / error。"""
+        base = {"bot_name": self._bot_name, "app_id": self.app_id,
+                "has_secret": bool(self.app_secret)}
         if not self.app_id or not self.app_secret:
             return {"ok": False, "state": "not_configured",
-                    "detail": "缺少 QQBOT_APP_ID / QQBOT_CLIENT_SECRET"}
+                    "detail": "缺少 QQBOT_APP_ID / QQBOT_CLIENT_SECRET", **base}
         if self._session_id:
-            return {"ok": True, "state": "online", "detail": "已连接 QQ 官方 WebSocket"}
+            return {"ok": True, "state": "online",
+                    "detail": "已连接 QQ 官方 WebSocket", **base}
         if self._thread and self._thread.is_alive():
             return {"ok": False, "state": "connecting",
-                    "detail": self._last_error or "连接中…"}
+                    "detail": self._last_error or "连接中…", **base}
         return {"ok": False, "state": "error",
-                "detail": self._last_error or "未启动"}
+                "detail": self._last_error or "未启动", **base}
+
+    # ------------------------------------------------------------------
+    # 凭据热更新（TUI 通道页「AppID / AppSecret」编辑）
+    # ------------------------------------------------------------------
+
+    def set_env_writer(self, fn):
+        """session_manager 注入：行级写回 .env（保留其他行）。"""
+        self._env_writer = fn
+
+    def set_credentials(self, app_id, app_secret):
+        """换 AppID/AppSecret：写回 .env + 换 client + 断开当前 ws 用新凭据重握手。
+
+        app_secret 传空 = 保持原 secret 不变（TUI 密文编辑留空语义）。
+        返回是否有实际变化。
+        """
+        app_id = str(app_id or "").strip()
+        app_secret = str(app_secret or "").strip()
+        if not app_id:
+            raise ValueError("AppID 不能为空")
+        if app_id == self.app_id and not app_secret:
+            return False
+        self.app_id = app_id
+        if app_secret:
+            self.app_secret = app_secret
+        os.environ["QQBOT_APP_ID"] = self.app_id
+        os.environ["QQBOT_CLIENT_SECRET"] = self.app_secret
+        if self._env_writer:
+            try:
+                self._env_writer("QQBOT_APP_ID", self.app_id)
+                self._env_writer("QQBOT_CLIENT_SECRET", self.app_secret)
+            except Exception as e:
+                logger.warning("QQBot 凭据写回 .env 失败: %s", e)
+        self.client = QQBotClient(self.app_id, self.app_secret, self.sandbox)
+        self._session_id = None
+        self._last_seq = None
+        self._bot_name = ""
+        if self._thread and self._thread.is_alive():
+            if self._loop and self._ws is not None:
+                asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
+        else:
+            self.start()          # 之前缺凭据未启动：现在直接拉起
+        logger.info("QQBot channel %s 凭据已更新（app_id=%s），重连中",
+                    self.channel_id, self.app_id)
+        return True
 
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
@@ -469,6 +531,7 @@ class QQBotChannel(Channel):
 
         gateway_url = await self.client.get_gateway_url()
         async with connect(gateway_url) as ws:
+            self._ws = ws
             hello = json.loads(await ws.recv())          # op=10 HELLO
             interval = hello["d"]["heartbeat_interval"] / 1000
 
@@ -494,6 +557,11 @@ class QQBotChannel(Channel):
                         if t == "READY":
                             self._session_id = p["d"]["session_id"]
                             logger.info("QQBot READY, session=%s", self._session_id)
+                            if not self._bot_name:
+                                me = await self.client.get_me()
+                                self._bot_name = str(me.get("username", ""))
+                                if self._bot_name:
+                                    logger.info("QQBot 机器人名称: %s", self._bot_name)
                         elif t == "RESUMED":
                             logger.info("QQBot RESUMED")
                         elif t == "C2C_MESSAGE_CREATE":
@@ -514,6 +582,7 @@ class QQBotChannel(Channel):
                         break
             finally:
                 hb.cancel()
+                self._ws = None
 
     async def _heartbeat(self, ws, interval):
         while True:

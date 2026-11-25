@@ -27,6 +27,9 @@ export interface ChannelHealthRow {
   state: string;
   detail: string;
   params?: Record<string, unknown>;
+  bot_name?: string;
+  app_id?: string;
+  has_secret?: boolean;
 }
 
 type ActionResult = { ok: boolean; note?: string; error?: string };
@@ -57,7 +60,7 @@ const FIELDS: Record<string, string[]> = {
 };
 const LABELS: Record<string, string> = {
   url: "hub 地址", name: "网络昵称", password: "接入密码", http_base: "上传地址",
-  focus: "侧重方向", app_id: "QQBOT_APP_ID", app_secret: "QQBOT_CLIENT_SECRET",
+  focus: "侧重方向", app_id: "AppID", app_secret: "AppSecret",
   require_mention: "仅@时响应", priority: "消息优先级", sandbox: "QQ 沙箱",
 };
 const SECRET_RE = /secret|password|token|api_key|app_secret/i;
@@ -66,7 +69,7 @@ const SECRET_RE = /secret|password|token|api_key|app_secret/i;
 const TYPE_INFO: Record<string, { label: string; desc: string }> = {
   tui: { label: "终端界面", desc: "当前这个 TUI 本身，无需配置" },
   harunet: { label: "HaruNet 组网", desc: "接入智能体组网：hub 地址 / 昵称 / 接入密码" },
-  qqbot: { label: "QQ 频道机器人", desc: "QQ 官方机器人；需 .env 的 QQBOT_APP_ID / CLIENT_SECRET" },
+  qqbot: { label: "QQ 频道机器人", desc: "QQ 官方机器人；AppID/AppSecret 在此直接配置，即时生效" },
   architect_telemetry: { label: "架构师遥测", desc: "内部通道：把运行事件喂给 arch，自动工作，无需配置" },
 };
 function typeLabel(type: string) { return TYPE_INFO[type]?.label ?? type; }
@@ -146,15 +149,17 @@ function buildRows(sessions: SessionEntry[], health: ChannelHealthRow[]): Row[] 
 }
 
 type Item =
-  | { kind: "field"; key: string; label: string; value: unknown }
-  | { kind: "action"; id: "reconnect" | "set_password" | "save"; label: string; hint: string };
+  | { kind: "field"; key: string; label: string; value: unknown; display?: string }
+  | { kind: "action"; id: "reconnect"; label: string; hint: string };
 
 /**
  * 通道设置：列表（运行状态）→ Enter 进入该通道的配置详情 → 字段可编辑。
- * harunet 的接入密码/重连走 RPC 立即生效；其余字段保存进 config.yaml（重启生效）。
+ * 编辑即保存：字段回车确认后立即持久化（config 字段写 config.yaml、
+ * qqbot 凭据写 .env 并热重连、harunet 密码走 RPC），没有二次"保存"步骤。
  */
 export function ChannelsEditorScreen({
   active, onClose, onSave, onResult, onHealth, onReconnect, onSetPassword,
+  onSetCredentials,
 }: {
   active: boolean;
   onClose: () => void;
@@ -163,13 +168,13 @@ export function ChannelsEditorScreen({
   onHealth: () => Promise<ChannelHealthRow[]>;
   onReconnect: (channelId: string) => Promise<ActionResult>;
   onSetPassword: (channelId: string, password: string) => Promise<ActionResult>;
+  onSetCredentials: (channelId: string, appId: string, appSecret: string) => Promise<ActionResult>;
 }) {
   const [sessions, setSessions] = useState<SessionEntry[]>([]);
   const [health, setHealth] = useState<ChannelHealthRow[]>([]);
   const [view, setView] = useState<"list" | "detail">("list");
   const [index, setIndex] = useState(0);        // 列表选中
   const [sel, setSel] = useState(0);            // 详情选中（字段/操作）
-  const [dirty, setDirty] = useState(false);
   const [editing, setEditing] = useState<{ key: string; label: string; secret: boolean } | null>(null);
   const [editValue, setEditValue] = useState("");
   const [busy, setBusy] = useState(false);
@@ -181,7 +186,7 @@ export function ChannelsEditorScreen({
     if (!active) return;
     const cfg = readConfig();
     setSessions(Array.isArray(cfg.sessions) ? (cfg.sessions as SessionEntry[]) : []);
-    setIndex(0); setView("list"); setSel(0); setDirty(false); setEditing(null);
+    setIndex(0); setView("list"); setSel(0); setEditing(null);
   }, [active]);
 
   useEffect(() => {
@@ -198,23 +203,45 @@ export function ChannelsEditorScreen({
     const list: Item[] = [];
     const keys = FIELDS[current.type] ?? Object.keys(current.params);
     for (const key of keys) {
+      if (current.type === "qqbot" && (key === "app_id" || key === "app_secret")) {
+        // 凭据始终展示（通常存在 .env 而非 params）：值取自运行时 health
+        if (key === "app_id") {
+          const v = current.health?.app_id || current.params.app_id || "";
+          list.push({ kind: "field", key, label: LABELS[key], value: v });
+        } else {
+          const has = Boolean(current.health?.has_secret || current.params.app_secret);
+          list.push({ kind: "field", key, label: LABELS[key], value: has ? "*" : "",
+                      display: has ? "已设置（Enter 输入新值覆盖）" : "（未设置）" });
+        }
+        continue;
+      }
       if (!(key in current.params)) continue;
       list.push({ kind: "field", key, label: LABELS[key] ?? key, value: current.params[key] });
     }
-    if (current.cfg) {
-      list.push({ kind: "action", id: "save", label: "保存到 config.yaml", hint: "Enter 保存；重启 Gateway 后生效" });
-    }
     if (current.type === "harunet") {
       list.push({ kind: "action", id: "reconnect", label: "立即重连", hint: "Enter 触发：跳过退避，立刻重新握手" });
-      list.push({ kind: "action", id: "set_password", label: "修改接入密码（立即生效）", hint: "Enter 输入新密码：写回 .env 并用新密码重连" });
     }
     return list;
   }, [current]);
 
   const startEdit = (key: string, label: string) => {
-    const secret = isSecret(key) || key === "__password__";
+    const secret = isSecret(key);
     setEditing({ key, label, secret });
-    setEditValue(secret ? "" : String(current?.params[key] ?? ""));
+    // qqbot AppID 一般不在 params（在 .env），预填运行时值
+    const prefill = current?.type === "qqbot" && key === "app_id"
+      ? (current.health?.app_id ?? current.params[key] ?? "")
+      : (current?.params[key] ?? "");
+    setEditValue(secret ? "" : String(prefill));
+  };
+
+  /** 配置改动立即写回 config.yaml（无二次确认步骤）。 */
+  const persist = (next: SessionEntry[]) => {
+    setSessions(next);
+    setBusy(true);
+    onSave("sessions", next)
+      .then((msg) => onResult(`${msg}（重启 Gateway 后生效）`))
+      .catch((e) => onResult(`保存失败: ${e}`))
+      .finally(() => setBusy(false));
   };
 
   const applyEdit = (raw: string) => {
@@ -222,7 +249,8 @@ export function ChannelsEditorScreen({
     setEditing(null);
     if (!ed || !current) return;
     const v = raw.trim();
-    if (ed.key === "__password__") {
+    if (current.type === "harunet" && ed.key === "password") {
+      // 接入密码：写回 .env + 立即重连（env 优先级高于 config，写 config 会被遮蔽）
       if (!v) { onResult("密码为空，未修改"); return; }
       setBusy(true);
       onSetPassword(current.channel_id, v)
@@ -231,7 +259,22 @@ export function ChannelsEditorScreen({
         .finally(() => setBusy(false));
       return;
     }
-    if (ed.secret && !v) { onResult("留空 = 保持不变"); return; }
+    if (current.type === "qqbot" && (ed.key === "app_id" || ed.key === "app_secret")) {
+      // 凭据：写 .env + 热重连，立即生效（不走 config.yaml）
+      if (!v) {
+        onResult(ed.key === "app_id" ? "AppID 不能为空" : "留空 = 保持不变");
+        return;
+      }
+      const appId = ed.key === "app_id"
+        ? v : String(current.health?.app_id ?? current.params.app_id ?? "");
+      const secret = ed.key === "app_secret" ? v : "";
+      setBusy(true);
+      onSetCredentials(current.channel_id, appId, secret)
+        .then((r) => onResult(r.ok ? `✔ ${r.note ?? "凭据已更新"}` : `✘ ${r.error ?? "失败"}`))
+        .catch((e) => onResult(`✘ ${e}`))
+        .finally(() => setBusy(false));
+      return;
+    }
     if (!current.cfg) {
       // 运行时通道（harunet）：字段直接写顶层 harunet.<key>
       setBusy(true);
@@ -242,21 +285,13 @@ export function ChannelsEditorScreen({
       return;
     }
     const { si, ci } = current.cfg;
-    const next = sessions.map((s, i) => i === si
+    persist(sessions.map((s, i) => i === si
       ? {
           ...s,
           channels: (s.channels ?? []).map((ch, c) => (c === ci
             ? { ...ch, params: { ...(ch.params ?? {}), [ed.key]: v } } : ch)),
         }
-      : s);
-    setSessions(next);
-    setDirty(true);
-  };
-
-  const saveSessions = () => {
-    void onSave("sessions", sessions)
-      .then((msg) => { setDirty(false); onResult(`${msg}（重启 Gateway 后生效）`); })
-      .catch((e) => onResult(`保存失败: ${e}`));
+      : s));
   };
 
   const doReconnect = () => {
@@ -273,58 +308,53 @@ export function ChannelsEditorScreen({
       if (key.escape) setEditing(null);
       return;   // TextInput 拥有其余按键
     }
+    if (busy) return;   // 保存/动作进行中，忽略输入防止并发写
     if (view === "detail") {
-      if (key.escape) { if (dirty) saveSessions(); setView("list"); return; }
+      if (key.escape) { setView("list"); return; }
       if (key.upArrow) { setSel((i) => Math.max(0, i - 1)); return; }
       if (key.downArrow) { setSel((i) => Math.min(items.length - 1, i + 1)); return; }
-      if (input === "s" && dirty) { saveSessions(); return; }
-      if (key.return && items[sel] && !busy) {
+      if (key.return && items[sel]) {
         const it = items[sel];
         if (it.kind === "field") startEdit(it.key, it.label);
-        else if (it.id === "save") saveSessions();
-        else if (it.id === "reconnect") doReconnect();
-        else startEdit("__password__", "接入密码");
+        else doReconnect();
       }
       return;
     }
     // ── 列表 ──
-    if (key.escape) { if (dirty) saveSessions(); onClose(); return; }
+    if (key.escape) { onClose(); return; }
     if (key.upArrow) { setIndex((i) => Math.max(0, i - 1)); return; }
     if (key.downArrow) { setIndex((i) => Math.min(rows.length - 1, i + 1)); return; }
     if (key.return && current) { setView("detail"); setSel(0); return; }
     if (input === "a" && sessions.length > 0) {
-      const next = sessions.map((s, si) => si === 0
+      persist(sessions.map((s, si) => si === 0
         ? { ...s, channels: [...(s.channels ?? []), { ...CHANNEL_TEMPLATE }] }
-        : s);
-      setSessions(next);
-      setDirty(true);
+        : s));
       setIndex(rows.length);
       return;
     }
     if (input === "d" && current?.cfg) {
       const { si, ci } = current.cfg;
-      const next = sessions.map((s, i) => i === si
-        ? { ...s, channels: (s.channels ?? []).filter((_, c) => c !== ci) } : s);
-      setSessions(next);
-      setDirty(true);
+      persist(sessions.map((s, i) => i === si
+        ? { ...s, channels: (s.channels ?? []).filter((_, c) => c !== ci) } : s));
       setIndex((i) => Math.max(0, Math.min(i, rows.length - 2)));
       return;
     }
-    if (input === "s" && dirty) saveSessions();
   }, { isActive: active });
 
   if (!active) return null;
+
+  const botName = current?.type === "qqbot" ? (current.health?.bot_name ?? "") : "";
 
   return (
     <Box flexDirection="column" borderStyle="round" borderColor="cyan" backgroundColor="#1c1e2b" paddingX={1}>
       <Text bold color="cyan" backgroundColor="#1c1e2b">
         📡 通道{view === "detail" && current
-          ? ` › ${typeLabel(current.type)}（${current.type}#${current.channel_id}）` : ""}
+          ? ` › ${typeLabel(current.type)}（${current.type}#${current.channel_id}）${botName ? ` 🤖 ${botName}` : ""}` : ""}
       </Text>
       {view === "list" && (
         <>
           <Text dimColor backgroundColor="#1c1e2b">
-            {dirty ? "● 有未保存修改（s 保存 / Esc 保存并返回）" : "各通道运行状态；Enter 进入配置"}
+            各通道运行状态；Enter 进入配置（修改即保存）
           </Text>
           {rows.length === 0 && (
             <Text color="yellow" backgroundColor="#1c1e2b">（无通道，按 a 新增）</Text>
@@ -333,6 +363,7 @@ export function ChannelsEditorScreen({
             const selected = i === index;
             const h = row.health;
             const info = TYPE_INFO[row.type];
+            const bot = row.type === "qqbot" && h?.bot_name ? ` · 🤖 ${h.bot_name}` : "";
             const st = h ? `${stateText(h)}${h.detail ? ` · ${h.detail}` : ""}` : "未运行";
             const line = `${selected ? "› " : "  "}● ${typeLabel(row.type).padEnd(8)} ${st}`;
             return (
@@ -344,23 +375,23 @@ export function ChannelsEditorScreen({
                 {(selected || !info) && (
                   <Text backgroundColor={selected ? "cyan" : "#1c1e2b"}
                         color={selected ? "black" : "gray"} dimColor={!selected} wrap="truncate">
-                    {`    ${row.type}#${row.channel_id}${info ? ` — ${info.desc}` : ""}`}
+                    {`    ${row.type}#${row.channel_id}${bot}${info ? ` — ${info.desc}` : ""}`}
                   </Text>
                 )}
               </Box>
             );
           })}
           <Text dimColor backgroundColor="#1c1e2b">
-            ↑↓ 选择 · Enter 配置 · a 新增(qqbot) · d 删除 · s 保存 · Esc 返回
+            ↑↓ 选择 · Enter 配置 · a 新增(qqbot) · d 删除 · Esc 返回
           </Text>
         </>
       )}
       {view === "detail" && current && (
         <>
           <Text backgroundColor="#1c1e2b" color={stateColor(current.health)}>
-            {`状态：${stateText(current.health)}${current.health?.detail ? ` — ${current.health.detail}` : ""}`}
+            {`状态：${stateText(current.health)}${current.health?.detail ? ` — ${current.health.detail}` : ""}${botName ? ` · 🤖 ${botName}` : ""}`}
           </Text>
-          <Text dimColor backgroundColor="#1c1e2b">─ 配置 ─</Text>
+          <Text dimColor backgroundColor="#1c1e2b">─ 配置（回车确认即保存）─</Text>
           {items.length === 0 && (
             <Text dimColor backgroundColor="#1c1e2b">
               {`  ${TYPE_INFO[current.type]?.desc ?? "内部通道"}（无需配置）`}
@@ -369,7 +400,7 @@ export function ChannelsEditorScreen({
           {items.map((it, i) => {
             const selected = i === sel;
             const body = it.kind === "field"
-              ? `${it.label}：${fmtVal(it.key, it.value)}`
+              ? `${it.label}：${it.display ?? fmtVal(it.key, it.value)}`
               : `⚡ ${it.label}`;
             return (
               <Text key={i} backgroundColor={selected ? "cyan" : "#1c1e2b"}
@@ -389,11 +420,12 @@ export function ChannelsEditorScreen({
             </Box>
           )}
           <Text dimColor backgroundColor="#1c1e2b">
-            {items[sel]?.kind === "action" ? (items[sel] as { hint?: string }).hint
-              : "Enter 编辑该字段"}
+            {busy ? "保存中…"
+              : items[sel]?.kind === "action" ? (items[sel] as { hint?: string }).hint
+              : "Enter 编辑该字段（回车确认即保存）"}
           </Text>
           <Text dimColor backgroundColor="#1c1e2b">
-            ↑↓ 选择 · Enter 编辑/执行{dirty ? " · s 保存" : ""} · Esc 返回列表
+            ↑↓ 选择 · Enter 编辑/执行 · Esc 返回列表
           </Text>
         </>
       )}

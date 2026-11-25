@@ -7,16 +7,19 @@ Core 只存字段，不做语义判断；"这次失败是配置还是外部、�
 from __future__ import annotations
 
 _CONFIG_PATTERNS = (
-    "apikey", "api key", "authentication", "unauthorized", "401",
+    "apikey", "api key", "api_key", "authentication", "unauthorized", "401",
     "invalid key", "invalid x-api-key", "forbidden", "permission",
     "insufficient", "quota", "billing", "payment", "402", "余额",
     "not found", "404", "model_not_found", "invalid_request", "400",
     "base_url", "endpoint", "no such model",
+    # Agent.providers.errors 生成的中文原因
+    "未配置 api key", "无效或无权限", "配额不足", "不存在", "请求被接口拒绝",
 )
 _EXTERNAL_PATTERNS = (
     "timeout", "timed out", "connection", "connecterror", "network",
     "dns", "proxy", "ssl", "tls", "unreachable", "reset by peer",
     "502", "503", "504", "overloaded", "rate limit", "429",
+    "连接超时", "无法连接", "请求过于频繁", "服务端出错",
 )
 
 

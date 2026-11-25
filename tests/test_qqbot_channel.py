@@ -293,6 +293,109 @@ check(last_two and 'msg_id' in last_two[-2] and 'msg_id' not in last_two[-1],
       '被动回复被拒 → 自动降级主动重发')
 ch_rp._loop.close()
 
+# ── 9. bot 名字（/users/@me）+ health 附加字段 ──────────────────────
+import os as _os
+
+class MeHTTP(FakeHTTP):
+    async def get(self, url, headers=None, **kw):
+        if url.endswith("/users/@me"):
+            self.gets.append((url, headers))
+            return FakeResponse({"id": "bot1", "username": "妃下"})
+        return await super().get(url, headers=headers, **kw)
+
+ch5 = QQBotChannel("qq5", {"app_id": "a5", "app_secret": "s5"})
+ch5.client._http = MeHTTP()
+ws5 = FakeWS([json.dumps({"op": 10, "d": {"heartbeat_interval": 41250}}),
+              json.dumps({"op": 0, "s": 1, "t": "READY", "d": {"session_id": "s5"}})])
+ch5._ws_factory = lambda url: ws5
+run(ch5._connect_once())
+check(ch5._bot_name == "妃下", "READY 后自动取 /users/@me 机器人名")
+h5 = ch5.health()
+check(h5["bot_name"] == "妃下" and h5["app_id"] == "a5"
+      and h5["has_secret"] is True and h5["state"] == "online",
+      "health 携带 bot_name/app_id/has_secret")
+
+# get_me 失败不阻断（返回 {}，名字留空）
+class BoomHTTP(FakeHTTP):
+    async def get(self, url, headers=None, **kw):
+        if url.endswith("/users/@me"):
+            raise RuntimeError("network down")
+        return await super().get(url, headers=headers, **kw)
+
+ch6 = QQBotChannel("qq6", {"app_id": "a", "app_secret": "s"})
+ch6.client._http = BoomHTTP()
+ws6 = FakeWS([json.dumps({"op": 10, "d": {"heartbeat_interval": 41250}}),
+              json.dumps({"op": 0, "s": 1, "t": "READY", "d": {"session_id": "s6"}})])
+ch6._ws_factory = lambda url: ws6
+run(ch6._connect_once())
+check(ch6._session_id == "s6" and ch6._bot_name == "",
+      "get_me 失败不阻断 READY（名字留空）")
+
+# ── 10. set_credentials：凭据热更新 ─────────────────────────────────
+_saved_env = {k: _os.environ.get(k) for k in ("QQBOT_APP_ID", "QQBOT_CLIENT_SECRET")}
+try:
+    # 运行中通道：换 client + 清 session + 关旧 ws 触发重握手 + 写回 .env
+    loop10 = asyncio.new_event_loop()
+    import threading as _th
+    t10 = _th.Thread(target=loop10.run_forever, daemon=True)
+    t10.start()
+
+    class WSClose:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    class AliveThread:
+        def is_alive(self):
+            return True
+
+    ch7 = QQBotChannel("qq7", {"app_id": "old_app", "app_secret": "old_sec"})
+    ch7._loop = loop10
+    ch7._thread = AliveThread()
+    ch7._ws = WSClose()
+    ch7._session_id = "sess_old"
+    written = []
+    ch7.set_env_writer(lambda k, v: written.append((k, v)))
+    ch7.set_credentials("new_app", "new_sec")
+    time.sleep(0.15)
+    check(ch7.app_id == "new_app" and ch7.app_secret == "new_sec"
+          and ch7.client.app_id == "new_app" and ch7._session_id is None
+          and ch7._bot_name == "",
+          "set_credentials 换 client + 清 session/名字")
+    check(ch7._ws.closed, "旧 ws 被关闭（触发新凭据重握手）")
+    check(("QQBOT_APP_ID", "new_app") in written
+          and ("QQBOT_CLIENT_SECRET", "new_sec") in written,
+          "凭据写回 .env（注入 writer）")
+    check(_os.environ.get("QQBOT_APP_ID") == "new_app"
+          and _os.environ.get("QQBOT_CLIENT_SECRET") == "new_sec",
+          "os.environ 同步更新")
+    loop10.call_soon_threadsafe(loop10.stop)
+    t10.join(timeout=2)
+
+    # secret 留空 = 保持不变；未启动通道 → 直接 start()
+    ch8 = QQBotChannel("qq8", {"app_id": "a8", "app_secret": "s8"})
+    started8 = []
+    ch8.start = lambda: started8.append(1)
+    ch8.set_credentials("a8_new", "")
+    check(ch8.app_id == "a8_new" and ch8.app_secret == "s8",
+          "secret 留空保持不变")
+    check(started8 == [1], "未启动通道更新凭据后直接 start()")
+
+    # 空 AppID 拒绝
+    try:
+        ch8.set_credentials("", "x")
+        check(False, "空 AppID 应抛 ValueError")
+    except ValueError:
+        check(True, "空 AppID 应抛 ValueError")
+finally:
+    for k, v in _saved_env.items():
+        if v is None:
+            _os.environ.pop(k, None)
+        else:
+            _os.environ[k] = v
+
 failed = [n for ok, n in results if not ok]
 print(f"\nRESULT: {'PASS' if not failed else 'FAIL'} ({len(results) - len(failed)}/{len(results)})")
 if failed:

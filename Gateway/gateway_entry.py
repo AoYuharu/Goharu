@@ -239,6 +239,14 @@ def dispatch(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     "result": (_manager.channel_set_password(cid, pw) if _manager
                                else {"ok": False, "error": "gateway not ready"}),
                     "id": req_id}
+        if method == "channels.set_qq_credentials":
+            cid = str(params.get("channel_id") or "")
+            return {"jsonrpc": "2.0",
+                    "result": (_manager.channel_set_qq_credentials(
+                        cid, str(params.get("app_id") or ""),
+                        str(params.get("app_secret") or "")) if _manager
+                        else {"ok": False, "error": "gateway not ready"}),
+                    "id": req_id}
         if method == "agent.send_message":
             message = params.get("message", "")
             session_id = params.get("session_id", "default")
@@ -766,7 +774,11 @@ class TuiRpcServer:
         global _bg_reader_running
         attached = False
         try:
-            conn.settimeout(300)
+            # 不设 recv 超时：本地 127.0.0.1 连接，TUI 空闲数分钟是常态。
+            # 曾经的 conn.settimeout(300) 会把"空闲"误判成"断开"——recv 抛
+            # socket.timeout（OSError 子类）被下面 except OSError 静默吞掉，
+            # 连接被悄悄掐断，proxy 变僵尸、TUI 报"crashed unexpectedly"。
+            # 对端真死（proxy 崩溃/被 taskkill）会发 FIN，recv 返回 b"" 即清理。
             buf = b""
             while True:
                 chunk = conn.recv(4096)
@@ -895,9 +907,9 @@ def _run_proxy_mode(port) -> int:
 
     # 必须先确认 attach 被接受（否则说明守护已被另一个 TUI 占用）
     import socket as _socket_mod
+    buf = b""
     try:
         sock.settimeout(5)
-        buf = b""
         while b"\n" not in buf:
             chunk = sock.recv(4096)
             if not chunk:
@@ -918,6 +930,7 @@ def _run_proxy_mode(port) -> int:
         return 2   # 另一个 TUI 已占用
 
     stop = threading.Event()
+    exit_reason = {"why": "gateway connection lost"}
     # 若首行缓冲里还有剩余字节（事件），交给 pump 前置输出
     _pending_first_chunk = buf.split(b"\n", 1)[1] if b"\n" in buf else b""
     if _pending_first_chunk:
@@ -941,30 +954,44 @@ def _run_proxy_mode(port) -> int:
         finally:
             stop.set()
 
+    def _pump_stdin_to_sock():
+        try:
+            for line in sys.stdin:
+                if stop.is_set():
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    sock.sendall((line + "\n").encode("utf-8"))
+                except OSError:
+                    break
+        except OSError:
+            pass
+        finally:
+            exit_reason["why"] = "TUI closed"
+            stop.set()
+
     threading.Thread(target=_pump_sock_to_stdout, daemon=True,
                      name="proxy-sock-reader").start()
+    threading.Thread(target=_pump_stdin_to_sock, daemon=True,
+                     name="proxy-stdin-reader").start()
 
+    # 任一方向断开即退出：守护断开（sock-reader 先停）立即退出，不傻等
+    # TUI 的 stdin（旧实现会让 proxy 变僵尸，直到 TUI 下次发请求才崩）；
+    # TUI 关闭（stdin EOF）→ 顺带通知守护收尾。
+    stop.wait()
+    if exit_reason["why"] == "TUI closed":
+        _sock_send({"jsonrpc": "2.0", "method": "tui.shutdown", "id": "bye"})
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
     try:
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            sock.sendall((line + "\n").encode("utf-8"))
-    except OSError:
-        pass
-
-    # stdin EOF = TUI 关闭 → 顺带关掉对接的守护
-    _sock_send({"jsonrpc": "2.0", "method": "tui.shutdown", "id": "bye"})
-    try:
-        sock.shutdown(socket.SHUT_WR)
-        deadline = time.time() + 5
-        while time.time() < deadline and not stop.is_set():
-            time.sleep(0.05)
-    except OSError:
-        pass
-    finally:
         sock.close()
-    logger.info("TUI proxy exit (gateway shut down)")
+    except OSError:
+        pass
+    logger.info("TUI proxy exit (%s)", exit_reason["why"])
     return 0
 
 

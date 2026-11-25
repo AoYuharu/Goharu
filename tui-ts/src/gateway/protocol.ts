@@ -77,8 +77,11 @@ export interface BrowserLlmSetResult extends BrowserLlmStatus {
 export interface ModelSetConfigResult {
   success: boolean;
   changed: string[];
-  /** success=false 时：失败分类与一句可读原因；切换已回滚，原模型继续生效 */
-  error_kind?: "auth" | "network" | "route" | "unknown";
+  /** success=false 时：失败分类与一句可读原因；切换已回滚，原模型继续生效。
+   *  kind 与 Gateway 侧 Agent.providers.errors 的归类一致 */
+  error_kind?:
+    | "missing_key" | "auth" | "quota" | "not_found" | "bad_request"
+    | "rate_limit" | "timeout" | "network" | "server" | "unknown";
   message?: string;
   fallback_model?: string;
 }
@@ -101,6 +104,9 @@ export interface ChannelHealthRow {
   state: string;
   detail: string;
   params?: Record<string, unknown>;
+  bot_name?: string;      // qqbot：/users/@me 的机器人名
+  app_id?: string;        // qqbot：当前 AppID（非密）
+  has_secret?: boolean;   // qqbot：是否已配置 AppSecret（密文不出网关）
 }
 
 export interface ChannelActionResult { ok: boolean; note?: string; error?: string }
@@ -127,6 +133,7 @@ export interface RpcMethods {
   "channels.health": { params: Record<string, never>; result: ChannelHealthRow[] };
   "channels.reconnect": { params: { channel_id: string }; result: ChannelActionResult };
   "channels.set_password": { params: { channel_id: string; password: string }; result: ChannelActionResult };
+  "channels.set_qq_credentials": { params: { channel_id: string; app_id: string; app_secret: string }; result: ChannelActionResult };
 }
 
 export type MethodName = keyof RpcMethods;
@@ -193,7 +200,7 @@ export interface CheckpointRollbackResult {
 
 export type GatewayEvent =
   | { type: "gateway.ready"; payload: Record<string, never> }
-  | { type: "gateway.init_error"; payload: { message: string } }
+  | { type: "gateway.init_error"; payload: { message: string; detail?: string } }
   | { type: "agent.ready"; payload: { tools?: unknown[] } }
   | { type: "agent.thinking"; payload: Record<string, never> }
   | { type: "agent.thinking_content"; payload: { step: number; thinking: string } }

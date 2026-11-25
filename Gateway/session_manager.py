@@ -261,6 +261,9 @@ class SessionManager:
                 )
                 session.attach_channel(ch)
                 ch.bind(session.enqueue)
+                # 凭据/密码写回 .env 的能力（qqbot set_credentials 等）
+                if hasattr(ch, "set_env_writer"):
+                    ch.set_env_writer(_write_env_var)
                 # AskUser 答案回送（channel 文本/按钮作答 → question_manager 放行工具线程）
                 from Tools.question_manager import question_manager
                 ch.bind_answer(
@@ -596,6 +599,23 @@ class SessionManager:
         if fut is None:
             return {"ok": False, "error": "channel 未启动（密码已记录，启动时生效）"}
         return {"ok": True, "note": "接入密码已更新并写回 .env，正在用新密码重连"}
+
+    def channel_set_qq_credentials(self, channel_id: str, app_id: str,
+                                   app_secret: str) -> dict:
+        """TUI 通道页「AppID/AppSecret」：写回 .env + 换凭据热重连（仅 qqbot）。"""
+        ch = self._find_channel(channel_id)
+        if ch is None:
+            return {"ok": False, "error": f"未找到 channel: {channel_id}"}
+        fn = getattr(ch, "set_credentials", None)
+        if fn is None:
+            return {"ok": False, "error": f"{ch.channel_type} 不支持凭据配置"}
+        try:
+            changed = fn(app_id, app_secret)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        if not changed:
+            return {"ok": True, "note": "凭据无变化"}
+        return {"ok": True, "note": "凭据已保存到 .env，正在用新凭据重连"}
 
     def _arch_floor_dispatch(self, question: str, reminder: str | None = None):
         """话语权=arch：把主人消息交给 Architect 派发链（worker 线程调用，可阻塞）。"""

@@ -93,6 +93,7 @@ try:
     degraded = False
     if resp is None and init_err and (
         "provider auto-detection" in init_err or "api key" in init_err.lower()
+        or "模型服务不可用" in init_err
     ):
         # 环境降级：facade 装配已走到 create_agent（Memory/Tools/MCP/Pipeline
         # 全部就绪），仅因本机 API key 失效（401）停在 LLMCore 构造——
