@@ -38,6 +38,11 @@ IS_WIN = os.name == "nt"
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 PIP_MIRROR = os.environ.get("PIP_MIRROR", "https://pypi.tuna.tsinghua.edu.cn/simple")
 
+def _install_draft_path() -> str:
+    return os.environ.get("GOHARU_INSTALL_DRAFT") or os.path.join(
+        os.path.expanduser("~"), ".goharu", "install_draft.json")
+
+
 
 def _load_error_rules():
     """按文件路径加载纯标准库的 Agent/providers/errors.py。
@@ -771,12 +776,14 @@ def _form_tty_loop(sections: list[dict], values: dict, on_verify) -> dict:
             if res == "confirm":
                 done, edit = edit, None
                 _apply_edit(done, values)
+                _save_install_draft(values)
                 if done.item["key"] == "api_key" and values["api_key"]:
                     msg = _run_verify(values, on_verify, draw)
             elif res == "cancel":
                 edit, msg = None, None
             continue
         if k == "ctrl-c":
+            _save_install_draft(values)
             print()
             raise SystemExit(130)
         msg = None   # 导航 / 操作键：清掉上一条提示
@@ -792,10 +799,12 @@ def _form_tty_loop(sections: list[dict], values: dict, on_verify) -> dict:
             item = vis[item_i]
             if item["type"] == "action":
                 if item["key"] == "__quit":
+                    _save_install_draft(values)
                     print()
                     raise SystemExit(0)
                 ok, msg, jump = _gate(values, on_verify, draw)
                 if ok:
+                    _save_install_draft(values)
                     print()
                     return values
                 sec_i, item_i = jump
@@ -806,6 +815,7 @@ def _form_tty_loop(sections: list[dict], values: dict, on_verify) -> dict:
             else:
                 cur = values.get(item["key"]) or ""
                 edit = _Edit(item, "" if item["type"] == "secret" else str(cur))
+        _save_install_draft(values)
 
 
 def _form_fallback(sections: list[dict], values: dict, on_verify) -> dict:
@@ -823,6 +833,7 @@ def _form_fallback(sections: list[dict], values: dict, on_verify) -> dict:
             if "show_if" in item and not item["show_if"](values):
                 continue
             _edit_item(item, values)
+            _save_install_draft(values)
             shown = "".join(text for text, _ in _fmt_value(item, values))
             print(f"      → {item['label']}: {shown}")
     flat = [it for s in sections for it in s["items"] if it["type"] in ("str", "secret")]
@@ -833,12 +844,14 @@ def _form_fallback(sections: list[dict], values: dict, on_verify) -> dict:
         else:
             ok, _kind, _status, text = on_verify(_provider_from_form(values), values.get("proxy", ""))
             if ok:
+                _save_install_draft(values)
                 return values
             err("API Key 验证失败：" + text.replace("\n", " "))
         if attempt == 3:
             break
         key = "api_key" if not missing else ("model" if missing == "模型名" else "base_url")
         _edit_item(next(it for it in flat if it["key"] == key), values)
+        _save_install_draft(values)
     err("API Key 连续 3 次未通过验证，安装中止")
     raise SystemExit(1)
 
@@ -1023,8 +1036,48 @@ def _write_bootstrap_exploration(text: str, value: str) -> tuple[str, bool]:
     return result, result != text
 
 
-def _load_existing(values: dict) -> None:
-    """重跑向导：带回上次安装的厂商 / 模型 / 密钥，不必重新粘贴（仍会重新联网验证）。"""
+def _save_install_draft(values: dict) -> None:
+    """保存未完成的表单；退出/崩溃后重跑可继续。文件仅当前用户可读。"""
+    path = _install_draft_path()
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        data = {key: values.get(key) for key in _default_values()}
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except Exception as e:
+        warn(f"安装草稿保存失败: {e}")
+
+
+def _load_install_draft(values: dict) -> bool:
+    path = _install_draft_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    for key in _default_values():
+        if key in data:
+            values[key] = data[key]
+    return True
+
+
+def _clear_install_draft() -> None:
+    try:
+        os.remove(_install_draft_path())
+    except OSError:
+        pass
+
+
+def _load_existing(values: dict) -> bool:
+    """重跑向导：带回已装配置，再覆盖上次未完成的表单草稿。"""
     cfg = _read_model_block()
     if cfg.get("model") or cfg.get("base_url"):
         values["provider"] = len(PROVIDERS) - 1   # 对不上预置厂商就是自定义
@@ -1040,6 +1093,7 @@ def _load_existing(values: dict) -> None:
     if os.path.exists(cfg_path):
         with open(cfg_path, encoding="utf-8") as f:
             values["initial_exploration"] = _read_bootstrap_exploration(f.read())
+    return _load_install_draft(values)
 
 
 def _channels_from_form(values: dict) -> dict:
@@ -1260,6 +1314,19 @@ WantedBy=default.target
     return True
 
 
+def _posix_launcher_content(repo: str, venv_py: str) -> str:
+    return (
+        "#!/usr/bin/env bash\n"
+        "# Goharu 全局启动器（install.py 生成）\n"
+        f'GOHARU_HOME="{repo}"\n'
+        'cd "$GOHARU_HOME" || exit 1\n'
+        # gateway 子进程要用 venv python（带依赖），否则落到系统 python3 崩在 import
+        f'export PYTHON="{venv_py}"\n'
+        'set -a; [ -f "$GOHARU_HOME/.env" ] && . "$GOHARU_HOME/.env"; set +a\n'
+        f'exec "{venv_py}" "$GOHARU_HOME/goharu_cli.py" "$@"\n'
+    )
+
+
 def step_register_command() -> bool:
     """注册全局 `goharu` 命令到 PATH，装完任意目录敲 `goharu` 即启动（无需再跑 start 脚本）。"""
     title("注册全局命令 goharu")
@@ -1307,16 +1374,7 @@ def step_register_command() -> bool:
     os.makedirs(bin_dir, exist_ok=True)
     launcher = os.path.join(bin_dir, "goharu")
     venv_py = os.path.join(repo, "venv", "bin", "python")
-    content = (
-        "#!/usr/bin/env bash\n"
-        "# Goharu 全局启动器（install.py 生成）\n"
-        f'GOHARU_HOME="{repo}\n'
-        'cd "$GOHARU_HOME" || exit 1\n'
-        # gateway 子进程要用 venv python（带依赖），否则落到系统 python3 崩在 import
-        f'export PYTHON="{venv_py}"\n'
-        'set -a; [ -f "$GOHARU_HOME/.env" ] && . "$GOHARU_HOME/.env"; set +a\n'
-        f'exec "{venv_py}" "$GOHARU_HOME/goharu_cli.py" "$@"\n'
-    )
+    content = _posix_launcher_content(repo, venv_py)
     with open(launcher, "w", encoding="utf-8", newline="\n") as f:
         f.write(content)
     os.chmod(launcher, 0o755)
@@ -1421,7 +1479,9 @@ def main() -> int:
     # ── 多栏配置表单（←→ 切栏 / ↑↓ 选条目 / Enter 编辑；API Key 必填且联网验证；非 TTY 顺序问答）──
     sections = _form_sections()
     values = _default_values()
-    _load_existing(values)
+    draft_loaded = _load_existing(values)
+    if draft_loaded:
+        info("已恢复上次未完成的安装内容（密钥仅保存在本机安装草稿）")
     if _is_tty():
         print()
         print(c("dim", "  下方为配置表单：←→ 切换栏，↑↓ 选择条目，Enter 编辑；到「执行」栏开始安装"))
@@ -1446,6 +1506,7 @@ def main() -> int:
     if with_systemd:
         step_setup_systemd()
     step_register_command()
+    _clear_install_draft()
 
     title("安装完成")
     if IS_WIN:

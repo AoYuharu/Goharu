@@ -11,6 +11,7 @@ import contextlib
 import io
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -407,6 +408,7 @@ def test_verify_provider():
 # ---------------------------------------------------------------------------
 def test_load_existing():
     print("\n[6] 重跑带回已装配置")
+    W._clear_install_draft()
     tmp = tempfile.mkdtemp()
     old = W.REPO_DIR
     W.REPO_DIR = tmp
@@ -538,7 +540,70 @@ def test_fallback():
     del out
 
 
-def main():
+def test_install_draft_and_launcher():
+    print("\n[9] 安装草稿恢复与启动器")
+    tmp = tempfile.mkdtemp()
+    old_repo = W.REPO_DIR
+    old_draft = os.environ.get("GOHARU_INSTALL_DRAFT")
+    draft = os.path.join(tmp, "draft.json")
+    W.REPO_DIR = tmp
+    os.environ["GOHARU_INSTALL_DRAFT"] = draft
+    try:
+        values = W._default_values()
+        values.update({
+            "embedding": True, "api_key": "sk-draft", "qq": True,
+            "qq_app_id": "app-id", "qq_secret": "qq-secret",
+            "harunet": True, "harunet_name": "draft-bot",
+            "initial_exploration": "检查摄像头",
+        })
+        W._save_install_draft(values)
+        check("草稿文件已写入", os.path.exists(draft))
+        if os.name != "nt":
+            check("草稿仅用户可读", os.stat(draft).st_mode & 0o777 == 0o600)
+        restored = W._default_values()
+        check("重跑可恢复草稿", W._load_existing(restored)
+              and restored["api_key"] == "sk-draft"
+              and restored["qq_app_id"] == "app-id"
+              and restored["harunet_name"] == "draft-bot",
+              restored)
+        W._clear_install_draft()
+        check("安装成功后草稿可清除", not os.path.exists(draft))
+
+        set_size(80, 24)
+        old_read = W._read_key
+        queue = list(["down", "enter"] + chars("draft-key") + ["enter", "ctrl-c"])
+        W._read_key = lambda: queue.pop(0)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.suppress(SystemExit):
+                W._form_tty(W._form_sections(), W._default_values(),
+                            on_verify=lambda _p, _proxy: (True, "ok", 200, ""))
+        finally:
+            W._read_key = old_read
+        check("Ctrl+C 退出后仍保留已填内容",
+              os.path.exists(draft) and W._load_install_draft(
+                  probe := W._default_values()) and probe["api_key"] == "draft-key")
+
+        content = W._posix_launcher_content("/tmp/Goharu test", "/tmp/venv/bin/python")
+        check("启动器路径变量引号闭合",
+              'GOHARU_HOME="/tmp/Goharu test"' in content)
+        bash = shutil.which("bash")
+        if bash:
+            launcher = os.path.join(tmp, "goharu")
+            with open(launcher, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+            parsed = subprocess.run([bash, "-n", launcher], capture_output=True,
+                                    text=True, encoding="utf-8", errors="replace")
+            check("启动器通过 bash 语法检查", parsed.returncode == 0, parsed.stderr)
+    finally:
+        W.REPO_DIR = old_repo
+        if old_draft is None:
+            os.environ.pop("GOHARU_INSTALL_DRAFT", None)
+        else:
+            os.environ["GOHARU_INSTALL_DRAFT"] = old_draft
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _run_all():
     print("=" * 60)
     print("安装向导离线测试")
     print("=" * 60)
@@ -550,10 +615,26 @@ def main():
     test_load_existing()
     test_bootstrap_exploration_config()
     test_fallback()
+    test_install_draft_and_launcher()
     print("\n" + "=" * 60)
     print(f"结果: {passed} passed, {failed} failed")
     print("=" * 60)
-    sys.exit(1 if failed else 0)
+    return 1 if failed else 0
+
+
+def main():
+    tmp = tempfile.mkdtemp(prefix="goharu_draft_test_")
+    old = os.environ.get("GOHARU_INSTALL_DRAFT")
+    os.environ["GOHARU_INSTALL_DRAFT"] = os.path.join(tmp, "draft.json")
+    try:
+        rc = _run_all()
+    finally:
+        if old is None:
+            os.environ.pop("GOHARU_INSTALL_DRAFT", None)
+        else:
+            os.environ["GOHARU_INSTALL_DRAFT"] = old
+        shutil.rmtree(tmp, ignore_errors=True)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

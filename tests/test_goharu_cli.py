@@ -124,6 +124,13 @@ def test_find_and_stop(cli):
         seen = cli._stop_processes(dry_run=True)
         check("dry-run 返回目标且不杀", {d1.pid, d2.pid} <= {p for p, _ in seen}
               and alive(d1.pid) and alive(d2.pid))
+        # 实杀前检查扫描结果里有没有"计划外"进程：_stop_processes 按命令行模式
+        # 匹配，无法区分诱饵与真实守护/TUI——2026-11-25 事故：本测试把正在服务
+        # 的生产守护一并 RPC 关停，QQBot 掉线。有真实进程在跑就跳过实杀。
+        extras = pids - {d1.pid, d2.pid, os.getpid(), os.getppid()}
+        if extras:
+            print(f"    [skip] 检测到真实网关/TUI 进程 {sorted(extras)}，跳过实杀（避免误杀）")
+            return
         cli._stop_processes(dry_run=False)
         # Windows：Popen 句柄未关时 os.kill(pid,0) 对已退出进程也可能成功，用 poll 判定
         check("stop-only 后两个目标都消失", d1.poll() is not None and d2.poll() is not None,
@@ -306,13 +313,123 @@ def test_mcp_http_tuple_compat():
 
 
 # ────────────────────────────────────────────────────────────────────
-# 6. 集成：真实守护
+# 6. upgrade 版本比对与升级
 # ────────────────────────────────────────────────────────────────────
+def test_upgrade(cli):
+    print("\n[7] upgrade 比对、快进与依赖重建")
+    old = (cli._git, cli._alive, cli.gateway_stop, cli.gateway_start,
+           cli._run_upgrade_command)
+    state = {
+        "local": "a" * 40, "remote": "b" * 40, "behind": "2", "ahead": "0",
+        "dirty": "", "merge_rc": 0,
+        "commit": "b" * 12 + " feat: latest"}
+    calls, stopped, started, steps = [], [], [], []
+
+    def result(stdout="", rc=0):
+        return types.SimpleNamespace(returncode=rc, stdout=stdout, stderr="")
+
+    def git(*args, **_kwargs):
+        key = " ".join(args)
+        calls.append(key)
+        if key.startswith("fetch"):
+            return result()
+        if key == "rev-parse HEAD":
+            return result(state["local"])
+        if key.startswith("rev-parse origin/master"):
+            return result(state["remote"])
+        if key.startswith("rev-list --count") and f"{state['local']}.." in key:
+            return result(state["behind"])
+        if key.startswith("rev-list --count"):
+            return result(state["ahead"])
+        if key.startswith("log "):
+            return result(state["commit"])
+        if key.startswith("status "):
+            return result(state["dirty"])
+        if key.startswith("merge "):
+            return result(rc=state["merge_rc"])
+        if key.startswith("diff --name-only"):
+            return result("requirements.txt\ntui-ts/src/components/App.tsx")
+        return result()
+
+    try:
+        cli._git = git
+        cli._alive = lambda: False
+        cli.gateway_stop = lambda: stopped.append(True) or True
+        cli.gateway_start = lambda: started.append(True) or True
+        cli._run_upgrade_command = lambda command, cwd, label: (
+            steps.append((command, cwd, label)) or True)
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cli.upgrade(["--check"])
+        text = out.getvalue()
+        check("--check 发现 2 个新提交", rc == 0 and "2 个新提交" in text, text)
+        check("--check 不 merge", not any(c.startswith("merge ") for c in calls))
+
+        state["local"] = state["remote"]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cli.upgrade([])
+        check("同 SHA 判定最新", rc == 0 and "已是最新版本" in out.getvalue())
+
+        state["local"] = "a" * 40
+        calls.clear()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cli.upgrade([])
+        check("默认快进升级", rc == 0 and any(c.startswith("merge --ff-only") for c in calls),
+              out.getvalue())
+        check("需求变更触发 Python 依赖", any(label == "Python 依赖" for _, _, label in steps))
+        check("TUI 源码变更触发构建", any(label == "TUI 构建" for _, _, label in steps))
+        check("TUI 源码变更不重复 npm install",
+              not any(label == "TUI 依赖" for _, _, label in steps))
+
+        state["dirty"] = " M local.py\n"
+        calls.clear()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cli.upgrade([])
+        check("未提交改动拒绝升级", rc == 1 and "未提交改动" in out.getvalue()
+              and not any(c.startswith("merge ") for c in calls))
+
+        cmds = cli._upgrade_commands(["tui-ts/package-lock.json"])
+        labels = [label for _, _, label in cmds]
+        check("lockfile 变更触发 npm install", "TUI 依赖" in labels)
+    finally:
+        (cli._git, cli._alive, cli.gateway_stop, cli.gateway_start,
+         cli._run_upgrade_command) = old
+
+
+# ────────────────────────────────────────────────────────────────────
+# 7. 集成：真实守护
+# ────────────────────────────────────────────────────────────────────
+def _ping_with_retry(cli, tries=3, gap=2.0):
+    """入口探活带重试：单次 ping 假阴性（守护忙、瞬时超时）会让测试误判
+    "无守护"→ gateway_start 收养用户守护 → teardown 把它停掉（2026-11-25 事故）。"""
+    for i in range(tries):
+        r = cli._ping()
+        if r and r.get("ok"):
+            return r
+        if i < tries - 1:
+            time.sleep(gap)
+    return None
+
+
+def _own_daemon_pid(cli, pre_pid):
+    """当前监听的守护 pid，仅当它不是启动前就存在的那个（即确属本次测试拉起）。"""
+    r = cli._ping()
+    pid = (r or {}).get("pid")
+    if pid is not None and pid != pre_pid:
+        return pid
+    return None
+
+
 def test_integration(cli):
-    print("\n[7] 集成：真实守护 start / status×3 / health / log / stop")
-    if cli._alive():
+    print("\n[8] 集成：真实守护 start / status×3 / health / log / stop")
+    if _ping_with_retry(cli):
         print("    [skip] 已有网关在运行，跳过集成（避免干扰）")
         return
+    pre_pid = cli._read_pid()
     # 在 Claude Code / 其他工具里跑测试时，宿主注入的 ANTHROPIC_* 会覆盖 .env
     # 的厂商密钥（dotenv 不覆盖已存在的环境变量）→ 守护初始化 401。临时摘除。
     saved = {k: os.environ.pop(k) for k in list(os.environ)
@@ -325,7 +442,8 @@ def test_integration(cli):
         os.environ.update(saved)
     if not started:
         print(f"    [skip] 本机网关初始化失败（LLM/MCP 环境），跳过集成：{buf.getvalue()[-200:]}")
-        cli.gateway_stop()
+        if _own_daemon_pid(cli, pre_pid):
+            cli.gateway_stop()
         return
     check("gateway start → 探活 ok", cli._alive())
     for i in range(3):
@@ -348,6 +466,11 @@ def test_integration(cli):
                    capture_output=True, timeout=30)
     time.sleep(1.0)
     check("CLI 进程退出后守护仍活", cli._alive())
+    if _own_daemon_pid(cli, pre_pid) is None:
+        # gateway_start 收养了启动前就存在的守护（入口探活假阴性）——只读检查
+        # 已完成，stop 会误杀别人的守护，必须跳过。
+        print("    [skip] 守护非本次测试拉起（pid 与启动前一致），跳过 stop 测试")
+        return
     with redirect_stdout(buf):
         stopped = cli.gateway_stop()
     check("gateway stop → 未运行", stopped and not cli._alive() and not os.path.exists(cli.PIDFILE))
@@ -366,6 +489,7 @@ def main():
     test_uninstall_fake_repo()
     test_rpc_serialization_guard()
     test_mcp_http_tuple_compat()
+    test_upgrade(cli)
     test_integration(cli)
     print("\n" + "=" * 60)
     print(f"结果: {passed} 通过, {failed} 失败")

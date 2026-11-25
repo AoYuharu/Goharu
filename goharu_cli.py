@@ -9,6 +9,7 @@
   goharu gateway restart      停 + 起
   goharu gateway status       探活，打印 pid / 是否守护 / sessions
   goharu gateway log [N]      看守护日志末尾 N 行（默认 40）
+  goharu upgrade [--check]    比对 GitHub master；默认快进升级，--check 只检查
   goharu uninstall [选项]     卸载：停服务 + 杀 gateway/TUI（含目录已删的幽灵守护）
                               + 删 venv/node_modules/dist/数据/.env + 全局命令
                               --keep-data 保留 runtime_memory/ 与 models/
@@ -38,6 +39,9 @@ PIDFILE = os.path.join(RUNTIME, "gateway.pid")
 LOGFILE = os.path.join(RUNTIME, "logs", "gateway_daemon.log")
 GATEWAY = os.path.join(REPO, "Gateway", "gateway_entry.py")
 DEFAULT_PORT = 8791
+UPGRADE_REMOTE = os.environ.get("GOHARU_UPGRADE_REMOTE", "origin")
+UPGRADE_BRANCH = os.environ.get("GOHARU_UPGRADE_BRANCH", "master")
+PIP_MIRROR = os.environ.get("PIP_MIRROR", "https://pypi.tuna.tsinghua.edu.cn/simple")
 
 
 def _python() -> str:
@@ -205,6 +209,125 @@ def gateway_log(n: int = 40) -> int:
     lines = open(LOGFILE, encoding="utf-8", errors="replace").read().splitlines()
     for ln in lines[-n:]:
         print(ln)
+    return 0
+
+
+def _git(*args, timeout: int = 120):
+    return subprocess.run(
+        ["git", "-C", REPO, *args], capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=timeout,
+    )
+
+
+def _git_text(*args) -> str | None:
+    p = _git(*args)
+    return p.stdout.strip() if p.returncode == 0 else None
+
+
+def _upgrade_commands(changed: list[str]) -> list[tuple[list[str], str, str]]:
+    """按变更文件决定升级后需要重建的依赖。"""
+    cmds: list[tuple[list[str], str, str]] = []
+    names = {p.replace("\\", "/") for p in changed}
+    if "requirements.txt" in names:
+        cmds.append(([_python(), "-m", "pip", "install", "-r", "requirements.txt",
+                      "-i", PIP_MIRROR], REPO, "Python 依赖"))
+    if {"tui-ts/package.json", "tui-ts/package-lock.json"} & names:
+        cmds.append((["npm", "install"], os.path.join(REPO, "tui-ts"), "TUI 依赖"))
+    if any(name.startswith("tui-ts/") for name in names):
+        cmds.append((["npm", "run", "build"], os.path.join(REPO, "tui-ts"), "TUI 构建"))
+    return cmds
+
+
+def _run_upgrade_command(cmd: list[str], cwd: str, label: str) -> bool:
+    print(f"[+] {label}: {' '.join(cmd)}")
+    try:
+        return subprocess.run(cmd, cwd=cwd).returncode == 0
+    except OSError as e:
+        print(f"[x] {label}启动失败: {e}")
+        return False
+
+
+def upgrade(argv: list[str]) -> int:
+    check_only = "--check" in argv
+    for arg in argv:
+        if arg in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        if arg not in ("--check", "--yes"):
+            print(f"未知参数: {arg}")
+            return 2
+    if not os.path.isdir(os.path.join(REPO, ".git")) or not shutil.which("git"):
+        print("[x] 当前目录不是可升级的 Git 仓库")
+        return 1
+
+    print(f"[+] 检查 {UPGRADE_REMOTE}/{UPGRADE_BRANCH}…")
+    fetched = _git("fetch", "--quiet", UPGRADE_REMOTE, UPGRADE_BRANCH)
+    if fetched.returncode != 0:
+        print(f"[x] 拉取 GitHub 失败: {(fetched.stderr or fetched.stdout).strip()[:500]}")
+        return 1
+    local = _git_text("rev-parse", "HEAD")
+    remote = _git_text("rev-parse", f"{UPGRADE_REMOTE}/{UPGRADE_BRANCH}")
+    if not local or not remote:
+        print("[x] 无法读取本地或远端版本")
+        return 1
+    print(f"    本地: {local[:12]}")
+    print(f"    最新: {remote[:12]}")
+    if local == remote:
+        print("[+] 已是最新版本")
+        return 0
+    behind_s = _git_text("rev-list", "--count", f"{local}..{remote}")
+    ahead_s = _git_text("rev-list", "--count", f"{remote}..{local}")
+    try:
+        behind, ahead = int(behind_s or "0"), int(ahead_s or "0")
+    except ValueError:
+        print("[x] 无法比较版本")
+        return 1
+    if behind == 0:
+        print(f"[+] 本地领先远程 {ahead} 个提交，无需升级")
+        return 0
+    print(f"[+] 发现 {behind} 个新提交：")
+    commits = _git_text("log", "--oneline", "--no-decorate", f"{local}..{remote}") or ""
+    for line in commits.splitlines()[:20]:
+        print(f"    {line}")
+    if check_only:
+        print("[+] --check：仅检查，未升级")
+        return 0
+    if ahead:
+        print(f"[x] 本地与远程已分叉（本地领先 {ahead}），拒绝自动升级")
+        return 1
+    dirty = _git("status", "--porcelain", "--untracked-files=no")
+    if dirty.returncode == 0 and dirty.stdout.strip():
+        print("[x] 仓库有未提交改动，拒绝覆盖；请先提交或备份后重试")
+        return 1
+
+    was_alive = _alive()
+    if was_alive:
+        gateway_stop()
+    merged = _git("merge", "--ff-only", remote)
+    if merged.returncode != 0:
+        print(f"[x] 快进失败: {(merged.stderr or merged.stdout).strip()[:500]}")
+        if was_alive:
+            gateway_start()
+        return 1
+    changed = [
+        line for line in (_git_text("diff", "--name-only", local, remote) or "").splitlines()
+        if line.strip()
+    ]
+    for cmd, cwd, label in _upgrade_commands(changed):
+        if not _run_upgrade_command(cmd, cwd, label):
+            print(f"[x] {label}失败；代码已更新，可重跑 `goharu upgrade --check` 或安装向导")
+            if was_alive:
+                gateway_start()
+            return 1
+    new_head = _git_text("rev-parse", "HEAD") or remote
+    print(f"[+] 已升级到 {new_head[:12]}")
+    if was_alive:
+        if gateway_start():
+            print("[+] 网关已用新版本重启")
+        else:
+            print("[!] 网关重启失败，请运行 `goharu gateway start` 查看日志")
+    else:
+        print("[+] 运行 `goharu` 启动新版")
     return 0
 
 
@@ -554,6 +677,13 @@ def uninstall(argv: list[str]) -> int:
 
 
 def main() -> int:
+    # Windows 默认 GBK 控制台：print 中文/符号（✓✗）会 UnicodeEncodeError。
+    # 统一 reconfigure 成 utf-8（errors=replace 兜底），保证任何终端都能输出。
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            getattr(_s, "reconfigure")(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     args = sys.argv[1:]
     if not args or args[0] == "tui":
         return tui()
@@ -573,6 +703,8 @@ def main() -> int:
             return gateway_log(n)
         print(f"未知 gateway 子命令: {sub}（可用 start/stop/restart/status/log）")
         return 2
+    if args[0] == "upgrade":
+        return upgrade(args[1:])
     if args[0] == "uninstall":
         return uninstall(args[1:])
     print(__doc__)
