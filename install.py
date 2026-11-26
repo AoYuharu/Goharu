@@ -72,6 +72,7 @@ PROVIDERS = [
     {
         "label": "DeepSeek",
         "model": "deepseek-flash",
+        "models": ["deepseek-flash", "deepseek-v4-pro", "deepseek-chat"],
         "base_url": "https://api.deepseek.com/anthropic",
         "env": "ZHIPU_API_KEY",
         "hint": "国内直连，便宜快速",
@@ -79,6 +80,7 @@ PROVIDERS = [
     {
         "label": "Kimi",
         "model": "kimi-k3",
+        "models": ["kimi-k3", "kimi-k3.1-pro", "kimi-k2"],
         "base_url": "https://api.kimi.com/coding/",
         "env": "ZHIPU_API_KEY",
         "hint": "Moonshot coding 端点",
@@ -86,6 +88,7 @@ PROVIDERS = [
     {
         "label": "智谱 GLM",
         "model": "glm-5.3-Flash",
+        "models": ["glm-5.3-Flash", "glm-4.6", "glm-4.5"],
         "base_url": "https://open.bigmodel.cn/api/anthropic",
         "env": "ZHIPU_API_KEY",
         "hint": "智谱 Anthropic 兼容端点",
@@ -93,6 +96,7 @@ PROVIDERS = [
     {
         "label": "MiniMax",
         "model": "MiniMax-M2.7",
+        "models": ["MiniMax-M2.7", "MiniMax-M2"],
         "base_url": "https://api.minimaxi.com/anthropic",
         "env": "ANTHROPIC_API_KEY",
         "hint": "MiniMax 官方 Anthropic 兼容端点",
@@ -100,6 +104,7 @@ PROVIDERS = [
     {
         "label": "自定义",
         "model": "",
+        "models": [],
         "base_url": "",
         "env": "ANTHROPIC_API_KEY",
         "hint": "自行填写 base_url 与模型名",
@@ -416,7 +421,7 @@ def _mask_secret(secret: str) -> str:
 
 def _default_values() -> dict:
     return {
-        "provider": 0, "api_key": "", "model": "", "base_url": "",
+        "provider": 0, "api_key": "", "model": 0, "model_manual": "", "base_url": "",
         "embedding": False,
         "systemd": False,
         "qq": False, "qq_app_id": "", "qq_secret": "",
@@ -425,6 +430,25 @@ def _default_values() -> dict:
         "proxy": "",
         "initial_exploration": "",
     }
+
+
+# ── 模型选择（预置模型列表 + 手动输入）─────────────────────────────────
+def _model_options(values: dict) -> list[str]:
+    return (PROVIDERS[int(values["provider"])].get("models") or []) + ["✎ 手动输入…"]
+
+
+def _choice_idx(values: dict, key: str, n: int) -> int:
+    """choice 值 → 合法索引；脏数据/旧草稿（字符串）/越界一律归 0。"""
+    try:
+        i = int(values.get(key, 0))
+    except (TypeError, ValueError):
+        return 0
+    return i if 0 <= i < n else 0
+
+
+def _model_is_manual(values: dict) -> bool:
+    p = PROVIDERS[int(values["provider"])]
+    return _choice_idx(values, "model", len(_model_options(values))) >= len(p.get("models") or [])
 
 
 def _form_sections() -> list[dict]:
@@ -437,9 +461,12 @@ def _form_sections() -> list[dict]:
             {"key": "api_key", "label": "API Key", "type": "secret",
              "hint": "必填：粘贴密钥（输入不可见），确认后自动联网验证；不通过则不能开始安装",
              "suffix": _check_segs},
-            {"key": "model", "label": "模型名", "type": "str",
-             "placeholder": "（自定义厂商时填写）", "hint": "Enter 输入模型名",
-             "show_if": lambda v: v["provider"] == len(PROVIDERS) - 1},
+            {"key": "model", "label": "模型名", "type": "choice",
+             "options": _model_options, "hint": "Enter 循环切换预置模型；选「手动输入」可自填",
+             "show_if": lambda v: v["provider"] != len(PROVIDERS) - 1},
+            {"key": "model_manual", "label": "自定义模型名", "type": "str",
+             "placeholder": "（输入完整模型名）", "hint": "Enter 输入模型名",
+             "show_if": lambda v: v["provider"] == len(PROVIDERS) - 1 or _model_is_manual(v)},
             {"key": "base_url", "label": "API 地址", "type": "str",
              "placeholder": "（自定义厂商时填写）", "hint": "Enter 输入 base_url",
              "show_if": lambda v: v["provider"] == len(PROVIDERS) - 1},
@@ -498,7 +525,8 @@ def _fmt_value(item: dict, values: dict) -> list[Seg]:
     if t == "bool":
         return [("是", "green")] if v else [("否", "dim")]
     if t == "choice":
-        return [(item["options"][int(v)], "bold")]
+        opts = item["options"](values) if callable(item["options"]) else item["options"]
+        return [(opts[_choice_idx(values, item["key"], len(opts))], "bold")]
     if t == "secret":
         return [(_mask_secret(v), "green")] if v else [("（未设置）", "dim")]
     if t == "action":
@@ -658,7 +686,8 @@ def _edit_item(item: dict, values: dict) -> None:
     if t == "bool":
         values[k] = confirm(item["label"], default=bool(cur))
     elif t == "choice":
-        values[k] = choose(item["label"], item["options"], default=int(cur))
+        opts = item["options"](values) if callable(item["options"]) else item["options"]
+        values[k] = choose(item["label"], opts, default=_choice_idx(values, k, len(opts)))
     elif t == "secret":
         nv = ask_secret(f"{item['label']}（回车保持不变；输入 - 清空）")
         if nv == "-":
@@ -671,18 +700,19 @@ def _edit_item(item: dict, values: dict) -> None:
 
 
 def _check_sig(values: dict) -> tuple:
-    """决定「这次验证还算不算数」的全部输入：厂商 / 密钥 / 自定义模型与地址 / 代理。"""
-    return (values["provider"], values["api_key"], values["model"], values["base_url"],
-            values.get("proxy", ""))
+    """决定「这次验证还算不算数」的全部输入：厂商 / 密钥 / 模型 / 自定义地址 / 代理。"""
+    return (values["provider"], values["api_key"], values["model"],
+            values.get("model_manual", ""), values["base_url"], values.get("proxy", ""))
 
 
 def _missing_field(values: dict) -> str:
-    """自定义厂商必须手填的两项：缺哪个返回哪个的名字；其余情况返回空串。"""
-    if int(values["provider"]) != len(PROVIDERS) - 1:
-        return ""
-    if not values["model"]:
+    """自定义厂商或选了「手动输入」时模型名必填；自定义厂商还须填 API 地址。"""
+    custom = int(values["provider"]) == len(PROVIDERS) - 1
+    if (custom or _model_is_manual(values)) and not values.get("model_manual"):
         return "模型名"
-    return "" if values["base_url"] else "API 地址"
+    if custom and not values["base_url"]:
+        return "API 地址"
+    return ""
 
 
 def _api_ready(values: dict) -> bool:
@@ -817,7 +847,8 @@ def _form_tty_loop(sections: list[dict], values: dict, on_verify) -> dict:
             elif item["type"] == "bool":
                 values[item["key"]] = not values.get(item["key"], item.get("default"))
             elif item["type"] == "choice":
-                values[item["key"]] = (int(values[item["key"]]) + 1) % len(item["options"])
+                opts = item["options"](values) if callable(item["options"]) else item["options"]
+                values[item["key"]] = (_choice_idx(values, item["key"], len(opts)) + 1) % len(opts)
             else:
                 cur = values.get(item["key"]) or ""
                 edit = _Edit(item, "" if item["type"] == "secret" else str(cur))
@@ -855,7 +886,7 @@ def _form_fallback(sections: list[dict], values: dict, on_verify) -> dict:
             err("API Key 验证失败：" + text.replace("\n", " "))
         if attempt == 3:
             break
-        key = "api_key" if not missing else ("model" if missing == "模型名" else "base_url")
+        key = "api_key" if not missing else ("model_manual" if missing == "模型名" else "base_url")
         _edit_item(next(it for it in flat if it["key"] == key), values)
         _save_install_draft(values)
     err("API Key 连续 3 次未通过验证，安装中止")
@@ -864,10 +895,14 @@ def _form_fallback(sections: list[dict], values: dict, on_verify) -> dict:
 
 # ── 表单 → 步骤参数 ─────────────────────────────────────────────────────
 def _provider_from_form(values: dict) -> dict:
-    """表单当前值 → 厂商参数（自定义厂商取手填的模型名与 API 地址）。"""
+    """表单当前值 → 厂商参数（预置模型按索引取；手动输入/自定义厂商取手填值）。"""
     p = dict(PROVIDERS[int(values["provider"])])
+    if p["label"] == "自定义" or _model_is_manual(values):
+        p["model"] = values.get("model_manual", "").strip()
+    else:
+        p["model"] = p["models"][_choice_idx(values, "model", len(_model_options(values)))]
     if p["label"] == "自定义":
-        p["model"], p["base_url"] = values["model"], values["base_url"]
+        p["base_url"] = values["base_url"]
     p["key"] = values["api_key"]
     return p
 
@@ -918,12 +953,20 @@ def _http_post(url: str, body: bytes, headers: dict, proxy: str) -> tuple[int, s
 
 
 def _is_model_reply(text: str) -> bool:
-    """HTTP 200 也可能是包着业务错误的假成功（部分网关）：必须真是一次补全。"""
+    """HTTP 200 也可能是包着业务错误的假成功（部分网关）：必须真是一次补全。
+    兼容端点差异：Kimi 对 max_tokens=1 返回 type=""、空 content（实测），
+    只要带 id/model/usage 且非 error，就是有效的模型响应。"""
     try:
         data = json.loads(text)
     except ValueError:
         return False
-    return isinstance(data, dict) and bool(data.get("type") == "message" or data.get("choices"))
+    if not isinstance(data, dict):
+        return False
+    if data.get("type") == "error" or "error" in data:
+        return False
+    if data.get("type") == "message" or data.get("choices"):
+        return True
+    return bool(data.get("id") and data.get("model") and data.get("usage"))
 
 
 def verify_provider(provider: dict, proxy: str = "") -> tuple[bool, str, int | None, str]:
@@ -1088,11 +1131,14 @@ def _load_existing(values: dict) -> bool:
     if cfg.get("model") or cfg.get("base_url"):
         values["provider"] = len(PROVIDERS) - 1   # 对不上预置厂商就是自定义
         for i, p in enumerate(PROVIDERS[:-1]):
-            if (p["model"] == cfg.get("model")
-                    and p["base_url"].rstrip("/") == (cfg.get("base_url") or "").rstrip("/")):
+            if p["base_url"].rstrip("/") == (cfg.get("base_url") or "").rstrip("/"):
                 values["provider"] = i
+                models = p.get("models") or []
+                # 模型在预置列表里就选中对应项，否则落到「手动输入」带回原名
+                values["model"] = models.index(cfg["model"]) if cfg.get("model") in models else len(models)
                 break
-        values["model"], values["base_url"] = cfg.get("model", ""), cfg.get("base_url", "")
+        values["model_manual"] = cfg.get("model", "")
+        values["base_url"] = cfg.get("base_url", "")
     key_env = cfg.get("api_key_env") or PROVIDERS[values["provider"]]["env"]
     values["api_key"] = _read_env_file().get(key_env, "")
     cfg_path = os.path.join(REPO_DIR, "config.yaml")
