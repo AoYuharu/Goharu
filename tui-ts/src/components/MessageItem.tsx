@@ -55,7 +55,7 @@ function buildLines(msg: ChatMessage): string[] {
     case "thinking":
       return [
         ts + chalk.bold.cyan("💭 Thinking") + chalk.dim(` (Step ${msg.step})`),
-        ...msg.text.split("\n").map((l) => chalk.italic.yellow("  " + l)),
+        ...renderMarkdown(msg.text).split("\n").map((l) => "  " + l),
         " ",
       ];
     case "note":
