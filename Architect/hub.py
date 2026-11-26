@@ -18,8 +18,8 @@ from Architect.audit import AuditPipeline
 from Architect.error_hooks import ErrorHookEngine
 from Architect.telemetry import TelemetryDigest
 from Architect.wake import (
-    KIND_GUARDIAN, KIND_REPAIR, REASON_CODE_UPDATE, REASON_ERROR_HOOK,
-    REASON_FATAL, WakeRequest,
+    KIND_EXPLORE, KIND_GUARDIAN, KIND_REPAIR, REASON_CODE_UPDATE,
+    REASON_ERROR_HOOK, REASON_FATAL, WakeRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -267,6 +267,24 @@ class ArchitectHub:
         return {"type": "error", "error": "repair failed and rolled back",
                 "verify": verify, "restore": restore}
 
+    def _run_explore(self, request: WakeRequest, task_text: str) -> dict:
+        """bootstrap 初始探索：Arch 探索 → Verify 验收闭环（explore_flow）。
+
+        拿结构化 request.context（identity_path/gaps/initial_exploration 等），
+        不解析 task_text 字符串。explore_flow 惰性 import SubAgent，独立部署时
+        ImportError 降级为 error 报告（不崩派发线程）。
+        """
+        try:
+            from Architect.explore_flow import run_explore_with_verify
+        except Exception as exc:
+            logger.warning("explore_flow 不可用（独立部署？）: %s", exc)
+            return {"type": "error", "error": f"explore flow unavailable: {exc}"}
+        context = dict(request.context or {})
+        bootstrap_cfg = self._hub_cfg.get("bootstrap", {}) or {}
+        context.setdefault("explore_max_rounds",
+                           bootstrap_cfg.get("explore_max_rounds", 3))
+        return run_explore_with_verify(context)
+
     def render_digest(self) -> str:
         return self.digest.render_text()
 
@@ -397,6 +415,8 @@ class ArchitectHub:
             try:
                 if request.reason == REASON_ERROR_HOOK and request.kind == KIND_REPAIR:
                     return self._run_repair(request, task_text)
+                if request.kind == KIND_EXPLORE:
+                    return self._run_explore(request, task_text)
                 return self._dispatch(request.kind, task_text)
             finally:
                 self._dispatch_lock.release()

@@ -58,6 +58,7 @@ class SubAgentConfig:
         "explore": "explore.md",
         "plan": "plan.md",
         "verify": "verify.md",
+        "verify_explore": "verify_explore.md",
         "architect": "architect.md",
     }
 
@@ -177,6 +178,12 @@ class SubAgentConfig:
             "（测试文件必须用 WriteTestFile 写到系统临时目录）。每条 PASS 必须有实际执行的命令和真实输出，"
             "禁止用 py_compile / 语法检查冒充验证。报告必须以 VERDICT: PASS / FAIL / PARTIAL 结尾。"
         ),
+        "verify_explore": (
+            "CRITICAL: 这是只读的 bootstrap 环境探测验收任务。禁止创建、修改、删除任何文件"
+            "（包括 identity.yaml）。用只读命令交叉复核探测结果，不得安装软件或驱动设备。"
+            "报告必须以 VERDICT: PASS / FAIL / PARTIAL 结尾，FAIL 时逐项列出"
+            "缺凭据或阻碍定位的 层.字段。"
+        ),
         "architect": (
             "CRITICAL: 你是 Goharu 项目的管理/升级智能体，拥有写权限——但纪律优先："
             "先 Read 后 Edit；文件写走 Write/Edit，禁止 shell 重定向写文件；"
@@ -202,6 +209,9 @@ class SubAgentConfig:
             return ["Read", "Grep", "Glob", "run_cmd"]
         elif agent_type.lower() == "verify":
             return ["Read", "Grep", "Glob", "run_cmd", "WriteTestFile"]
+        elif agent_type.lower() == "verify_explore":
+            # bootstrap 环境探测验收：只读验收 + 只读命令交叉复核，不写测试文件
+            return ["Read", "Grep", "Glob", "run_cmd"]
         elif agent_type.lower() == "architect":
             # Goharu 自身管理/升级：全量读写 + MessageHero 对外沟通 + SetConfig 改配置。
             # 高危灰名单命令（del/taskkill/reg 等）由 run_cmd 工具内部的
@@ -262,9 +272,10 @@ class SubAgentConfig:
         if cls._sleep_exceeds_limit(cleaned):
             return False
 
-        # verify 采用黑名单模式：不在 FORBIDDEN_PATTERNS 里即放行
-        # （不再受只读白名单约束，使其能运行 node/pytest 等真实验证命令）
-        if agent_type.lower() == "verify":
+        # verify / verify_explore 采用黑名单模式：不在 FORBIDDEN_PATTERNS 里即放行
+        # （不再受只读白名单约束，使其能运行 node/pytest 等真实验证命令，
+        #   verify_explore 亦需跑 nvidia-smi/cat /proc 等只读探测命令做交叉复核）
+        if agent_type.lower() in ("verify", "verify_explore"):
             for forbidden in cls.FORBIDDEN_PATTERNS:
                 if forbidden in cleaned:
                     return False
@@ -767,8 +778,8 @@ class SubAgent:
         if error:
             result["error"] = error
 
-        # verify 类型：机器解析 VERDICT，主 agent 不再需要通读自由文本找结论
-        if self.agent_type.lower() == "verify" and status != "error":
+        # verify / verify_explore：机器解析 VERDICT，主 agent 不再需要通读自由文本找结论
+        if self.agent_type.lower().startswith("verify") and status != "error":
             verdict = self.parse_verdict(content)
             if verdict:
                 result["verdict"] = verdict

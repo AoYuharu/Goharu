@@ -138,6 +138,20 @@ pending_retry），identity.yaml 落盘即完成标记。
   平台只读命令与写回约束。Arch 不重复已验证探测，禁止安装软件、改源码/配置或
   驱动设备，只能写 identity；补值时同步更新 probe_report 状态/证据，并从
   gaps_pending 移除已解决项。
+- **探索验收闭环（explore_flow.py，2026-11-25）**：KIND_EXPLORE 派发不再
+  "一锤子买卖"——`hub._run_explore` 惰性 import
+  `explore_flow.run_explore_with_verify(request.context)` 走「Arch 探索 →
+  verify_explore 验收 → FAIL 回喂迭代」闭环，拿结构化 context（不解析
+  task_text 字符串）。终止条件三选一（防无尽循环）：① `gaps_pending` 清空
+  （硬规则，机械判 PASS）② verify 判 PASS（软判断——每个仍 `unknown` 的 field
+  在 probe_report 里都写了"已尽力"凭据：尝试过什么只读手段 + 为何不可得/
+  无权限/不适用；缺凭据 = FAIL，逐项列 `层.字段` 回喂下一轮）③ 达
+  `explore_max_rounds`（默认 3，`architect_hub.bootstrap.explore_max_rounds`
+  可调）。到上限仍未 PASS 标 best_effort，报告剩余 unknown 与凭据状态，不再
+  循环。新增 `verify_explore` 子代理类型：工具白名单 Read/Grep/Glob/run_cmd
+  （无写工具），提示词 `prompts/subagent/verify_explore.md`，走普通任务模板
+  （不预填 git diff），verdict 解析复用 verify 的 `parse_verdict`
+  （`_build_result` 判定条件放宽为 `startswith("verify")`）。
 - **编码教训（2026-11-22 实测）**：Windows 中文系统的系统工具输出是 GBK——
   `_run` 必须 utf-8→gbk 解码链，且 ipconfig 字段名要中英双语正则
   （"DNS 服务器"/"DNS Servers"、"默认网关"/"Default Gateway"）。

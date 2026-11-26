@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import yaml  # noqa: E402
 
 import Architect.probe as probe  # noqa: E402
+import Architect.explore_flow as explore_flow  # noqa: E402
 from Architect.bootstrap import bootstrap_if_needed  # noqa: E402
 
 PASS, FAIL = 0, 0
@@ -252,6 +253,95 @@ def test_harunet_register():
         check("失败标记待重试", data2["harunet"]["pending_retry"] is True)
 
 
+def test_explore_flow_hard_rule():
+    print("== 闭环：硬规则直通 ==")
+    calls = {"arch": 0, "verify": 0}
+
+    def arch(round_no, context, feedback):
+        calls["arch"] += 1
+        return {"status": "success"}
+
+    def verify(identity_path, gaps, round_no):
+        calls["verify"] += 1
+        return {"status": "success", "verdict": "PASS"}
+
+    def read(path):
+        return {"gaps_pending": []}
+
+    r = explore_flow.run_explore_with_verify(
+        {"identity_path": "/tmp/identity.yaml", "explore_max_rounds": 3},
+        dispatch_arch=arch, dispatch_verify=verify, read_identity=read)
+    check("gaps 清空直接 PASS", r["verdict"] == "PASS")
+    check("只跑一轮", calls["arch"] == 1 and calls["verify"] == 1, calls)
+    check("剩余 gaps 空", r["remaining_gaps"] == [])
+
+
+def test_explore_flow_best_effort():
+    print("== 闭环：verify 判已尽力 PASS ==")
+    def arch(round_no, context, feedback):
+        return {"status": "success"}
+
+    def verify(identity_path, gaps, round_no):
+        return {"status": "success", "verdict": "PASS",
+                "content": "剩余 unknown 已带凭据，机器可定位"}
+
+    def read(path):
+        return {"gaps_pending": ["cpu.instruction_sets"]}
+
+    r = explore_flow.run_explore_with_verify(
+        {"identity_path": "/tmp/identity.yaml", "explore_max_rounds": 3},
+        dispatch_arch=arch, dispatch_verify=verify, read_identity=read)
+    check("已尽力 PASS", r["verdict"] == "PASS")
+    check("剩余 unknown 记录", r["remaining_gaps"] == ["cpu.instruction_sets"])
+    check("只跑一轮", len(r["rounds"]) == 1)
+
+
+def test_explore_flow_feedback():
+    print("== 闭环：FAIL 回喂迭代 ==")
+    state = {"gaps": ["cpu.instruction_sets", "gpu.driver"]}
+    feedbacks = []
+
+    def arch(round_no, context, feedback):
+        feedbacks.append(feedback)
+        if round_no == 2:
+            state["gaps"] = []
+        return {"status": "success"}
+
+    def verify(identity_path, gaps, round_no):
+        return {"status": "success",
+                "verdict": "FAIL" if round_no == 1 else "PASS",
+                "content": "缺 cpu.instruction_sets 凭据"}
+
+    def read(path):
+        return {"gaps_pending": list(state["gaps"])}
+
+    r = explore_flow.run_explore_with_verify(
+        {"identity_path": "/tmp/identity.yaml", "explore_max_rounds": 3},
+        dispatch_arch=arch, dispatch_verify=verify, read_identity=read)
+    check("迭代两轮", len(r["rounds"]) == 2, [x["round"] for x in r["rounds"]])
+    check("第二轮回喂含 FAIL 项", "cpu.instruction_sets" in feedbacks[1], feedbacks[1])
+    check("最终 PASS", r["verdict"] == "PASS")
+
+
+def test_explore_flow_max_rounds():
+    print("== 闭环：max_rounds 截断防无尽循环 ==")
+    def arch(round_no, context, feedback):
+        return {"status": "success"}
+
+    def verify(identity_path, gaps, round_no):
+        return {"status": "success", "verdict": "FAIL", "content": "仍未尽力"}
+
+    def read(path):
+        return {"gaps_pending": ["cpu.instruction_sets"]}
+
+    r = explore_flow.run_explore_with_verify(
+        {"identity_path": "/tmp/identity.yaml", "explore_max_rounds": 2},
+        dispatch_arch=arch, dispatch_verify=verify, read_identity=read)
+    check("跑满 2 轮", len(r["rounds"]) == 2, len(r["rounds"]))
+    check("best_effort 状态", r["status"] == "best_effort")
+    check("最终 FAIL", r["verdict"] == "FAIL")
+
+
 def main():
     test_probe_real()
     test_layered_probe()
@@ -259,6 +349,10 @@ def main():
     test_os_specific_communication()
     test_bootstrap_flow()
     test_harunet_register()
+    test_explore_flow_hard_rule()
+    test_explore_flow_best_effort()
+    test_explore_flow_feedback()
+    test_explore_flow_max_rounds()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
 
