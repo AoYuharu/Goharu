@@ -36,7 +36,13 @@ import urllib.request
 
 IS_WIN = os.name == "nt"
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
-PIP_MIRROR = os.environ.get("PIP_MIRROR", "https://pypi.tuna.tsinghua.edu.cn/simple")
+PIP_MIRROR = os.environ.get("PIP_MIRROR", "")
+# pip 镜像回退链：单源失败自动换下一个。PIP_MIRROR 显式指定时只用该源。
+PIP_MIRRORS = [PIP_MIRROR] if PIP_MIRROR else [
+    "https://pypi.tuna.tsinghua.edu.cn/simple",
+    "https://mirrors.aliyun.com/pypi/simple/",
+    "https://pypi.mirrors.ustc.edu.cn/simple/",
+]
 
 def _install_draft_path() -> str:
     return os.environ.get("GOHARU_INSTALL_DRAFT") or os.path.join(
@@ -1144,6 +1150,17 @@ def run_step(label: str, cmd: str, cwd: str = REPO_DIR) -> bool:
     return True
 
 
+def run_pip_step(label: str, pip_args: str) -> bool:
+    """pip 步骤带镜像回退：依次尝试 PIP_MIRRORS（清华→阿里→中科大），
+    单源网络失败自动换源重跑（pip 幂等，已装包自动跳过）；全部失败才报错。"""
+    for i, mirror in enumerate(PIP_MIRRORS):
+        if i > 0:
+            info(f"切换 pip 镜像源：{mirror}")
+        if run_step(label, f"{_venv_py()} -m pip {pip_args} -i {mirror}"):
+            return True
+    return False
+
+
 # ── 步骤实现 ─────────────────────────────────────────────────────────
 def step_check_env() -> bool:
     title("环境探测")
@@ -1207,15 +1224,14 @@ def step_install_deps(with_embedding: bool) -> bool:
     else:
         info("venv 已存在，跳过创建")
 
-    vp = _venv_py()
-    if not run_step("升级 pip", f"{vp} -m pip install --upgrade pip -q --progress-bar off -i {PIP_MIRROR}"):
+    if not run_pip_step("升级 pip", "install --upgrade pip -q --progress-bar off"):
         return False
-    if not run_step("安装核心依赖", f"{vp} -m pip install --progress-bar off -r requirements.txt -i {PIP_MIRROR}"):
+    if not run_pip_step("安装核心依赖", "install --progress-bar off -r requirements.txt"):
         return False
     if with_embedding:
-        if not run_step(
+        if not run_pip_step(
             "安装 embedding 重依赖（torch 等，>2GB，请耐心）",
-            f"{vp} -m pip install --progress-bar off -r requirements-embedding.txt -i {PIP_MIRROR}",
+            "install --progress-bar off -r requirements-embedding.txt",
         ):
             return False
     else:
