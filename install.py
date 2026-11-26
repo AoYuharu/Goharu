@@ -1162,6 +1162,36 @@ def run_pip_step(label: str, pip_args: str) -> bool:
 
 
 # ── 步骤实现 ─────────────────────────────────────────────────────────
+def _find_node():
+    """遍历 PATH 全部候选 + 常见安装位置，返回第一个 >= 20 的 (node 路径, 版本)。
+    不因 PATH 里第一个是旧版就误判缺失。"""
+    import glob
+    exe = "node.exe" if IS_WIN else "node"
+    cands = [os.path.join(d, exe) for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+    home = os.path.expanduser("~")
+    if IS_WIN:
+        cands += glob.glob(os.path.join(home, "node*", "node.exe"))
+        cands += [r"C:\Program Files\nodejs\node.exe"]
+    else:
+        cands += glob.glob(os.path.join(home, "node*", "bin", "node"))
+        cands += ["/usr/local/bin/node"]
+        cands += glob.glob(os.path.join(home, ".nvm", "versions", "node", "*", "bin", "node"))
+        cands += glob.glob("/opt/node*/bin/node")
+    seen = set()
+    for p in cands:
+        if p in seen or not os.path.isfile(p):
+            continue
+        seen.add(p)
+        try:
+            ver = subprocess.run([p, "--version"], capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            continue
+        m = re.match(r"v?(\d+)", ver)
+        if m and int(m.group(1)) >= 20:
+            return p, ver
+    return None, ""
+
+
 def step_check_env() -> bool:
     title("环境探测")
     print(f"    系统: {platform.system()} {platform.release()} ({platform.machine()})")
@@ -1189,22 +1219,17 @@ def step_check_env() -> bool:
         ok = False
 
     # Node / npm（TUI 依赖 ink/string-width 用了 /v 正则旗标，需 Node >= 20）
-    node = shutil.which("node")
-    npm = shutil.which("npm")
-    node_major = None
-    node_ver = ""
+    # 全候选探测：找到合格即用，并注入 PATH 供后续 npm 构建使用
+    node, node_ver = _find_node()
     if node:
-        node_ver = subprocess.run(["node", "--version"], capture_output=True, text=True).stdout.strip()
-        mver = re.match(r"v?(\d+)", node_ver)
-        node_major = int(mver.group(1)) if mver else None
-    if node and npm and node_major and node_major >= 20:
-        info(f"Node {node_ver} + npm")
+        os.environ["PATH"] = os.path.dirname(node) + os.pathsep + os.environ.get("PATH", "")
+        info(f"Node {node_ver}（{node}）")
     else:
-        err(f"需要 Node.js >= 20（当前 {node_ver or '未安装'}；TUI 依赖 ink/string-width 的 /v 正则旗标）")
+        err("需要 Node.js >= 20（TUI 依赖 ink/string-width 的 /v 正则旗标）")
         if IS_WIN:
-            print("      安装: winget install OpenJS.NodeJS.LTS   或  https://nodejs.org")
+            print("      安装: winget install OpenJS.NodeJS.LTS   或  重跑 bootstrap.ps1 自动安装")
         else:
-            print("      安装: https://nodejs.org  或  nvm install 20")
+            print("      重跑 bootstrap.sh 可自动安装到 ~/node22，或 nvm install 20")
         ok = False
 
     return ok

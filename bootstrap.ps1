@@ -3,32 +3,89 @@
 # 一行安装（Win+R 粘贴回车，或 PowerShell 窗口执行，自动 clone + 进入交互式向导）：
 #   powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/AoYuharu/Goharu/master/bootstrap.ps1 | iex"
 #
+# 环境变量：GOHARU_DIR 安装目录；GOHARU_REPO 仓库地址；GOHARU_NODE_DIR Node 自动安装目录（默认 ~\node22）
+#
+# 组件探测原则（与 bootstrap.sh 一致）：遍历 PATH 全部候选与常见安装位置，
+# 合格即用并注入 PATH；都不合格才自动安装 Node 官方二进制（npmmirror→官方
+# 回退，无需管理员）；自动安装也失败才报错。
+#
 # 用 irm | iex 而非下载后执行，是为了让向导在当前控制台读 stdin，支持交互式输入密钥。
 
 $RepoUrl   = if ($env:GOHARU_REPO) { $env:GOHARU_REPO } else { "https://github.com/AoYuharu/Goharu.git" }
 $TargetDir = if ($env:GOHARU_DIR)  { $env:GOHARU_DIR }  else { Join-Path $env:USERPROFILE "Goharu" }
+$NodeMin = 20
+$NodeVersion = "v22.20.0"
+$NodeHome = if ($env:GOHARU_NODE_DIR) { $env:GOHARU_NODE_DIR } else { Join-Path $env:USERPROFILE "node22" }
 
 function Info($m) { Write-Host "[+] $m" -ForegroundColor Green }
 function Err($m)  { Write-Host "[x] $m" -ForegroundColor Red }
 
-# ── 前置依赖检查 ──
+function Test-Node($p) {
+    if (-not $p -or -not (Test-Path $p)) { return $false }
+    $v = (& $p --version 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $v) { return $false }
+    return ([int](($v -replace '^v','') -split '\.')[0] -ge $NodeMin)
+}
+
+function Find-Node {
+    $cands = @()
+    $cands += (Get-Command node -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+    $cands += (Join-Path $NodeHome "node.exe")
+    $cands += (Get-ChildItem "$env:USERPROFILE\node*\node.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    $cands += "C:\Program Files\nodejs\node.exe"
+    foreach ($c in $cands) { if (Test-Node $c) { return $c } }
+    return $null
+}
+
+function Install-Node {
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
+    $pkg = "node-$NodeVersion-win-$arch.zip"
+    $tmp = Join-Path $env:TEMP ("goharu-node-" + [guid]::NewGuid().Guid)
+    New-Item -ItemType Directory -Path $tmp | Out-Null
+    foreach ($base in @("https://registry.npmmirror.com/-/binary/node/$NodeVersion", "https://nodejs.org/dist/$NodeVersion")) {
+        Info "下载 Node $NodeVersion（$base）"
+        try {
+            Invoke-WebRequest -Uri "$base/$pkg" -OutFile (Join-Path $tmp $pkg) -TimeoutSec 300 -UseBasicParsing
+            Expand-Archive -Path (Join-Path $tmp $pkg) -DestinationPath $tmp -Force
+            $dir = Join-Path $tmp "node-$NodeVersion-win-$arch"
+            if (Test-Node (Join-Path $dir "node.exe")) {
+                if (Test-Path $NodeHome) { Remove-Item $NodeHome -Recurse -Force }
+                Move-Item $dir $NodeHome
+                Info "Node $NodeVersion 已安装到 $NodeHome"
+                Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+                return $true
+            }
+        } catch { Info "该源失败，换下一个" }
+    }
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    Err "Node 自动安装失败"
+    return $false
+}
+
+# ── 前置依赖检查（全候选探测，合格即用）──
 $missing = @()
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { $missing += "git          → winget install Git.Git" }
+
 $py = $null
 foreach ($cand in @("python", "python3", "py")) {
-    if (Get-Command $cand -ErrorAction SilentlyContinue) { $py = $cand; break }
+    foreach ($c in (Get-Command $cand -All -ErrorAction SilentlyContinue)) {
+        & $c.Source -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>$null
+        if ($LASTEXITCODE -eq 0) { $py = $c.Source; break }
+    }
+    if ($py) { break }
 }
-if (-not $py) {
-    $missing += "Python>=3.10  → winget install Python.Python.3.12"
-} else {
-    $verOk = & $py -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>$null
-    if ($LASTEXITCODE -ne 0) { $missing += "Python>=3.10  → winget install Python.Python.3.12"; $py = $null }
+if (-not $py) { $missing += "Python>=3.10  → winget install Python.Python.3.12" }
+
+$nodeBin = Find-Node
+if (-not $nodeBin) {
+    Info "未找到 Node.js >= $NodeMin，自动安装到 $NodeHome"
+    if (Install-Node) { $nodeBin = Join-Path $NodeHome "node.exe" }
 }
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    $missing += "Node.js>=20  → winget install OpenJS.NodeJS.LTS"
+if ($nodeBin) {
+    $env:PATH = (Split-Path $nodeBin) + ";" + $env:PATH
+    Info ("Node：{0}（{1}）" -f $nodeBin, (& $nodeBin --version))
 } else {
-    $nv = [int]((((node --version) 2>$null) -replace '^v','') -split '\.')[0]
-    if ($nv -lt 20) { $missing += "Node.js>=20（当前 $(node --version)）  → winget install OpenJS.NodeJS.LTS" }
+    $missing += "Node.js>=20（自动安装失败）  → winget install OpenJS.NodeJS.LTS"
 }
 
 if ($missing.Count -gt 0) {
