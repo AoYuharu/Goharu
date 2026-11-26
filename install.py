@@ -1196,13 +1196,18 @@ def run_step(label: str, cmd: str, cwd: str = REPO_DIR) -> bool:
     return True
 
 
-def run_pip_step(label: str, pip_args: str) -> bool:
+def run_pip_step(label: str, pip_args: str, proxy: str = "") -> bool:
     """pip 步骤带镜像回退：依次尝试 PIP_MIRRORS（清华→阿里→中科大），
-    单源网络失败自动换源重跑（pip 幂等，已装包自动跳过）；全部失败才报错。"""
+    单源网络失败自动换源重跑（pip 幂等，已装包自动跳过）；全部失败才报错。
+    --isolated：忽略宿主机环境变量与用户级 pip 配置（如 cert=/dev/null 毒配置），
+    本次安装用干净配置、不改宿主机任何文件；代理经 --proxy 显式传递。"""
     for i, mirror in enumerate(PIP_MIRRORS):
         if i > 0:
             info(f"切换 pip 镜像源：{mirror}")
-        if run_step(label, f"{_venv_py()} -m pip {pip_args} -i {mirror}"):
+        cmd = f"{_venv_py()} -m pip --isolated {pip_args} -i {mirror}"
+        if proxy:
+            cmd += f' --proxy "{proxy}"'
+        if run_step(label, cmd):
             return True
     return False
 
@@ -1285,7 +1290,7 @@ def _venv_py() -> str:
     return os.path.join("venv", "Scripts", "python.exe") if IS_WIN else os.path.join("venv", "bin", "python")
 
 
-def step_install_deps(with_embedding: bool) -> bool:
+def step_install_deps(with_embedding: bool, proxy: str = "") -> bool:
     title("安装 Python 依赖")
     if not os.path.isdir(os.path.join(REPO_DIR, "venv")):
         # 用当前解释器建 venv，保证与运行向导的 Python 版本一致
@@ -1295,14 +1300,14 @@ def step_install_deps(with_embedding: bool) -> bool:
     else:
         info("venv 已存在，跳过创建")
 
-    if not run_pip_step("升级 pip", "install --upgrade pip -q --progress-bar off"):
+    if not run_pip_step("升级 pip", "install --upgrade pip -q --progress-bar off", proxy):
         return False
-    if not run_pip_step("安装核心依赖", "install --progress-bar off -r requirements.txt"):
+    if not run_pip_step("安装核心依赖", "install --progress-bar off -r requirements.txt", proxy):
         return False
     if with_embedding:
         if not run_pip_step(
             "安装 embedding 重依赖（torch 等，>2GB，请耐心）",
-            "install --progress-bar off -r requirements-embedding.txt",
+            "install --progress-bar off -r requirements-embedding.txt", proxy,
         ):
             return False
     else:
@@ -1581,7 +1586,7 @@ def main() -> int:
     with_embedding = bool(values["embedding"])
     with_systemd = bool(values["systemd"])
 
-    if not step_install_deps(with_embedding):
+    if not step_install_deps(with_embedding, values.get("proxy", "")):
         err("依赖安装失败，可重跑本向导（已完成步骤会自动跳过）")
         return 1
 
