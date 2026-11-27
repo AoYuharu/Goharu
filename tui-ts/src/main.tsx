@@ -8,6 +8,9 @@ const useMock = process.argv.includes("--mock");
 // mouse hit-map can safely assume the viewport starts at terminal row 1.
 process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
 
-const { waitUntilExit } = render(<App mock={useMock} />, { exitOnCtrlC: false });
+const { waitUntilExit } = render(<App mock={useMock} />, {
+  exitOnCtrlC: false,
+  incrementalRendering: true,
+});
 
 waitUntilExit().then(() => process.exit(0));

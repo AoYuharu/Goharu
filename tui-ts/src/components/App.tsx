@@ -135,6 +135,12 @@ function parseTs(raw: string | undefined): string {
 const HISTORY_REPLAY_FALLBACK = 20;
 const SESSION_ID = "default";
 const LIVE_PANEL_ROWS = 12;
+const TERMINAL_RESERVE_ROWS = 1;
+
+export function mainViewportRows(termRows: number, bottomRows: number, topOffset: number): number {
+  return Math.max(1, termRows - bottomRows - topOffset - TERMINAL_RESERVE_ROWS);
+}
+
 // 模型切换失败里需要用户重填 API Key 的几类（密钥无效 / 配额用完 / 未配置）
 const API_KEY_ERROR_KINDS: ReadonlySet<string> = new Set(["auth", "quota", "missing_key"]);
 
@@ -1299,8 +1305,8 @@ export function App({ mock = false }: { mock?: boolean }) {
   // ── Chat viewport geometry (deterministic: every line is pre-wrapped) ──
   const width = Math.max(20, process.stdout.columns || 80);
   const termRows = process.stdout.rows || 24;
-  // Settings 按钮：右下角最后一行，右对齐 "☰ Settings" 的命中区
-  settingsHitRef.current = { row: termRows, x0: width - 12 };
+  // Settings 按钮位于预留安全行之前，右对齐 "☰ Settings" 的命中区
+  settingsHitRef.current = { row: Math.max(1, termRows - TERMINAL_RESERVE_ROWS), x0: width - 12 };
 
   // Viewport content: main chat, or the selected subagent's own ReAct flow —
   // both rendered through the SAME ChatMessage pipeline (no duplicate rendering).
@@ -1337,14 +1343,15 @@ export function App({ mock = false }: { mock?: boolean }) {
   const questionRows = screen === null && questionQueue.length > 0 ? QUESTION_PANEL_ROWS : 0;
   const voiceRows = screen === null && voiceOpen ? VOICE_PANEL_ROWS : 0;
   const modelRows = screen === null && modelOpen ? modelPanelRows(modelStatus?.history?.length ?? 0) : 0;
-  const settingsRows = screen === null && settingsOpen ? 7 : 0; // 设置菜单：标题 + 4 选项 + 空行 + footer
+  const settingsRows = screen === null && settingsOpen ? 9 : 0; // 7 行内容 + 上下边框
+  const checkpointRows = screen === null && checkpoint ? 1 : 0;
   // 输入框纵向展开：内容宽 = 总宽 - 边框2 - paddingX2 - 提示符"❯ "2；行数随折行增长
   const inputContentW = Math.max(1, width - 6);
   const inputLines = wrapAnsi(inputValue || " ", inputContentW, { hard: true, trim: false }).split("\n").length;
   const inputBarRows = inputLines + 2; // +2 上下边框
-  const bottomRows = liveRows + subBarRows + suggRows + panelRows + pinnedRows + bgRows + taskRows + livePanelRows + confirmRows + questionRows + voiceRows + modelRows + settingsRows + 1 + inputBarRows + 1; // StatusBar(1) + InputBar(动态) + Settings 行(1)
+  const bottomRows = liveRows + subBarRows + suggRows + panelRows + pinnedRows + bgRows + checkpointRows + taskRows + livePanelRows + confirmRows + questionRows + voiceRows + modelRows + settingsRows + 1 + inputBarRows + 1; // StatusBar(1) + InputBar(动态) + Settings 行(1)
   const topOffset = screen === null && voiceIndicator ? 1 : 0;
-  const viewH = Math.max(3, termRows - bottomRows - topOffset);
+  const viewH = mainViewportRows(termRows, bottomRows, topOffset);
 
   const allLines: Array<{ id: number; kind: string; text: string }> = [];
   for (const m of viewMessages) {
