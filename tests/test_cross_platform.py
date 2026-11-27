@@ -6,6 +6,7 @@
      —— A+B 组合不变量：start_new_session=True 使子进程自立进程组，
         killpg(getpgid(child)) 只杀子进程组，不再误杀 agent 自身
   C. run_tui_ts.py 自动构建调用（Windows shell=True / 模拟 POSIX shell=False + argv 完整）
+     且必须先确保独立 daemon 就绪
   D. HybridRetriever FTS5 特殊 token 查询不崩溃（真实 SQLite，临时目录）
   E. run_cmd 真实执行 git --version（验证 start_new_session 参数在 Windows 不破坏真实链路）
 """
@@ -127,7 +128,9 @@ def test_c_run_tui_ts_build_invocation():
         with mock.patch.object(run_tui_ts.os, "name", simulated_os), \
              mock.patch.object(run_tui_ts, "DIST_ENTRY", fake_dist), \
              mock.patch.object(run_tui_ts.shutil, "which",
-                               side_effect=lambda n: f"/fake/{n}" if n in ("node", "npm") else None), \
+                               side_effect=lambda n: "/fake/npm" if n in ("npm", "npm.cmd") else None), \
+             mock.patch.object(run_tui_ts, "_find_node", return_value="/fake/node"), \
+             mock.patch.object(run_tui_ts, "_ensure_gateway", return_value=True), \
              mock.patch.object(run_tui_ts.subprocess, "check_call",
                                side_effect=lambda *a, **kw: check_call_calls.append((a, kw))), \
              mock.patch.object(run_tui_ts.subprocess, "run", return_value=fake_run_result):

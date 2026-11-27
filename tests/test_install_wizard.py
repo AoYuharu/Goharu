@@ -583,9 +583,13 @@ def test_install_draft_and_launcher():
               os.path.exists(draft) and W._load_install_draft(
                   probe := W._default_values()) and probe["api_key"] == "draft-key")
 
-        content = W._posix_launcher_content("/tmp/Goharu test", "/tmp/venv/bin/python")
+        content = W._posix_launcher_content(
+            "/tmp/Goharu test", "/tmp/venv/bin/python", "/tmp/node22/bin/node")
         check("启动器路径变量引号闭合",
               'GOHARU_HOME="/tmp/Goharu test"' in content)
+        check("启动器持久化安装时选择的 Node 22",
+              'export GOHARU_NODE="/tmp/node22/bin/node"' in content
+              and 'export PATH="/tmp/node22/bin:$PATH"' in content)
         bash = shutil.which("bash")
         if bash:
             launcher = os.path.join(tmp, "goharu")

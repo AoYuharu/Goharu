@@ -1214,7 +1214,7 @@ def run_pip_step(label: str, pip_args: str, proxy: str = "") -> bool:
 
 # ── 步骤实现 ─────────────────────────────────────────────────────────
 def _find_node():
-    """遍历 PATH 全部候选 + 常见安装位置，返回第一个 >= 20 的 (node 路径, 版本)。
+    """遍历 PATH 全部候选 + 常见安装位置，返回第一个 >= 22 的 (node 路径, 版本)。
     不因 PATH 里第一个是旧版就误判缺失。"""
     import glob
     exe = "node.exe" if IS_WIN else "node"
@@ -1238,7 +1238,7 @@ def _find_node():
         except Exception:
             continue
         m = re.match(r"v?(\d+)", ver)
-        if m and int(m.group(1)) >= 20:
+        if m and int(m.group(1)) >= 22:
             return p, ver
     return None, ""
 
@@ -1269,18 +1269,18 @@ def step_check_env() -> bool:
             print("      Debian/Ubuntu: sudo apt install git   macOS: xcode-select --install / brew install git")
         ok = False
 
-    # Node / npm（TUI 依赖 ink/string-width 用了 /v 正则旗标，需 Node >= 20）
+    # Node / npm（Ink 7 需要 Node >= 22）
     # 全候选探测：找到合格即用，并注入 PATH 供后续 npm 构建使用
     node, node_ver = _find_node()
     if node:
         os.environ["PATH"] = os.path.dirname(node) + os.pathsep + os.environ.get("PATH", "")
         info(f"Node {node_ver}（{node}）")
     else:
-        err("需要 Node.js >= 20（TUI 依赖 ink/string-width 的 /v 正则旗标）")
+        err("需要 Node.js >= 22（当前 TUI 依赖 Ink 7）")
         if IS_WIN:
             print("      安装: winget install OpenJS.NodeJS.LTS   或  重跑 bootstrap.ps1 自动安装")
         else:
-            print("      重跑 bootstrap.sh 可自动安装到 ~/node22，或 nvm install 20")
+            print("      重跑 bootstrap.sh 可自动安装到 ~/node22，或 nvm install 22")
         ok = False
 
     return ok
@@ -1391,7 +1391,7 @@ After=network.target
 
 [Service]
 WorkingDirectory={REPO_DIR}
-ExecStart=/bin/bash -c 'tail -f /dev/null | venv/bin/python Gateway/gateway_entry.py'
+ExecStart={os.path.join(REPO_DIR, _venv_py())} -u {os.path.join(REPO_DIR, "Gateway", "gateway_entry.py")} --daemon
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
@@ -1406,7 +1406,13 @@ WantedBy=default.target
     return True
 
 
-def _posix_launcher_content(repo: str, venv_py: str) -> str:
+def _posix_launcher_content(repo: str, venv_py: str, node: str = "") -> str:
+    node_lines = ""
+    if node:
+        node_lines = (
+            f'export GOHARU_NODE="{node}"\n'
+            f'export PATH="{os.path.dirname(node)}:$PATH"\n'
+        )
     return (
         "#!/usr/bin/env bash\n"
         "# Goharu 全局启动器（install.py 生成）\n"
@@ -1414,7 +1420,8 @@ def _posix_launcher_content(repo: str, venv_py: str) -> str:
         'cd "$GOHARU_HOME" || exit 1\n'
         # gateway 子进程要用 venv python（带依赖），否则落到系统 python3 崩在 import
         f'export PYTHON="{venv_py}"\n'
-        'set -a; [ -f "$GOHARU_HOME/.env" ] && . "$GOHARU_HOME/.env"; set +a\n'
+        + node_lines
+        + 'set -a; [ -f "$GOHARU_HOME/.env" ] && . "$GOHARU_HOME/.env"; set +a\n'
         f'exec "{venv_py}" "$GOHARU_HOME/goharu_cli.py" "$@"\n'
     )
 
@@ -1423,6 +1430,8 @@ def step_register_command() -> bool:
     """注册全局 `goharu` 命令到 PATH，装完任意目录敲 `goharu` 即启动（无需再跑 start 脚本）。"""
     title("注册全局命令 goharu")
     repo = REPO_DIR
+    node, _ = _find_node()
+    node_dir = os.path.dirname(node) if node else ""
     if IS_WIN:
         bin_dir = os.path.join(os.path.expanduser("~"), ".goharu", "bin")
         os.makedirs(bin_dir, exist_ok=True)
@@ -1433,7 +1442,9 @@ def step_register_command() -> bool:
             "@echo off\r\n"
             f'cd /d "{repo}"\r\n'
             f'set "PYTHON={venv_py}"\r\n'
-            f'"{venv_py}" "{os.path.join(repo, "goharu_cli.py")}" %*\r\n'
+            + (f'set "GOHARU_NODE={node}"\r\n' if node else "")
+            + (f'set "PATH={node_dir};%PATH%"\r\n' if node else "")
+            + f'"{venv_py}" "{os.path.join(repo, "goharu_cli.py")}" %*\r\n'
         )
         with open(launcher, "w", encoding="utf-8", newline="") as f:
             f.write(content)
@@ -1466,7 +1477,7 @@ def step_register_command() -> bool:
     os.makedirs(bin_dir, exist_ok=True)
     launcher = os.path.join(bin_dir, "goharu")
     venv_py = os.path.join(repo, "venv", "bin", "python")
-    content = _posix_launcher_content(repo, venv_py)
+    content = _posix_launcher_content(repo, venv_py, node or "")
     with open(launcher, "w", encoding="utf-8", newline="\n") as f:
         f.write(content)
     os.chmod(launcher, 0o755)
@@ -1613,9 +1624,12 @@ def main() -> int:
 
     if confirm("现在立即启动 Goharu？", default=False):
         vp = _venv_py()
-        print(c("dim", "正在启动 TUI…（Ctrl+C 退出）"))
+        print(c("dim", "正在启动独立网关与 TUI…（退出 TUI 不会停止网关）"))
         try:
-            subprocess.call(f'"{os.path.abspath(vp)}" run_tui_ts.py', cwd=REPO_DIR, shell=True)
+            return subprocess.call(
+                [os.path.abspath(vp), os.path.join(REPO_DIR, "goharu_cli.py")],
+                cwd=REPO_DIR,
+            )
         except KeyboardInterrupt:
             pass
     return 0

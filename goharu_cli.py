@@ -17,7 +17,7 @@
                               --dry-run   只列出将杀/将删的内容
                               --yes       跳过确认（非交互环境必须）
 
-关 TUI 不会关网关（config gateway.tui_attach_shutdown=false）；要停用 `gateway stop`。
+关 TUI 只断开 attach，不会关网关；要停用 `gateway stop`。
 """
 from __future__ import annotations
 
@@ -109,6 +109,20 @@ def _remove_pid() -> None:
         pass
 
 
+def _pid_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def gateway_start(wait: int = 60) -> bool:
     r = _ping()
     if r and r.get("ok"):
@@ -154,15 +168,15 @@ def gateway_stop(wait: int = 15) -> bool:
         print("[+] 网关未在运行")
         return True
     print("[+] 正在停止网关…")
+    pid = _read_pid()
     _rpc("gateway.shutdown", timeout=5)
     deadline = time.time() + wait
     while time.time() < deadline:
-        if not _alive():
+        if not _alive() and not _pid_alive(pid):
             _remove_pid()
             print("[+] 网关已停止")
             return True
         time.sleep(0.5)
-    pid = _read_pid()
     if pid:
         print(f"[!] RPC 停不掉，按 pid {pid} 强杀")
         try:
@@ -374,7 +388,9 @@ def tui() -> int:
     """goharu 默认：确保网关在跑（没起就拉起守护），再起 TUI attach 上去。"""
     if not _alive():
         print("[!] 网关未运行，先拉起守护…")
-        gateway_start()
+        if not gateway_start():
+            print("[x] 网关未就绪，TUI 不会启动；请先处理网关错误。")
+            return 1
     # run_tui_ts.py → node TUI → 它 spawn 的 gateway_entry 发现端口被占 → 自动降为 proxy attach
     return subprocess.call([_python(), os.path.join(REPO, "run_tui_ts.py")], cwd=REPO)
 

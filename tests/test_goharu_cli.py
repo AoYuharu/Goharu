@@ -416,8 +416,29 @@ def test_upgrade(cli):
          cli._restore_upgrade_file) = old
 
 
+def test_tui_requires_daemon(cli):
+    print("\n[8] TUI 只在独立 daemon 就绪后启动")
+    old = cli._alive, cli.gateway_start, cli.subprocess.call
+    try:
+        cli._alive = lambda: False
+        cli.gateway_start = lambda: False
+        called = []
+        cli.subprocess.call = lambda *args, **kwargs: called.append((args, kwargs)) or 0
+        with redirect_stdout(io.StringIO()):
+            rc = cli.tui()
+        check("daemon 启动失败时 TUI 不回退为真实网关", rc == 1 and not called)
+
+        cli.gateway_start = lambda: True
+        with redirect_stdout(io.StringIO()):
+            rc = cli.tui()
+        check("daemon 就绪后才启动 TUI", rc == 0 and len(called) == 1
+              and called[0][0][0][-1].endswith("run_tui_ts.py"), str(called))
+    finally:
+        cli._alive, cli.gateway_start, cli.subprocess.call = old
+
+
 # ────────────────────────────────────────────────────────────────────
-# 7. 集成：真实守护
+# 9. 集成：真实守护
 # ────────────────────────────────────────────────────────────────────
 def _ping_with_retry(cli, tries=3, gap=2.0):
     """入口探活带重试：单次 ping 假阴性（守护忙、瞬时超时）会让测试误判
@@ -441,7 +462,7 @@ def _own_daemon_pid(cli, pre_pid):
 
 
 def test_integration(cli):
-    print("\n[8] 集成：真实守护 start / status×3 / health / log / stop")
+    print("\n[9] 集成：真实守护 start / status×3 / health / log / stop")
     if _ping_with_retry(cli):
         print("    [skip] 已有网关在运行，跳过集成（避免干扰）")
         return
@@ -506,6 +527,7 @@ def main():
     test_rpc_serialization_guard()
     test_mcp_http_tuple_compat()
     test_upgrade(cli)
+    test_tui_requires_daemon(cli)
     test_integration(cli)
     print("\n" + "=" * 60)
     print(f"结果: {passed} 通过, {failed} 失败")

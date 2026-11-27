@@ -5,7 +5,7 @@
   "type": "module",
   "description": "TypeScript TUI frontend for Goharu agent (replaces TUI/ Textual frontend)",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "dev": "tsx watch src/main.tsx",

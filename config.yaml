@@ -331,4 +331,3 @@ channels:
   - Architect.channel
 gateway:
   rpc_port: 8791
-  tui_attach_shutdown: false

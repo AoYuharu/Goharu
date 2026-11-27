@@ -19,7 +19,7 @@ set -euo pipefail
 
 REPO_URL="${GOHARU_REPO:-https://github.com/AoYuharu/Goharu.git}"
 TARGET_DIR="${GOHARU_DIR:-$HOME/Goharu}"
-NODE_MIN=20
+NODE_MIN=22
 NODE_VERSION="v22.20.0"
 NODE_HOME="${GOHARU_NODE_DIR:-$HOME/node22}"
 

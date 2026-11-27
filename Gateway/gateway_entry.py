@@ -60,14 +60,6 @@ lifecycle("════════ 新会话 ════════", f"Gatew
 CRASH_LOG = project_root / "runtime_memory" / "logs" / "gateway" / "crash.log"
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    """环境变量布尔覆盖（机器专属配置，如 haru 的 headless 守护）。"""
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
-
-
 def _dumps_safe(obj: Dict[str, Any]) -> str:
     """RPC 回包序列化：结果含不可序列化对象（函数/句柄）时不能让守护崩——
     改发 JSON-RPC internal error 并记录（2026-11-24 事故：channels.health 的
@@ -696,9 +688,8 @@ def _stdin_reader():
 
 # ── TUI attach：TCP JSON-RPC 服务（守护进程侧）+ 代理模式（TUI 侧）────
 #
-# 场景：QQ 守护进程常驻时用户再开 TUI——TUI spawn 的 gateway_entry 探测到
-# 端口已被占用，自动降级为 stdio↔TCP 代理，对接现有守护；TUI 关闭时代理
-# 发 tui.shutdown，守护随之退出（不留守户进程）。
+# TUI 只连接独立网关；关闭 TUI 仅 detach。停止网关必须显式调用
+# `goharu gateway stop`（RPC gateway.shutdown）。
 
 
 class TuiRpcServer:
@@ -706,12 +697,11 @@ class TuiRpcServer:
 
     - 普通连接（探测）直接关闭无副作用；只有发送 tui.attach 的连接才算
       "已对接 TUI"：此后 tui channel 的事件流转到该 socket
-    - 已对接 TUI 断开 → 守护整体退出（gateway.tui_attach_shutdown，默认开）
+    - TUI 断开只清理 attach，不影响网关主循环
     """
 
-    def __init__(self, port, shutdown_on_detach=True):
+    def __init__(self, port):
         self.port = int(port)
-        self.shutdown_on_detach = bool(shutdown_on_detach)
         self._lock = threading.Lock()
         self._attached_sock = None   # 当前对接中的 TUI socket
         self._server = None
@@ -771,7 +761,6 @@ class TuiRpcServer:
                 ch._transport = write_json
 
     def _serve_client(self, conn):
-        global _bg_reader_running
         attached = False
         try:
             # 不设 recv 超时：本地 127.0.0.1 连接，TUI 空闲数分钟是常态。
@@ -838,19 +827,12 @@ class TuiRpcServer:
                         continue
 
                     if method == "tui.shutdown":
-                        if self.shutdown_on_detach:
-                            self._send_line(conn, {
-                                "jsonrpc": "2.0", "result": {"shutting_down": True},
-                                "id": req.get("id")})
-                            logger.info("TuiRpcServer: shutdown requested by TUI")
-                            _bg_reader_running = False   # 主循环退出 → finally 走完整收尾
-                            return
-                        # 常驻模式：TUI 关闭只 detach，守护继续跑（连接随后由对端关闭 → finally 清理）
+                        # 兼容旧 proxy 的退出请求；常驻网关只允许 gateway.shutdown 停止。
                         self._send_line(conn, {
                             "jsonrpc": "2.0",
                             "result": {"shutting_down": False, "detached": True},
                             "id": req.get("id")})
-                        logger.info("TuiRpcServer: TUI detached (daemon stays alive)")
+                        logger.info("TuiRpcServer: TUI detached (gateway stays alive)")
                         continue
 
                     # 普通 RPC → 主循环 dispatch，应答经本 socket 回
@@ -867,10 +849,7 @@ class TuiRpcServer:
                     if self._attached_sock is conn:
                         self._attached_sock = None
                 self._restore_tui_channel()
-                if self.shutdown_on_detach:
-                    logger.info("TuiRpcServer: attached TUI disconnected, "
-                                "shutting gateway down")
-                    _bg_reader_running = False
+                logger.info("TuiRpcServer: attached TUI disconnected; gateway stays alive")
 
 
 def _probe_existing_gateway(port, timeout=1.0) -> bool:
@@ -886,8 +865,7 @@ def _probe_existing_gateway(port, timeout=1.0) -> bool:
 def _run_proxy_mode(port) -> int:
     """TUI spawn 进来的 gateway_entry 发现守护已在 → 本进程退化为代理。
 
-    stdio(TUI) ↔ TCP(守护)。stdin EOF（TUI 关闭）→ 发 tui.shutdown →
-    守护退出 → 代理退出。
+    stdio(TUI) ↔ TCP(守护)。任一方向断开只结束代理，不停止守护。
     """
     import socket
     logger.info("existing gateway detected, running as TUI proxy")
@@ -977,16 +955,8 @@ def _run_proxy_mode(port) -> int:
     threading.Thread(target=_pump_stdin_to_sock, daemon=True,
                      name="proxy-stdin-reader").start()
 
-    # 任一方向断开即退出：守护断开（sock-reader 先停）立即退出，不傻等
-    # TUI 的 stdin（旧实现会让 proxy 变僵尸，直到 TUI 下次发请求才崩）；
-    # TUI 关闭（stdin EOF）→ 顺带通知守护收尾。
+    # 任一方向断开即退出代理；守护生命周期只由 gateway.shutdown / 信号控制。
     stop.wait()
-    if exit_reason["why"] == "TUI closed":
-        _sock_send({"jsonrpc": "2.0", "method": "tui.shutdown", "id": "bye"})
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
     try:
         sock.close()
     except OSError:
@@ -1072,7 +1042,7 @@ def main():
     rpc_port = int(config.get("gateway.rpc_port", 8791) or 0)
 
     # 单实例决策：端口先到先得。
-    # - 探测到已有守护 → 本进程退化为 TUI 代理（TUI 关闭时顺带关掉守护）
+    # - 探测到已有守护 → 本进程退化为 TUI 代理（只转发，不拥有守护生命周期）
     # - 否则**立即独占绑定端口再去做初始化**——消除"守护启动中(25s)
     #   探测失败 → TUI 又起第二个完整 gateway"的竞态（2026-10-31 双实例事故）
     if rpc_port > 0:
@@ -1093,13 +1063,7 @@ def main():
                                                "已有另一个 TUI 连接着后台网关，请先关闭那个 TUI"}}})
                     sys.exit(1)
                 break   # 代理连接失败（对端刚好退出）→ 继续尝试本地绑定
-            candidate = TuiRpcServer(
-                rpc_port,
-                shutdown_on_detach=(False if daemon_mode else _env_flag(
-                    "GOHARU_TUI_ATTACH_SHUTDOWN",
-                    bool(config.get("gateway.tui_attach_shutdown", False)),
-                )),
-            )
+            candidate = TuiRpcServer(rpc_port)
             if candidate.start():        # 绑定即胜出：我是唯一实例
                 rpc_server = candidate
                 break

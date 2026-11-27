@@ -13,7 +13,7 @@
 
 $RepoUrl   = if ($env:GOHARU_REPO) { $env:GOHARU_REPO } else { "https://github.com/AoYuharu/Goharu.git" }
 $TargetDir = if ($env:GOHARU_DIR)  { $env:GOHARU_DIR }  else { Join-Path $env:USERPROFILE "Goharu" }
-$NodeMin = 20
+$NodeMin = 22
 $NodeVersion = "v22.20.0"
 $NodeHome = if ($env:GOHARU_NODE_DIR) { $env:GOHARU_NODE_DIR } else { Join-Path $env:USERPROFILE "node22" }
 
@@ -85,7 +85,7 @@ if ($nodeBin) {
     $env:PATH = (Split-Path $nodeBin) + ";" + $env:PATH
     Info ("Node：{0}（{1}）" -f $nodeBin, (& $nodeBin --version))
 } else {
-    $missing += "Node.js>=20（自动安装失败）  → winget install OpenJS.NodeJS.LTS"
+    $missing += "Node.js>=22（自动安装失败）  → winget install OpenJS.NodeJS.LTS"
 }
 
 if ($missing.Count -gt 0) {
