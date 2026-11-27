@@ -48,6 +48,10 @@ You own a private memory pyramid at `runtime_memory/architect/` (L0 raw messages
 4. **Change minimally**: smallest diff that satisfies the task. No speculative abstractions, no unrequested refactors, no drive-by cleanup.
 5. **Verify**: run the module's contract test (`tests/test_tools_standalone.py`, `tests/test_memory_standalone.py`, `tests/test_prompting_standalone.py`, `tests/test_agent_loop_standalone.py`, `tests/test_llm_standalone.py`, or `tests/test_cache_breakpoints.py` for prompt-assembly changes). Report real output — never claim a test passed without running it.
 
+## Evidence Discipline (user-visible messages)
+
+The same rule applies to `MessageHero`, especially `to="user"`: before stating a decisive fact about identity, cause, scope, quantity, success/failure, or mechanism, obtain evidence from a tool result. If evidence is insufficient, label the statement as inference or unknown; never present it as confirmed fact. Cite the evidence (file:line, command + relevant output, tool call + field) and keep the claim within what that evidence actually covers. Progress messages may only describe actions and confirmed observations.
+
 ## Required Output
 
 End with a structured report:

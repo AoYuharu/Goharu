@@ -105,8 +105,17 @@ check("第 3 次写触发提醒", nudge is not None and "AgentDelegate" in nudge
 nudge = verify_nudge.after_tool_call("Write", {"path": "E:/proj/x.py"}, ok_result)
 check("阈值以上继续提醒", nudge is not None)
 
-nudge = verify_nudge.after_tool_call("AgentDelegate", {"agent_type": "verify", "task": "验收"}, "{}")
-check("verify 调用清零", nudge is None and verify_nudge._mutation_count == 0 and not verify_nudge._risky_touched)
+for bad in ("{}", "VERDICT: FAIL", "VERDICT: PARTIAL", '{"error": "boom"}'):
+    nudge = verify_nudge.after_tool_call(
+        "AgentDelegate", {"agent_type": "verify", "task": "验收"}, bad)
+    check(f"verify {bad} 不清零",
+          nudge is None and verify_nudge._mutation_count > 0)
+
+nudge = verify_nudge.after_tool_call(
+    "AgentDelegate", {"agent_type": "verify", "task": "验收"},
+    "[子智能体 success] verify agent\n\nVERDICT: PASS")
+check("verify PASS 清零",
+      nudge is None and verify_nudge._mutation_count == 0 and not verify_nudge._risky_touched)
 
 nudge = verify_nudge.after_tool_call("AgentDelegate", {"agent_type": "explore", "task": "探索"}, "{}")
 check("explore 调用不清零", nudge is None and verify_nudge._mutation_count == 0)
@@ -146,7 +155,8 @@ verify_nudge._mutation_count = 0
 verify_nudge._gate_fires = 0
 verify_nudge._risky_touched = False
 verify_nudge.after_tool_call("Write", {"path": "E:/Goharu/Agent/x.py"}, "已创建文件 x（1 行）")
-verify_nudge.after_tool_call("AgentDelegate", {"agent_type": "verify", "task": "t"}, "{}")
+verify_nudge.after_tool_call(
+    "AgentDelegate", {"agent_type": "verify", "task": "t"}, "VERDICT: PASS")
 check(
     "verify 运行后闸门与计数一起清零",
     verify_nudge._gate_fires == 0

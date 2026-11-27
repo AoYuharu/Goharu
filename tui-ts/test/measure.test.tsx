@@ -45,6 +45,15 @@ for (const { name, msg } of cases) {
   console.log(`${ok ? "PASS" : "FAIL"} ${name}: measured=${expected} rendered=${actual}`);
   unmount();
 }
+{
+  const noteMsg: ChatMessage = { id: 99, ts: "10:00:10", kind: "note", text: "阶段性进展", step: 2 };
+  const { lastFrame, unmount } = render(<MessageItem msg={noteMsg} />, { columns: WIDTH });
+  const frame = lastFrame() ?? "";
+  const ok = frame.includes("进展") && !frame.includes("Assistant");
+  if (!ok) failed++;
+  console.log(`${ok ? "PASS" : "FAIL"} note-renders-as-progress`);
+  unmount();
+}
 const viewportCases = [
   { name: "normal", rows: 24, bottom: 5, top: 0, expected: 18 },
   { name: "checkpoint", rows: 24, bottom: 6, top: 0, expected: 17 },

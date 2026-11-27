@@ -139,6 +139,9 @@ tools:
   - Sleep
   background_no_cancel_tools:
   - AgentDelegate
+  - DiskUsage
+  subagent_tool_timeouts:
+    DiskUsage: 600
   result_format:
     enabled: true
   verify_nudge:
@@ -157,6 +160,7 @@ tools:
   - Tools.builtin.core_tools
   - Tools.builtin.file_tools
   - Tools.builtin.glob_tool
+  - Tools.builtin.disk_usage
   - Tools.builtin.agent_delegate
   - Tools.builtin.pdf_tools
   - Tools.builtin.pdf_annotate_tools

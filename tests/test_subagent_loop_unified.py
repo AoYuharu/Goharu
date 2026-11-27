@@ -12,10 +12,12 @@
 运行：python tests/test_subagent_loop_unified.py
 """
 
+import asyncio
 import json
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
@@ -182,6 +184,58 @@ def main():
           [c for c in registry.dispatched if c[0] == "run_cmd"] == [("run_cmd", {"cmd": "ls -la"})],
           str(registry.dispatched))
     check("只读命令正常执行", result["status"] == "success", result)
+
+    # ------------------------------------------------------------------
+    # 3b. Explore 容量工具、长超时与不可靠报告回退
+    # ------------------------------------------------------------------
+    print("\n[3b] Explore 容量工具与失败回退")
+    explore_tools = SubAgentConfig.get_allowed_tools("explore")
+    check("Explore 白名单含 DiskUsage", "DiskUsage" in explore_tools, explore_tools)
+    allowed = SubAgentConfig.is_command_allowed
+    check("du/df/stat 只读放行",
+          allowed("explore", "du -sh /c") and allowed("explore", "df -h")
+          and allowed("explore", "stat x.txt"))
+    check("rm 仍被拒绝", not allowed("explore", "rm x.txt"))
+
+    import Agent.SubAgent as subagent_module
+    from Agent.SubAgent import _SubToolRuntime
+
+    captured = {}
+
+    async def fake_wait_for(awaitable, timeout):
+        captured["timeout"] = timeout
+        return await awaitable
+
+    config_values = {
+        "tools.subagent_tool_timeouts": {"DiskUsage": 600},
+        "tools.timeout": 60,
+    }
+    with mock.patch.object(subagent_module.config, "get",
+                           side_effect=lambda key, default=None: config_values.get(key, default)), \
+         mock.patch.object(subagent_module.asyncio, "wait_for", side_effect=fake_wait_for):
+        disk_registry = FakeRegistry(["DiskUsage"])
+        runtime = _SubToolRuntime("explore", ["DiskUsage"], disk_registry)
+        timeout_result = asyncio.run(runtime.call_tool("DiskUsage", {}))
+    check("DiskUsage 使用长超时 600s", captured.get("timeout") == 600, str(captured))
+    check("DiskUsage 正常 dispatch", timeout_result == "ok:DiskUsage", timeout_result)
+    check("Explore 调用注入 _subagent 标记",
+          disk_registry.dispatched[0][1].get("_subagent") is True,
+          str(disk_registry.dispatched))
+
+    llm = ScriptedLLM([
+        FakeResponse([
+            {"type": "thinking", "thinking": f"secret-thinking-{i}"},
+            {"type": "tool_use", "id": f"c{i}", "name": "Read", "input": {"path": f"f{i}.py"}},
+        ], stop_reason="tool_use")
+        for i in range(2)
+    ])
+    sub = make_sub("explore", llm, FakeRegistry(["Read", "Grep", "Glob", "run_cmd"]))
+    sub._get_max_iterations = lambda: 2
+    result = sub.execute()
+    check("partial 不包含 thinking 文本",
+          "secret-thinking" not in result.get("content", ""), result)
+    check("partial 明确未形成可靠结论",
+          "未形成可靠最终结论" in result.get("content", ""), result)
 
     # ------------------------------------------------------------------
     # 4. 倒计时 + CRITICAL_REMINDERS 每轮注入

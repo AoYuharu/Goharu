@@ -60,7 +60,7 @@ function buildLines(msg: ChatMessage): string[] {
       ];
     case "note":
       return [
-        ts + chalk.bold.green("Assistant") + chalk.dim(` (Step ${msg.step})`),
+        ts + chalk.bold.cyan("↳ 进展") + chalk.dim(` (Step ${msg.step})`),
         ...renderMarkdown(msg.text).split("\n"),
         " ",
       ];

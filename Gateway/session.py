@@ -238,6 +238,16 @@ class AgentSession:
     def _broadcast_thinking(self, text=None, meta=None):
         self._send("thinking", "send_thinking", text, meta)
 
+    def _broadcast_progress_text(self, text, step, show_text=True):
+        """中间 text 只进富客户端事件流，不作为聊天渠道普通消息发送。"""
+        text_out = str(text or "").strip()
+        if not text_out or not show_text:
+            return
+        self._broadcast_event("agent.text_content", {
+            "step": step,
+            "text": text_out,
+        })
+
     def _broadcast_tool_use(self, name, args, call_id, meta=None):
         self._send("tool_use", "send_tool_use", name, args, call_id, meta)
 
@@ -820,15 +830,7 @@ class AgentSession:
                                              meta={"step": current_step})
 
                 def _on_text(text_content):
-                    text_out = str(text_content).strip()
-                    if not text_out:
-                        return
-                    if show_text:
-                        self._broadcast_event("agent.text_content", {
-                            "step": current_step, "text": text_out})
-                    # 聊天型渠道（QQ 等）：中间文本块也送达（用户要求全量 text 转发）
-                    self._send("text_output", "send_text_output", text_out,
-                               {"step": current_step})
+                    self._broadcast_progress_text(text_content, current_step, show_text)
 
                 def _on_tool_result(tool_name, call_id, result_text):
                     self._broadcast_tool_result(tool_name, str(result_text), str(call_id))

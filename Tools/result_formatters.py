@@ -186,6 +186,48 @@ def _fmt_agent_delegate(data: dict) -> str:
     return header + "\n\n" + str(content)
 
 
+def _human_bytes(value) -> str:
+    size = float(value or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _fmt_disk_usage(data: dict) -> str:
+    lines = [
+        f"目录 {data.get('path')} 的逻辑大小为 {_human_bytes(data.get('total_bytes'))}"
+        f"（文件 {data.get('file_count')}，目录 {data.get('dir_count')}，耗时 {data.get('elapsed_ms')}ms）。"
+    ]
+    coverage = "完整" if data.get("complete") else "不完整"
+    lines.append(
+        f"覆盖状态：{coverage}；权限错误 {data.get('permission_errors')}，"
+        f"其他错误 {data.get('other_errors')}，取消：{'是' if data.get('cancelled') else '否'}。"
+    )
+    lines.append(
+        "统计口径：文件逻辑大小（非精确物理占用）；符号链接/重解析点未跟随；"
+        f"硬链接在文件索引可用时同次扫描只计一次（跳过重复 {data.get('hardlink_deduped')} 个）；"
+        f"跳过链接 {data.get('skipped_links')} 个。"
+    )
+    entries = data.get("entries") or []
+    if entries:
+        lines.append("目录聚合 Top-N：")
+        for item in entries:
+            lines.append(f"  - {item.get('path')}：{_human_bytes(item.get('bytes'))}（{item.get('files')} 个文件）")
+    files = data.get("largest_files") or []
+    if files:
+        lines.append("最大文件 Top-N：")
+        for item in files:
+            lines.append(f"  - {item.get('path')}：{_human_bytes(item.get('bytes'))}")
+    samples = data.get("error_samples") or []
+    if samples:
+        lines.append("错误样例：")
+        for item in samples:
+            lines.append(f"  - {item.get('path')}：{item.get('error')}")
+    return "\n".join(lines)
+
+
 # 工具名 → 翻译模板。没列出的工具走默认（美化 JSON）。
 _FORMATTERS: dict[str, Callable[[dict], str]] = {
     "Read": _fmt_read,
@@ -195,6 +237,7 @@ _FORMATTERS: dict[str, Callable[[dict], str]] = {
     "Glob": _fmt_glob,
     "run_cmd": _fmt_run_cmd,
     "AgentDelegate": _fmt_agent_delegate,
+    "DiskUsage": _fmt_disk_usage,
 }
 
 

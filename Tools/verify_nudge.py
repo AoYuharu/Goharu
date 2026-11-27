@@ -13,6 +13,7 @@ Goharu 没有任务清单系统，等价的坏模式检测是：
 
 import logging
 import os
+import re
 
 from Tools.config_proxy import get_config
 
@@ -125,10 +126,10 @@ class VerifyNudge:
         if not self._enabled():
             return None
 
-        # verify 子智能体跑过 → 计数与闸门次数都清零（新一轮验收周期开始）
+        # verify 子智能体只有 PASS 才清零；FAIL/PARTIAL/error/无 verdict 不算验收完成
         if tool_name == "AgentDelegate":
             agent_type = str((arguments or {}).get("agent_type", "")).lower()
-            if agent_type == "verify":
+            if agent_type == "verify" and re.search(r"VERDICT:\s*PASS\b", result_text, re.IGNORECASE):
                 self._mutation_count = 0
                 self._gate_fires = 0
                 self._risky_touched = False

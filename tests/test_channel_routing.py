@@ -32,6 +32,8 @@ class FakeChannel(Channel):
         self.answers = []
         self.thinkings = []
         self.tool_uses = []
+        self.events = []
+        self.text_outputs = []
 
     def send_answer(self, text, meta=None):
         self.answers.append(str(text))
@@ -41,6 +43,12 @@ class FakeChannel(Channel):
 
     def send_tool_use(self, name, args, call_id="", meta=None):
         self.tool_uses.append(name)
+
+    def send_event(self, event_type, payload):
+        self.events.append((event_type, payload))
+
+    def send_text_output(self, text, meta=None):
+        self.text_outputs.append(str(text))
 
 
 def make_session():
@@ -100,6 +108,17 @@ def main():
     s._broadcast_tool_use("run_cmd", {}, "c1")
     check("tool_use 只到 TUI（QQ 无此能力）",
           tui.tool_uses == ["run_cmd"] and qq.tool_uses == [])
+
+    print("== 中间 text 只进 TUI event，不进聊天消息 ==")
+    tui.events.clear(); qq.text_outputs.clear()
+    s._broadcast_progress_text("阶段性推测", 3, True)
+    check("TUI 收到 agent.text_content",
+          tui.events == [("agent.text_content", {"step": 3, "text": "阶段性推测"})])
+    check("QQ 不收任意中间 text", qq.text_outputs == [])
+    s._broadcast_progress_text("被隐藏的进展", 4, False)
+    check("show_text=false 不广播", len(tui.events) == 1)
+    s._send("text_output", "send_text_output", "后台任务已启动", {"kind": "bg_started"})
+    check("真实后台通知仍发 QQ", qq.text_outputs == ["后台任务已启动"])
 
     print("== 第三通道消息 → 路由切换 + 提醒 ==")
     s.attach_channel(tg)

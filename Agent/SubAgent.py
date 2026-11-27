@@ -95,7 +95,7 @@ class SubAgentConfig:
     }
 
     EXPLORE_PLAN_COMMANDS = {
-        'find',
+        'find', 'du', 'df', 'stat',
     }
 
     COMMAND_ALLOWLISTS = {
@@ -167,7 +167,7 @@ class SubAgentConfig:
     CRITICAL_REMINDERS = {
         "explore": (
             "CRITICAL: 这是只读探索任务。禁止创建、修改、删除任何文件（包括临时文件）。"
-            "找到足够信息后立即以文本返回分析报告，不要扩大搜索面。"
+            "达到任务要求的覆盖度后立即以文本返回分析报告，不要超出分配的目录范围。"
         ),
         "plan": (
             "CRITICAL: 这是只读规划任务。禁止创建、修改、删除任何文件（包括临时文件）。"
@@ -206,7 +206,7 @@ class SubAgentConfig:
     def get_allowed_tools(cls, agent_type: str) -> List[str]:
         """获取指定类型agent允许使用的工具"""
         if agent_type.lower() in ["explore", "plan"]:
-            return ["Read", "Grep", "Glob", "run_cmd"]
+            return ["Read", "Grep", "Glob", "DiskUsage", "run_cmd"]
         elif agent_type.lower() == "verify":
             return ["Read", "Grep", "Glob", "run_cmd", "WriteTestFile"]
         elif agent_type.lower() == "verify_explore":
@@ -410,17 +410,22 @@ class _SubToolRuntime:
         tool_args = tool_args or {}
         access_error = self._validate_access(tool_name, tool_args)
         if access_error is None:
-            tool_timeout = config.get("tools.timeout", 60)
+            overrides = config.get("tools.subagent_tool_timeouts", {}) or {}
+            tool_timeout = float(overrides.get(tool_name, config.get("tools.timeout", 60)))
+            dispatch_args = dict(tool_args)
+            if tool_name == "DiskUsage":
+                dispatch_args["_subagent"] = True
             try:
                 with timeit(f"subagent.tool.{tool_name}"):
                     result = await asyncio.wait_for(
-                        self.registry.dispatch(tool_name, tool_args),
+                        self.registry.dispatch(tool_name, dispatch_args),
                         timeout=tool_timeout,
                     )
                 result_text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
             except asyncio.TimeoutError:
+                hint = "按更小目录拆分，或改用 DiskUsage 分区扫描；不要原样重试同一个长任务。"
                 result_text = json.dumps(
-                    {"error": f"Tool '{tool_name}' timed out after {tool_timeout}s"},
+                    {"error": f"Tool '{tool_name}' timed out after {tool_timeout}s", "hint": hint},
                     ensure_ascii=False)
             except Exception as e:
                 result_text = json.dumps(
@@ -813,26 +818,6 @@ class SubAgent:
 
         return result
 
-    def _scan_messages_for_last_text(self, messages: List[Dict]) -> Optional[str]:
-        """扫描消息列表，返回最后一条 assistant 的 text/thinking 内容（排除纯 tool_use 消息）"""
-        for msg in reversed(messages):
-            if msg.get("role") != "assistant":
-                continue
-            content = msg.get("content")
-            if isinstance(content, list):
-                text_parts = []
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") in ("text", "thinking"):
-                            text_parts.append(block.get("text", "") or block.get("thinking", ""))
-                    elif hasattr(block, "type") and getattr(block, "type") in ("text", "thinking"):
-                        text_parts.append(getattr(block, "text", "") or getattr(block, "thinking", ""))
-                if text_parts:
-                    return "\n".join(text_parts)
-            elif isinstance(content, str) and content.strip():
-                return content.strip()
-        return None
-
     def execute(self) -> Dict[str, Any]:
         """
         执行子agent任务——薄驱动：循环调用与主 Agent 同一套 ActorAgent.act()，
@@ -976,9 +961,6 @@ class SubAgent:
 
                 text_preview = "\n".join(step_text).strip() or (result.get("answer") or "")
                 thinking_preview = "\n".join(step_thinking).strip() or (result.get("thinking") or "")
-                if text_preview or thinking_preview:
-                    self.last_text_answer = text_preview or thinking_preview
-                    self.shared_state["last_text_answer"] = self.last_text_answer
                 self._notify(
                     f"  💭 [{self.agent_id}] 思考: "
                     + ((text_preview or thinking_preview or "(no text)")[:200]),
@@ -1008,7 +990,10 @@ class SubAgent:
                 # error：引擎已优雅返回错误文本（重试耗尽/空响应），不向上抛
                 self._notify(f"  ❌ [{self.agent_id}] LLM 调用失败: {result.get('error')}", "error",
                              category="error")
-                fallback = self._scan_messages_for_last_text(working.get_context()) or ""
+                fallback = (
+                    f"未形成可靠最终结论（LLM 调用失败）；"
+                    f"已执行 {len(self.tool_calls)} 次工具调用。"
+                )
                 return self._build_result(
                     "error", fallback, iteration,
                     error=f"LLM call failed: {result.get('error')}",
@@ -1018,15 +1003,9 @@ class SubAgent:
             if final_answer is None:
                 self._notify(f"  ⚠️ [{self.agent_id}] 达到最大迭代次数", "warning")
                 final_answer = (
-                    self.last_text_answer
-                    or self._scan_messages_for_last_text(working.get_context())
-                    or ""
+                    f"未形成可靠最终结论（达到 {max_iterations} 轮上限）；"
+                    f"已执行 {len(self.tool_calls)} 次工具调用。"
                 )
-                if not final_answer:
-                    final_answer = (
-                        f"子Agent [{self.agent_id}] 在 {max_iterations} 轮内"
-                        f"未能生成文本答案（已执行 {len(self.tool_calls)} 次工具调用）"
-                    )
                 return self._build_result(
                     "partial", final_answer, iteration,
                     warning="Reached max iterations"

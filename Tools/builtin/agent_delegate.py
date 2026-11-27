@@ -427,10 +427,15 @@ WHY SPLIT: Sub-agents run concurrently (up to 3 Explore at once). Parallel searc
 CALLER-SPECIFIC ACCESS: The main Agent may use all four types: Explore, Plan, Verify, and Architect. When Architect calls this tool, it may ONLY use agent_type='explore' for read-only investigation. Architect must NOT call Plan, Verify, or Architect, and must NOT delegate recursively.
 
 WHEN TO SPLIT:
-- Scanning multiple directories/disks: one agent per directory tree
+- Scanning multiple directories/disks: one agent per NON-OVERLAPPING directory tree; each Explore uses DiskUsage for size statistics and interprets the result
 - Analyzing multiple modules: one agent per module
 - Searching by multiple patterns: one agent per pattern
 - Any task that can be partitioned: DO IT
+
+Disk-usage example (split — concurrent):
+  call 1: Explore task="Use DiskUsage on C:/Users; report largest subdirectories and explain their purpose"
+  call 2: Explore task="Use DiskUsage on C:/Windows; report largest subdirectories and explain their purpose"
+  call 3: Explore task="Use DiskUsage on C:/ProgramData; report largest subdirectories and explain their purpose"
 
 GOOD (split — concurrent):
   call 1: Explore task="Search for 'keyword' in C:/Projects/src"
@@ -463,11 +468,11 @@ Concurrent execution: max 3 Explore, max 2 Plan, max 1 Verify, max 1 Architect b
             "agent_type": {
                 "type": "string",
                 "enum": ["Explore", "Plan", "Verify", "Architect", "explore", "plan", "verify", "architect"],
-                "description": "Agent type: Explore (search/understand codebase), Plan (design implementation plan), Verify (adversarial read-only verification), or Architect (manage/upgrade the Goharu codebase itself, has write tools and private memory)."
+                "description": "Agent type: Explore (read-only code/filesystem/disk-usage/system-metadata exploration), Plan (design implementation plan), Verify (adversarial read-only verification), or Architect (manage/upgrade the Goharu codebase itself, has write tools and private memory)."
             },
             "task": {
                 "type": "string",
-                "description": "Task for THIS specific area only. Each AgentDelegate call = ONE target. DO NOT bundle multiple areas in one call. Example: 'Search for config.yaml in C:/Users' rather than 'Search everywhere for config.yaml'. Be specific about path and target. For verify, the task should be a LIGHT summary only: which files you changed plus the original purpose (a few sentences). Git status and full diff are auto-prefilled into Verify's context by the framework; Verify reads code, writes its own test cases, and runs real tests independently — do NOT include test commands, expected behavior, risk points, test results, or anything that could steer its test direction."
+                "description": "Task for THIS specific area only. Each AgentDelegate call = ONE NON-OVERLAPPING target. DO NOT bundle multiple directory trees in one call. For disk-usage work, name the assigned root and instruct Explore to use DiskUsage, then interpret the largest entries. Example: 'Use DiskUsage on C:/Users and explain the largest subdirectories'. For verify, the task should be a LIGHT summary only: which files you changed plus the original purpose (a few sentences). Git status and full diff are auto-prefilled into Verify's context by the framework; Verify reads code, writes its own test cases, and runs real tests independently — do NOT include test commands, expected behavior, risk points, test results, or anything that could steer its test direction."
             },
             "run_background": {
                 "type": "boolean",
