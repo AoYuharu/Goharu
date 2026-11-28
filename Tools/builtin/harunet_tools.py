@@ -17,6 +17,8 @@ import logging
 import threading
 import time
 
+from Core.reply_suppression import is_group_suppress_text
+from Tools.config_proxy import get_config
 from Tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -131,6 +133,13 @@ async def harunet_reply(text: str | None = None, kind: str = "group",
                          file_paths: list | None = None,
                          to: str | None = None) -> str:
     """广播消息（mentions=[agent_id] @对方；file_paths 先上传再随消息广播）。"""
+    if text:
+        phrases = get_config().get(
+            "channels.group_reply_suppress_phrases",
+            ["不回复", "无需回复", "不回应", "不参与"])
+        if is_group_suppress_text(text, phrases):
+            return _json({"ok": False, "suppressed": True,
+                          "error": "群聊屏蔽词不发送；如需发言请直接给正文"})
     h = _get()
     if h is None:
         return _json(_NOT_WIRED)

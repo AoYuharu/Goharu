@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 from Core.Message import CoreMessage, MessageSource
+from Core.reply_suppression import is_group_suppress_text
 from Core.LifecycleLog import lifecycle
 from Core.error_report import report_error
 from Core.timing import timeit
@@ -71,6 +72,10 @@ class AgentSession:
         self._active_channel = None
         # 当前 turn 的固定来源；处理期间新到消息只改 _active_channel，不抢本轮回包
         self._turn_channel = None
+        # 本轮来源是否为群聊（QQ scene=group / HaruNet 广播）；群聊屏蔽词只拦群出口
+        self._turn_is_group = False
+        # 主人消息永不屏蔽；只有同事/普通群消息允许用屏蔽词
+        self._turn_allow_suppress = False
 
         # 计划模式（只读运行时状态）：闸门由 SessionManager 装配
         self.plan_mode = False
@@ -237,7 +242,32 @@ class AgentSession:
     def _broadcast_event(self, event_type, payload):
         self._send("event", "send_event", event_type, payload)
 
+    def _is_group_suppressed_answer(self, text) -> bool:
+        phrases = config.get(
+            "channels.group_reply_suppress_phrases",
+            ["不回复", "无需回复", "不回应", "不参与"],
+        )
+        return self._turn_allow_suppress and is_group_suppress_text(text, phrases)
+
+    def _broadcast_answer_to_tui(self, text, meta=None):
+        for ch in self.channels:
+            if ch.channel_type == "tui":
+                try:
+                    ch.send_answer(text, meta)
+                except Exception as e:
+                    logger.warning("session %s: suppressed TUI answer failed: %s",
+                                   self.session_id, e)
+
     def _broadcast_answer(self, text, meta=None):
+        if self._is_group_suppressed_answer(text):
+            logger.info("session %s: 群聊屏蔽词回答不转发（%s）",
+                        self.session_id, str(text)[:40])
+            self._broadcast_answer_to_tui(text, meta)
+            self._broadcast_event("agent.answer_suppressed", {
+                "reason": "group_block_phrase",
+                "text": str(text),
+            })
+            return
         self._send(None, "send_answer", text, meta)   # answer 是隐含必要能力
 
     def _broadcast_thinking(self, text=None, meta=None):
@@ -263,6 +293,19 @@ class AgentSession:
     # ------------------------------------------------------------------
     # 入站：channel 消息入队
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _message_is_group(msg) -> bool:
+        if msg.channel_type == "harunet":
+            return True   # Goharu 的 HaruNet 出站固定为 grp:main 群广播
+        meta = getattr(msg, "meta", None) or {}
+        if "is_group" in meta:
+            return bool(meta.get("is_group"))
+        if str(meta.get("scene", "")).lower() == "group":
+            return True
+        if str(meta.get("class", "")).lower() == "group":
+            return True
+        return bool(meta.get("group") or meta.get("group_id"))
 
     def enqueue(self, msg):
         """channel 入站唯一入口（msg: ChannelMessage）。
@@ -311,6 +354,8 @@ class AgentSession:
                 return
 
         source = msg.channel_type
+        is_group = self._message_is_group(msg)
+        allow_suppress = is_group and not bool((msg.meta or {}).get("from_owner"))
         meta_info = ""
         if msg.meta:
             brief = ", ".join(f"{k}={v}" for k, v in list(msg.meta.items())[:3])
@@ -344,7 +389,8 @@ class AgentSession:
         # 确认/答案已在入口被 channel 拦截消费，不受此封锁影响。
         if self._update_blocked():
             self.queue_message(annotated, req_id=f"{msg.channel_id}",
-                               origin=(source, msg.channel_id))
+                               origin=(source, msg.channel_id), is_group=is_group,
+                               allow_suppress=allow_suppress)
             logger.info("session %s: 更新进行中，消息挂起: %s",
                         self.session_id, msg.text[:30])
             return
@@ -355,6 +401,8 @@ class AgentSession:
                     "type": "message", "data": annotated,
                     "req_id": f"{msg.channel_id}", "priority": "high",
                     "origin": (source, msg.channel_id),
+                    "is_group": is_group,
+                    "allow_suppress": allow_suppress,
                 })
             if self._processing:
                 # 打断当前轮：actor 在下一个检查点（步骤边界/工具执行前）
@@ -373,7 +421,8 @@ class AgentSession:
             return
 
         self.queue_message(annotated, req_id=f"{msg.channel_id}",
-                           origin=(source, msg.channel_id))
+                           origin=(source, msg.channel_id), is_group=is_group,
+                               allow_suppress=allow_suppress)
         self._start_processing()
 
     def dispatch_question(self, request_id, payload):
@@ -391,11 +440,13 @@ class AgentSession:
                 logger.warning("session %s: dispatch_question to %s failed: %s",
                                self.session_id, ch, e)
 
-    def queue_message(self, message: str, req_id="", origin=None):
+    def queue_message(self, message: str, req_id="", origin=None,
+                      is_group=False, allow_suppress=False):
         with self._batch_lock:
             self.pending_items.append({
                 "type": "message", "data": message, "req_id": req_id,
-                "origin": origin,
+                "origin": origin, "is_group": bool(is_group),
+                "allow_suppress": bool(allow_suppress),
             })
             logger.info("session %s: queued message (pending=%d)",
                         self.session_id, len(self.pending_items))
@@ -551,12 +602,16 @@ class AgentSession:
                             msg_items.append(items[i])
                             i += 1
                         combined = "\n".join(m["data"] for m in msg_items)
+                        is_group = any(m.get("is_group") for m in msg_items)
+                        allow_suppress = any(m.get("allow_suppress") for m in msg_items)
                         if len(msg_items) > 1:
                             self._broadcast_event("user.batch", {
                                 "count": len(msg_items),
                                 "combined": combined[:100]})
                         last_answer = self._run_sync(
-                            self.process_message(combined, origin=origin))
+                            self.process_message(combined, origin=origin,
+                                                 is_group=is_group,
+                                                 allow_suppress=allow_suppress))
                         self._broadcast_event("token.stats", self.calculate_token_stats())
                         self._broadcast_event("message.complete",
                                               {"answer": last_answer})
@@ -672,9 +727,12 @@ class AgentSession:
     # turn 循环
     # ------------------------------------------------------------------
 
-    async def process_message(self, message: str, origin=None) -> str:
+    async def process_message(self, message: str, origin=None,
+                              is_group=False, allow_suppress=False) -> str:
         """处理一条（或一批同源合并的）用户消息，返回最终回答。"""
         self._turn_channel = origin
+        self._turn_is_group = bool(is_group)
+        self._turn_allow_suppress = bool(allow_suppress)
         self._processing = True
         self._micro_compacted = False
         self._turn_tools = []          # 本轮工具调用统计（供 answer 附带摘要）
@@ -1002,6 +1060,8 @@ class AgentSession:
             raise
         finally:
             self._turn_channel = None
+            self._turn_is_group = False
+            self._turn_allow_suppress = False
             # checkpoint：turn 结束收口（finalize 重哈希 + git 对账 + 落盘）。
             # 放 finally 保证 5 条出路径全覆盖；to_thread 避免 git subprocess
             # 阻塞事件循环；内部全吞异常，绝不破坏 finally。

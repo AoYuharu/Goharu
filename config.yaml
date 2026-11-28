@@ -333,5 +333,10 @@ sessions:
 channels:
   plugins:
   - Architect.channel
+  group_reply_suppress_phrases:
+  - 不回复
+  - 无需回复
+  - 不回应
+  - 不参与
 gateway:
   rpc_port: 8791

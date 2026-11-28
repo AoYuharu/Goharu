@@ -38,8 +38,11 @@ class RoutingSession(AgentSession):
         super().__init__("default", None, None, None, _FakeBg(), None, None)
         self.origins = []
 
-    async def process_message(self, message, origin=None):
+    async def process_message(self, message, origin=None,
+                              is_group=False, allow_suppress=False):
         self._turn_channel = origin
+        self._turn_is_group = bool(is_group)
+        self._turn_allow_suppress = bool(allow_suppress)
         self.origins.append(origin)
         answer = f"answer:{origin[0] if origin else 'none'}"
         self._broadcast_answer(answer)
@@ -144,6 +147,34 @@ def main():
     check("show_text=false 不广播", len(tui.events) == 1)
     s._send("text_output", "send_text_output", "后台任务已启动", {"kind": "bg_started"})
     check("真实后台通知仍发 QQ", qq.text_outputs == ["后台任务已启动"])
+
+    print("== 群聊屏蔽词：不转发群 channel，TUI 仍可见 ==")
+    tui.answers.clear(); qq.answers.clear(); tui.events.clear()
+    s._turn_channel = ("qqbot", "qq_main")
+    s._turn_is_group = True
+    s._turn_allow_suppress = True
+    s._broadcast_answer("不回复")
+    check("群聊屏蔽词不发 QQ", qq.answers == [])
+    check("TUI 仍可见屏蔽决定", tui.answers == ["不回复"])
+    check("产生 agent.answer_suppressed 事件",
+          any(et == "agent.answer_suppressed" for et, _ in tui.events))
+    check("Markdown 屏蔽词识别", s._is_group_suppressed_answer("**不回复**"))
+    check("带解释不拦截", not s._is_group_suppressed_answer("不回复，因为这件事与我无关。"))
+    s._turn_allow_suppress = False
+    s._broadcast_answer("不回复")
+    check("主人消息即使群聊也不屏蔽", qq.answers == ["不回复"])
+    s._turn_is_group = False
+    s._broadcast_answer("不回复")
+    check("非群聊不屏蔽", qq.answers[-1] == "不回复")
+    s._turn_channel = None
+
+    print("== 群聊来源识别 ==")
+    check("QQ group 识别", AgentSession._message_is_group(ChannelMessage(
+        "x", "qqbot", "qq_main", {"scene": "group"})))
+    check("QQ c2c 不识别", not AgentSession._message_is_group(ChannelMessage(
+        "x", "qqbot", "qq_main", {"scene": "c2c"})))
+    check("HaruNet 恒群聊", AgentSession._message_is_group(ChannelMessage(
+        "x", "harunet", "harunet_main", {})))
 
     print("== 第三通道消息 → 路由切换 + 提醒 ==")
     s.attach_channel(tg)

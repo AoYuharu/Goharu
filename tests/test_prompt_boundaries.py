@@ -28,6 +28,7 @@ def main():
     base = (ROOT / "prompts" / "actor" / "base.md").read_text(encoding="utf-8")
     explore = (ROOT / "prompts" / "subagent" / "explore.md").read_text(encoding="utf-8")
     architect = (ROOT / "prompts" / "subagent" / "architect.md").read_text(encoding="utf-8")
+    harunet = (ROOT / "prompts" / "actor" / "harunet.md").read_text(encoding="utf-8")
     delegate = (ROOT / "Tools" / "builtin" / "agent_delegate.py").read_text(encoding="utf-8")
 
     print("\n[1] 主 Actor 证据协议")
@@ -65,6 +66,10 @@ def main():
     check("AgentDelegate 不再把 Explore 限定为 codebase",
           "search/understand codebase" not in delegate)
     check("Architect 含证据纪律", "Evidence Discipline" in architect)
+    check("HaruNet 无关群消息直接输出屏蔽词",
+          "Output exactly `不回复`" in harunet)
+    check("HaruNet 屏蔽词不用于主人或 @ 消息",
+          "Never use this for owner messages, direct @mentions" in harunet)
 
     print("\n" + "=" * 60)
     print(f"结果: {PASS} 通过, {FAIL} 失败")

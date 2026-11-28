@@ -267,14 +267,15 @@ class HaruNetChannel(Channel):
     _NOTE_FOR_ME = "This Message is specifically sent for you, you need to reply it"
     _NOTE_BROADCAST = ("This is a broadcast message sent from user, react to it "
                        "and participate in the current talking only if you could "
-                       "confirm that you are helpful or necessary to reply")
+                       "confirm that you are helpful or necessary to reply. "
+                       "If it is clearly unrelated to you, output exactly '不回复'.")
 
     def _note_for_other(self, mentions: list) -> str:
         return ("This Message is specifically sent for "
                 f"{self._fmt_mentions(mentions)}, Not For You. "
                 "But You can do some slight thinking or analysis if you confirm "
                 "that you are helpful or necessary to participate in their "
-                "conversation.")
+                "conversation. If it is clearly unrelated to you, output exactly '不回复'.")
 
     def _mention_note(self, mentions: list) -> str:
         """群消息 @对象 reminder（每条必跟）：@我 → 必须回复；@别人 → 明确旁观；
@@ -555,7 +556,8 @@ class HaruNetChannel(Channel):
             "不重要且不相关的可以不回复。"
         )
         self.emit_inbound(text, meta={"harunet": True, "class": "group",
-                                      "summarized": True, "count": len(rows)})
+                                      "summarized": True, "count": len(rows),
+                                      "from_owner": any(r["sender"] in self.owner_ids for r in rows)})
 
     # ------------------------------------------------------------- 出站
     def send_answer(self, text: str, meta: dict | None = None):
@@ -819,4 +821,5 @@ class HaruNetChannel(Channel):
                      "相关或被问到时才用 harunet_reply 回复。")
         logger.info("安静期自动阅读触发")
         self.emit_inbound("\n".join(parts), meta={"harunet": True, "class": "group",
-                                                  "auto_read": True})
+                                                  "auto_read": True,
+                                                  "from_owner": bool(owner_latest)})
