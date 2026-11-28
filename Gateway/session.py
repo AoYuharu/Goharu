@@ -36,6 +36,8 @@ from Prompting.reminders import PLAN_MODE_REMINDER
 
 logger = logging.getLogger(__name__)
 
+_UNSPECIFIED = object()
+
 
 class AgentSession:
     """单会话运行时：消息队列 + turn 循环 + channel 轮发。"""
@@ -67,6 +69,8 @@ class AgentSession:
         self._watchdog_thread_started = False
         # 出站路由：最近一条用户消息的来源 channel（None=尚无消息，全量广播）
         self._active_channel = None
+        # 当前 turn 的固定来源；处理期间新到消息只改 _active_channel，不抢本轮回包
+        self._turn_channel = None
 
         # 计划模式（只读运行时状态）：闸门由 SessionManager 装配
         self.plan_mode = False
@@ -202,10 +206,11 @@ class AgentSession:
         - 路由目标全部因 capability 过滤掉（如来源 channel 掉线）→ 全量兜底，
           答案绝不丢
         """
-        if capability == "event" or self._active_channel is None:
+        active = self._turn_channel if self._turn_channel is not None else self._active_channel
+        if capability == "event" or active is None:
             return [ch for ch in self.channels
                     if not capability or capability in ch.capabilities]
-        atype, aid = self._active_channel
+        atype, aid = active
         targets = [
             ch for ch in self.channels
             if (ch.channel_type == atype and ch.channel_id == aid)
@@ -338,7 +343,8 @@ class AgentSession:
         # 更新四态进行中：新消息挂起（不打断、不启动新轮）。
         # 确认/答案已在入口被 channel 拦截消费，不受此封锁影响。
         if self._update_blocked():
-            self.queue_message(annotated, req_id=f"{msg.channel_id}")
+            self.queue_message(annotated, req_id=f"{msg.channel_id}",
+                               origin=(source, msg.channel_id))
             logger.info("session %s: 更新进行中，消息挂起: %s",
                         self.session_id, msg.text[:30])
             return
@@ -348,6 +354,7 @@ class AgentSession:
                 self.pending_items.insert(0, {
                     "type": "message", "data": annotated,
                     "req_id": f"{msg.channel_id}", "priority": "high",
+                    "origin": (source, msg.channel_id),
                 })
             if self._processing:
                 # 打断当前轮：actor 在下一个检查点（步骤边界/工具执行前）
@@ -365,7 +372,8 @@ class AgentSession:
             self._start_processing()
             return
 
-        self.queue_message(annotated, req_id=f"{msg.channel_id}")
+        self.queue_message(annotated, req_id=f"{msg.channel_id}",
+                           origin=(source, msg.channel_id))
         self._start_processing()
 
     def dispatch_question(self, request_id, payload):
@@ -383,9 +391,12 @@ class AgentSession:
                 logger.warning("session %s: dispatch_question to %s failed: %s",
                                self.session_id, ch, e)
 
-    def queue_message(self, message: str, req_id=""):
+    def queue_message(self, message: str, req_id="", origin=None):
         with self._batch_lock:
-            self.pending_items.append({"type": "message", "data": message, "req_id": req_id})
+            self.pending_items.append({
+                "type": "message", "data": message, "req_id": req_id,
+                "origin": origin,
+            })
             logger.info("session %s: queued message (pending=%d)",
                         self.session_id, len(self.pending_items))
 
@@ -403,12 +414,15 @@ class AgentSession:
         except Exception:
             return False
 
-    def get_pending_messages(self):
-        """取出全部 pending 消息（command 留在队列等批次间执行）。"""
+    def get_pending_messages(self, origin=_UNSPECIFIED):
+        """取出 pending 消息；指定 origin 时只取同源消息，其他来源留到下一轮。"""
         with self._batch_lock:
             msgs, reqs, remaining = [], [], []
             for item in self.pending_items:
                 if item["type"] == "message":
+                    if origin is not _UNSPECIFIED and item.get("origin") != origin:
+                        remaining.append(item)
+                        continue
                     msgs.append(item["data"])
                     reqs.append(item["req_id"])
                 else:
@@ -530,8 +544,10 @@ class AgentSession:
                         self._run_sync(_execute_command(item))
                         i += 1
                     else:
+                        origin = items[i].get("origin")
                         msg_items = []
-                        while i < len(items) and items[i]["type"] == "message":
+                        while (i < len(items) and items[i]["type"] == "message"
+                               and items[i].get("origin") == origin):
                             msg_items.append(items[i])
                             i += 1
                         combined = "\n".join(m["data"] for m in msg_items)
@@ -539,7 +555,8 @@ class AgentSession:
                             self._broadcast_event("user.batch", {
                                 "count": len(msg_items),
                                 "combined": combined[:100]})
-                        last_answer = self._run_sync(self.process_message(combined))
+                        last_answer = self._run_sync(
+                            self.process_message(combined, origin=origin))
                         self._broadcast_event("token.stats", self.calculate_token_stats())
                         self._broadcast_event("message.complete",
                                               {"answer": last_answer})
@@ -655,8 +672,9 @@ class AgentSession:
     # turn 循环
     # ------------------------------------------------------------------
 
-    async def process_message(self, message: str) -> str:
-        """处理一条（或一批合并的）用户消息，返回最终回答。"""
+    async def process_message(self, message: str, origin=None) -> str:
+        """处理一条（或一批同源合并的）用户消息，返回最终回答。"""
+        self._turn_channel = origin
         self._processing = True
         self._micro_compacted = False
         self._turn_tools = []          # 本轮工具调用统计（供 answer 附带摘要）
@@ -702,7 +720,7 @@ class AgentSession:
             self._interrupt_event.clear()
 
             # 合并第一批待处理消息
-            pending_msgs, pending_reqs = self.get_pending_messages()
+            pending_msgs, pending_reqs = self.get_pending_messages(origin=origin)
             if "bg_reactivation" in pending_reqs:
                 self._bg_reactivation_queued = False
             all_messages = [message] + pending_msgs
@@ -737,7 +755,7 @@ class AgentSession:
                 step += 1
 
                 # 中途合并新到的消息
-                pending_msgs, pending_reqs = self.get_pending_messages()
+                pending_msgs, pending_reqs = self.get_pending_messages(origin=origin)
                 if pending_msgs:
                     pending_text = "\n".join(pending_msgs)
                     logger.info(
@@ -983,6 +1001,7 @@ class AgentSession:
             )
             raise
         finally:
+            self._turn_channel = None
             # checkpoint：turn 结束收口（finalize 重哈希 + git 对账 + 落盘）。
             # 放 finally 保证 5 条出路径全覆盖；to_thread 避免 git subprocess
             # 阻塞事件循环；内部全吞异常，绝不破坏 finally。

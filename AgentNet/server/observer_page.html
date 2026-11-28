@@ -539,6 +539,16 @@ function mdToHtml(text) {
   const isBlank = l => !l.trim();
   const isFence = l => /^\s*```/.test(l);
   const isHr = l => /^\s*(?:---+|\*\*\*+|___+)\s*$/.test(l);
+  const tableCells = line => {
+    let s = line.trim();
+    if (s.startsWith('|')) s = s.slice(1);
+    if (s.endsWith('|')) s = s.slice(0, -1);
+    return s.split('|').map(c => c.trim());
+  };
+  const isTableDivider = l => {
+    const cells = tableCells(l);
+    return cells.length >= 2 && cells.every(c => /^:?-{3,}:?$/.test(c));
+  };
   const heading = l => l.match(/^(#{1,4})\s+(.*)$/);
   const ulItem = l => l.match(/^\s*[-*+]\s+(.*)$/);
   const olItem = l => l.match(/^\s*(\d+)[.)]\s+(.*)$/);
@@ -564,6 +574,25 @@ function mdToHtml(text) {
     }
     if (isBlank(line)) { closeAll(); i++; continue; }
     if (isHr(line)) { closeAll(); out.push('<hr>'); i++; continue; }
+    if (line.includes('|') && i + 1 < lines.length && isTableDivider(lines[i + 1])) {
+      closeAll();
+      const headers = tableCells(line);
+      const aligns = tableCells(lines[i + 1]).map(c =>
+        /^:-+:$/.test(c) ? 'center' : /^:-+$/.test(c) ? 'left' : /^-+:$/.test(c) ? 'right' : '');
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim() && !isFence(lines[i])) {
+        rows.push(tableCells(lines[i]));
+        i++;
+      }
+      const attr = j => aligns[j] ? ' style="text-align:' + aligns[j] + '"' : '';
+      out.push('<table><thead><tr>' + headers.map((c, j) =>
+        '<th' + attr(j) + '>' + mdInline(c) + '</th>').join('') +
+        '</tr></thead><tbody>' + rows.map(r => '<tr>' + headers.map((_, j) =>
+          '<td' + attr(j) + '>' + mdInline(r[j] || '') + '</td>').join('') + '</tr>').join('') +
+        '</tbody></table>');
+      continue;
+    }
     const h = heading(line);
     if (h) { closeAll(); const lv = h[1].length; out.push('<h' + lv + '>' + mdInline(h[2]) + '</h' + lv + '>'); i++; continue; }
     if (/^\s*>\s?/.test(line)) {

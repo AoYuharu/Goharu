@@ -24,6 +24,31 @@ def check(name, cond):
         print(f"  FAIL  {name}")
 
 
+class _FakeBg:
+    reactivation_count = 99
+
+    def has_pending(self):
+        return False
+
+
+class RoutingSession(AgentSession):
+    """用假 process_message 记录每轮 origin，验证不同来源不串台。"""
+
+    def __init__(self):
+        super().__init__("default", None, None, None, _FakeBg(), None, None)
+        self.origins = []
+
+    async def process_message(self, message, origin=None):
+        self._turn_channel = origin
+        self.origins.append(origin)
+        answer = f"answer:{origin[0] if origin else 'none'}"
+        self._broadcast_answer(answer)
+        return answer
+
+    def calculate_token_stats(self, extra_system_prompt=""):
+        return {}
+
+
 class FakeChannel(Channel):
     def __init__(self, channel_id, channel_type, caps=()):
         super().__init__(channel_id)
@@ -131,6 +156,21 @@ def main():
     check("telegram 收到", tg.answers == ["回答C"])
     check("TUI 常驻副本", tui.answers == ["回答C"])
     check("QQ 收不到", qq.answers == [])
+
+    print("== 不同来源分轮回答，不合并串台 ==")
+    tui2 = FakeChannel("tui_main", "tui", {"thinking", "tool_use", "tool_result", "event"})
+    qq2 = FakeChannel("qq_main", "qqbot", {"thinking", "text_output", "file"})
+    s2 = RoutingSession()
+    s2.attach_channel(tui2)
+    s2.attach_channel(qq2)
+    s2._start_processing = lambda: None
+    s2.enqueue(msg(tui2, "A 任务"))
+    s2.enqueue(msg(qq2, "B 问进度"))
+    s2._process_queued_messages()
+    check("A/B 各自成轮", s2.origins == [("tui", "tui_main"), ("qqbot", "qq_main")])
+    check("A 回答只到 TUI，B 回答到 QQ",
+          tui2.answers == ["answer:tui", "answer:qqbot"]
+          and qq2.answers == ["answer:qqbot"])
 
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
