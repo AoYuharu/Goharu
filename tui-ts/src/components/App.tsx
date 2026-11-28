@@ -621,6 +621,12 @@ export function App({ mock = false }: { mock?: boolean }) {
       // 中断是终态，不是"进行中"——必须用静态文本，spinner 会永远转圈
       showStatic("Interrupted - What should I do?", "warning");
     });
+    gw.on("agent.environment_status", (p) => {
+      add({
+        kind: p.ok ? "system" : "error",
+        text: `${p.component}: ${p.message}`,
+      });
+    });
     gw.on("agent.error", (p) => {
       const meta = [p.blocking, p.cause, p.scope].filter(Boolean).join(" / ");
       add({ kind: "error", text: meta ? `[${meta}] ${p.message}` : p.message });

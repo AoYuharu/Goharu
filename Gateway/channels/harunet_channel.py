@@ -590,6 +590,12 @@ class HaruNetChannel(Channel):
             return
         self._broadcast_text(text, mentions=[target["sender"]])
 
+    def send_system_notice(self, text: str) -> None:
+        """环境/运维状态直发全网（不依赖最近一条 urgent 消息的回复目标）。"""
+        if not text or not self._connected.is_set():
+            return
+        self._broadcast_text(str(text))
+
     def _broadcast_text(self, text: str, mentions: list | None = None) -> None:
         if not self._client or not self._loop:
             return

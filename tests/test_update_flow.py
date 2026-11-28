@@ -77,7 +77,9 @@ def wait_done(hub, timeout=10):
 
 
 def main():
-    uf.Upgrader = FakeUpgrader   # 注入假 staging（模块内引用点替换）
+    import Architect.upgrader as upmod
+    orig_upgrader = upmod.Upgrader
+    upmod.Upgrader = FakeUpgrader   # UpdateFlow 在函数内 from ... import，需替换模块属性
 
     print("== 门控 ==")
     hub, _ = make_hub()
@@ -112,6 +114,25 @@ def main():
           and any("等待确认" in p or "更新计划已写好" in p for p in pushes)
           and any("更新完毕" in p for p in pushes))
     check("终态后不再 active", not hub3.is_update_active())
+
+    print("== UpdateFlow 复用代理提供器 ==")
+    captured = {}
+
+    class CaptureUpgrader(FakeUpgrader):
+        def __init__(self, *a, **kw):
+            captured.update(kw)
+
+    provider = lambda: ("http://127.0.0.1:7893", ["github.com"])
+    hubp, _ = make_hub(confirm=True)
+    hubp.set_proxy_provider(provider)
+    upmod.Upgrader = CaptureUpgrader
+    try:
+        hubp.start_update(source="manual", force=True)
+        wait_done(hubp)
+    finally:
+        upmod.Upgrader = FakeUpgrader
+    check("UpdateFlow 传入 proxy_provider",
+          captured.get("proxy_provider") is provider)
 
     print("== 确认拒绝 ==")
     merges2 = []
@@ -161,6 +182,7 @@ def main():
     finally:
         hub_mod.get_default_hub = orig
 
+    upmod.Upgrader = orig_upgrader
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
 

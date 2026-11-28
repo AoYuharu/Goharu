@@ -87,6 +87,12 @@ network:
     rules:
     - github.com
     - arxiv.org
+    auto_candidates:
+    - http://127.0.0.1:7893
+    - http://127.0.0.1:7890
+    - http://127.0.0.1:7897
+    - http://127.0.0.1:10809
+    - http://127.0.0.1:1080
 prompt:
   system:
     shared: []

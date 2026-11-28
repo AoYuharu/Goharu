@@ -154,7 +154,7 @@ class GitUpdateSource:
 
     def __init__(self, repo_dir: str = ".", remote: str = "origin",
                  branch: str = "master", check_interval_seconds: int = 1800,
-                 run_git=None, proxy_provider=None):
+                 run_git=None, proxy_provider=None, status_callback=None):
         self.repo_dir = str(repo_dir)
         self.remote = str(remote)
         self.branch = str(branch)
@@ -162,6 +162,7 @@ class GitUpdateSource:
             check_interval_seconds if check_interval_seconds is not None else 1800)
         self._run_git = run_git or Upgrader._default_run_git
         self._proxy_provider = proxy_provider
+        self._status_callback = status_callback
         self._last_check = 0.0
         self._accepted_sha = None
 
@@ -185,7 +186,15 @@ class GitUpdateSource:
         r = self._run_git(self.repo_dir, *proxy, "fetch", self.remote, self.branch)
         if not r["ok"]:
             logger.warning("git_update fetch failed: %s", r["output"][:200])
+            if self._status_callback:
+                self._status_callback(
+                    False, f"无法连接 GitHub：{r['output'][:200]}")
+            reset = getattr(self._proxy_provider, "reset", None)
+            if callable(reset):
+                reset()
             return None
+        if self._status_callback:
+            self._status_callback(True, "GitHub 已恢复连接")
 
         local = self._run_git(self.repo_dir, "rev-parse", "HEAD")
         remote = self._run_git(self.repo_dir, "rev-parse", ref)

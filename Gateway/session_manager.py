@@ -403,17 +403,33 @@ class SessionManager:
                 if config.get("architect_hub.upgrade.enabled", False):
                     from Architect.upgrader import GitUpdateSource
                     up_cfg = config.get("architect_hub.upgrade", {})
+                    from Architect.connectivity import (
+                        AutoProxyResolver, DEFAULT_PROXY_CANDIDATES,
+                    )
+                    from Architect.upgrader import GitUpdateSource
+                    up_cfg = config.get("architect_hub.upgrade", {})
+                    proxy_resolver = AutoProxyResolver(
+                        repo_dir=up_cfg.get("repo_dir", "."),
+                        remote=up_cfg.get("remote", "origin"),
+                        branch=up_cfg.get("branch", "master"),
+                        configured_provider=lambda: (
+                            config.get("network.proxy.url", ""),
+                            config.get("network.proxy.rules", []),
+                        ),
+                        candidate_provider=lambda: config.get(
+                            "network.proxy.auto_candidates",
+                            list(DEFAULT_PROXY_CANDIDATES)),
+                        on_selected=self._persist_github_proxy,
+                    )
+                    get_default_hub().set_proxy_provider(proxy_resolver)
                     get_default_hub().register_wake_source(GitUpdateSource(
                         repo_dir=up_cfg.get("repo_dir", "."),
                         remote=up_cfg.get("remote", "origin"),
                         branch=up_cfg.get("branch", "master"),
                         check_interval_seconds=up_cfg.get(
                             "check_interval_seconds", 1800),
-                        # 代理按调用时读取（panel/SetConfig 改了 network.proxy 下周期生效）
-                        proxy_provider=lambda: (
-                            config.get("network.proxy.url", ""),
-                            config.get("network.proxy.rules", []),
-                        ),
+                        proxy_provider=proxy_resolver,
+                        status_callback=self._github_status,
                     ))
                     get_default_hub().start_scheduler()
         except Exception as e:
@@ -464,6 +480,39 @@ class SessionManager:
                 fn(payload)
             except Exception:
                 logger.warning("错误上报 HaruNet 失败", exc_info=True)
+
+    def _persist_github_proxy(self, url: str) -> None:
+        """自动探测到可用代理后写回配置，下个周期及 UpdateFlow 共用。"""
+        url = str(url or "").strip()
+        if not url or config.get("network.proxy.url", "") == url:
+            return
+        try:
+            config.set("network.proxy.url", url)
+            config.save()
+            logger.info("GitHub 自动代理已写入配置: %s", url)
+        except Exception:
+            logger.warning("GitHub 自动代理写回配置失败: %s", url, exc_info=True)
+
+    def _github_status(self, ok: bool, message: str) -> None:
+        """连通性状态只在失败/恢复翻转时通知 TUI 和 HaruNet。"""
+        ok = bool(ok)
+        if getattr(self, "_last_github_ok", True) == ok:
+            return
+        self._last_github_ok = ok
+        payload = {"component": "github", "ok": ok, "message": str(message)}
+        for session in list(self.sessions.values()):
+            try:
+                session._broadcast_event("agent.environment_status", payload)
+            except Exception:
+                logger.warning("GitHub 状态事件广播失败（session=%s）",
+                               session.session_id, exc_info=True)
+        ch = self._harunet_channel
+        fn = getattr(ch, "send_system_notice", None) if ch is not None else None
+        if callable(fn):
+            try:
+                fn(("✅ " if ok else "⚠️ ") + str(message))
+            except Exception:
+                logger.warning("GitHub 状态通知 HaruNet 失败", exc_info=True)
 
     def _error_evidence(self, record: dict) -> dict:
         """Architect 修复证据：日志尾部 + lifecycle + git 状态。"""

@@ -67,6 +67,7 @@ class ArchitectHub:
         self._dispatch_lock = threading.Lock()   # architect 串行兜底（非阻塞获取）
         self._hub_cfg = hub_cfg
         self._merge_fn = merge_fn
+        self._proxy_provider = None
         # Hero 桥（双向沟通）：Gateway 装配期注入
         #   notify_user(text)  —— 向用户推送报告（走 session 的 channel 广播）
         #   message_hero(text) —— 给主智能体递消息（进它的会话队列，下一轮处理）
@@ -510,6 +511,10 @@ class ArchitectHub:
     # 版本升级（触发器 ③）：staging 拉取 → 审计 → 合并
     # ------------------------------------------------------------------
 
+    def set_proxy_provider(self, provider) -> None:
+        """注入网络代理提供器，供 GitUpdateSource 与 UpdateFlow 共用。"""
+        self._proxy_provider = provider
+
     def request_upgrade(self, note: str = "") -> dict:
         """收到升级指令：fetch 最新代码到 staging，过审计管线，PASS 才合并。
 
@@ -522,6 +527,7 @@ class ArchitectHub:
             staging_dir=up_cfg.get("staging_dir", "runtime_memory/upgrade_staging"),
             remote=up_cfg.get("remote", "origin"),
             branch=up_cfg.get("branch", "master"),
+            proxy_provider=self._proxy_provider,
         )
         fetch = up.fetch_staging()
         if not fetch.get("ok"):

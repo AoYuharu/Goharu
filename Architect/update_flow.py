@@ -64,6 +64,7 @@ class UpdateFlow:
                                        "runtime_memory/upgrade_staging"),
                 remote=up_cfg.get("remote", "origin"),
                 branch=up_cfg.get("branch", "master"),
+                proxy_provider=getattr(hub, "_proxy_provider", None),
             )
             fetch = up.fetch_staging()
             if not fetch.get("ok"):

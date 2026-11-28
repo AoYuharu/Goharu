@@ -222,6 +222,7 @@ export type GatewayEvent =
       cause?: "config" | "runtime" | "external";
       wake_status?: string;
     } }
+  | { type: "agent.environment_status"; payload: { component: string; ok: boolean; message: string } }
   | { type: "tool.call"; payload: { tool: string; arguments: unknown; call_id: string; step: number } }
   | { type: "tool.result"; payload: { tool: string; call_id: string; result: string } }
   | { type: "token.stats"; payload: { current_tokens?: number; prompt_cache_ratio?: number; cache_read_tokens?: number; cache_write_tokens?: number; uncached_input_tokens?: number } & Record<string, unknown> }

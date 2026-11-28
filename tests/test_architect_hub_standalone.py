@@ -315,8 +315,13 @@ def test_git_update_source():
     # fetch 失败静默降级
     def dead_git(repo, *args):
         return {"ok": False, "output": "network dead"}
-    src2 = GitUpdateSource(run_git=dead_git, check_interval_seconds=0)
+    statuses = []
+    src2 = GitUpdateSource(
+        run_git=dead_git, check_interval_seconds=0,
+        status_callback=lambda ok, msg: statuses.append((ok, msg)))
     check("fetch 失败 → None 不抛异常", src2.poll() is None)
+    check("fetch 失败 → 上报连通性状态",
+          statuses and statuses[0][0] is False and "GitHub" in statuses[0][1])
 
     # 节流：interval 内不重复 fetch
     src3 = GitUpdateSource(run_git=fake_git, check_interval_seconds=3600)
