@@ -9,6 +9,7 @@ import glob
 import logging
 import os
 import platform
+import posixpath
 import re
 import shutil
 import socket
@@ -348,7 +349,7 @@ def probe_runtime() -> dict:
         version = _re1(pattern, out) if out else None
         return version.rstrip(".") if version else None
 
-    return {
+    result = {
         "python": platform.python_version(),
         "node": _ver(["node", "--version"], r"v?([\d.]+)"),
         "java": _ver(["java", "-version"], r'version "([^"]+)"'),
@@ -356,6 +357,46 @@ def probe_runtime() -> dict:
         "git": _ver(["git", "--version"], r"version ([\d.]+)"),
         "ffmpeg": _ver(["ffmpeg", "-version"], r"version ([\d.\-]+)"),
     }
+    result.update(_probe_voice_state())
+    return result
+
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_VOICE_SDK_CANDIDATES = [
+    os.path.join(_PROJECT_ROOT, "extras", "voice-wakeup", "voice-wakeup-sdk"),
+    os.path.join(_PROJECT_ROOT, "voice-wakeup", "voice-wakeup-sdk"),
+]
+
+
+def _probe_voice_state() -> dict:
+    """语音套件三态（布尔）：SDK 目录 / 推理依赖 / SenseVoice 模型。"""
+    root = next((p for p in _VOICE_SDK_CANDIDATES if os.path.isdir(p)),
+                _VOICE_SDK_CANDIDATES[0])
+    model = os.path.join(root, "sense-voice-asr", "model.int8.onnx")
+    try:
+        model_present = (os.path.isfile(model)
+                         and os.path.getsize(model) >= 200 * 1024 * 1024)
+    except OSError:
+        model_present = False
+
+    required = ["sherpa_onnx", "pypinyin"]
+    if IS_WINDOWS or IS_MACOS:
+        required.append("sounddevice")   # 无 arecord，必须用 sounddevice
+
+    deps_ok = all(_spec_present(name) for name in required)
+    return {
+        "voice_sdk_present": os.path.isdir(os.path.join(root, "haru_kws_sdk")),
+        "voice_deps_ok": deps_ok,
+        "voice_asr_model_present": model_present,
+    }
+
+
+def _spec_present(name: str) -> bool:
+    try:
+        import importlib.util
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def probe_services() -> dict:
@@ -524,15 +565,97 @@ def probe_peripherals() -> dict:
 
 # L5：物理行为能力 ---------------------------------------------------------
 
+_LED_UNSAFE_NAME_TOKENS = (
+    "kbd", "keyboard", "capslock", "numlock", "scrolllock", "input",
+)
+_LED_UNSAFE_DRIVER_TOKENS = ("leds-regulator",)
+
+
+def _sys_read(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _is_writable(path):
+    try:
+        return os.access(path, os.W_OK)
+    except OSError:
+        return False
+
+
+def _led_entry(base: str) -> dict:
+    """只读枚举单个 leds-class 设备，并给出安全性裁决。
+
+    安全条件：brightness 可写 + trigger 可读且可写（可保存恢复）+
+    非键盘背光 / 锁定键 + 非 leds-regulator 驱动。任一不满足 → 不安全。
+    """
+    # sysfs 是 POSIX 路径：Windows 上跑测试也不能用 os.path.join 拼反斜杠
+    name = posixpath.basename(base)
+    brightness = posixpath.join(base, "brightness")
+    trigger = _sys_read(posixpath.join(base, "trigger"))
+    uevent = _sys_read(posixpath.join(base, "device", "uevent")) or ""
+    driver = _re1(r"DRIVER=(\S+)", uevent)
+    writable = _is_writable(brightness)
+    trigger_restorable = trigger is not None and _is_writable(
+        posixpath.join(base, "trigger"))
+    lname = name.lower()
+    unsafe_name = any(token in lname for token in _LED_UNSAFE_NAME_TOKENS)
+    unsafe_driver = ("leds-regulator" in uevent.lower()
+                     or any(token in (driver or "").lower()
+                            for token in _LED_UNSAFE_DRIVER_TOKENS))
+    return {
+        "name": name,
+        "path": base,
+        "color": _sys_read(posixpath.join(base, "color")),
+        "multi_intensity": _sys_read(posixpath.join(base, "multi_intensity")),
+        "max_brightness": _as_int(_sys_read(posixpath.join(base, "max_brightness"))),
+        "trigger": trigger,
+        "driver": driver,
+        "writable": writable,
+        "source": "sysfs-leds",
+        "safe": bool(writable and trigger_restorable
+                     and not unsafe_name and not unsafe_driver),
+    }
+
+
+def _blink_support(leds: list) -> dict:
+    if not leds:
+        return {"status": "unsupported", "interface": None,
+                "reason": "no leds-class devices found"}
+    safe = [led for led in leds if led.get("safe")]
+    if safe:
+        return {"status": "supported", "interface": safe[0]["path"],
+                "reason": f"{len(safe)} safe sysfs leds-class device(s)"}
+    if any(led.get("writable") for led in leds):
+        return {"status": "needs_user_confirm", "interface": None,
+                "reason": "LEDs exist but cannot be proven safe (driver/trigger uncertain)"}
+    return {"status": "unsupported", "interface": None,
+            "reason": "leds-class devices exist but are not writable by this user"}
+
+
 def probe_actuation() -> dict:
-    """只发现 GPIO 候选节点，绝不打开、写入或驱动设备。"""
+    """只发现 GPIO/LED/hwmon 候选，绝不打开、写入或驱动设备。"""
     if IS_WINDOWS or IS_MACOS:
-        return {"gpio_chips": None, "control_candidates": None}
+        return {"gpio_chips": None, "control_candidates": None, "leds": None,
+                "rgb_controllers": None, "fans": None, "blink_support": None}
     chips = sorted(glob.glob("/dev/gpiochip*"))
+    leds = [_led_entry(path) for path in sorted(glob.glob("/sys/class/leds/*"))]
+    rgb = [{"name": led["name"], "path": led["path"]}
+           for led in leds if led.get("color") or led.get("multi_intensity")]
+    fans = sorted(glob.glob("/sys/class/hwmon/hwmon*/fan*_input"))
+    candidates = [{"type": "gpio", "device": path} for path in chips]
+    candidates += [{"type": "led", "device": led["path"]}
+                   for led in leds if led.get("safe")]
     return {
         "gpio_chips": chips,
-        "control_candidates": ([{"type": "gpio", "device": path} for path in chips]
-                               if chips else None),
+        "control_candidates": candidates or None,
+        "leds": leds,
+        "rgb_controllers": rgb,
+        "fans": fans,
+        "blink_support": _blink_support(leds),
     }
 
 
@@ -549,13 +672,16 @@ PROBE_TABLE = [
     ("L1", "security", probe_security, ("user", "is_admin", "secure_boot")),
     ("L1", "status", probe_status, ("cpu_load", "memory_used_pct")),
     ("L2", "runtime", probe_runtime,
-     ("python", "node", "java", "docker", "git", "ffmpeg")),
+     ("python", "node", "java", "docker", "git", "ffmpeg",
+      "voice_sdk_present", "voice_deps_ok", "voice_asr_model_present")),
     ("L2", "services", probe_services, ("service_manager", "container_runtime")),
     ("L3", "network", probe_network,
      ("hostname_ip", "interfaces", "dns", "gateway", "internet")),
     ("L3", "communication", probe_communication, ("usb_count", "serial_ports")),
     ("L4", "peripherals", probe_peripherals, ("camera", "audio")),
-    ("L5", "actuation", probe_actuation, ("gpio_chips", "control_candidates")),
+    ("L5", "actuation", probe_actuation,
+     ("gpio_chips", "control_candidates", "leds", "rgb_controllers", "fans",
+      "blink_support")),
 ]
 
 _CATEGORY_EVIDENCE = {
@@ -572,7 +698,7 @@ _CATEGORY_EVIDENCE = {
     "network": "socket and OS network configuration",
     "communication": "USB and serial read-only enumeration",
     "peripherals": "camera and audio read-only enumeration",
-    "actuation": "GPIO device-node discovery",
+    "actuation": "GPIO and LED device-node discovery",
 }
 
 _RUNTIME_COMMANDS = {"node": "node", "java": "java", "docker": "docker",

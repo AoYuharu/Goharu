@@ -180,7 +180,7 @@ def test_gate():
             return True, "ok", 200, ""
         return False, "auth", 401, W.failure_message("auth", 401, "401 Authentication Fails")
 
-    to_exec = ["right"] * 5
+    to_exec = ["right"] * 6
     keys = to_exec + ["enter"]                              # 没填 key 直接开始安装
     keys += ["enter"] + chars("bad-key") + ["enter"]        # 被弹回 API Key 行：展开输入框，填一个坏 key
     keys += to_exec + ["enter"]                             # 坏 key 再试
@@ -244,7 +244,7 @@ def test_tty_redraw():
     print("\n[4] TTY 重绘不漂移")
     set_size(80, 24)
     keys = (["down", "enter"] + chars("good-key") + ["enter"]
-            + ["right"] * 5 + ["enter"])
+            + ["right"] * 6 + ["enter"])
     values, calls = run_form_writes(
         keys, lambda _p, _proxy: (True, "ok", 200, ""))
     frames = [
@@ -443,7 +443,8 @@ def test_load_existing():
         values = W._default_values()
         W._load_existing(values)
         check("对不上预置厂商 → 自定义并带回模型与地址",
-              values["provider"] == len(W.PROVIDERS) - 1 and values["model"] == "my-model"
+              values["provider"] == len(W.PROVIDERS) - 1
+              and W._provider_from_form(values)["model"] == "my-model"
               and values["base_url"] == "https://llm.internal/v1", values)
         check("自定义厂商没有对应密钥 → 仍需填写", values["api_key"] == "")
 
@@ -497,6 +498,56 @@ def test_bootstrap_exploration_config():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_voice_install():
+    print("\n[7] 语音栏与轻量安装")
+    values = W._default_values()
+    check("默认不安装语音", values["voice"] is False)
+    sec = next((s for s in W._form_sections() if s["title"] == "语音"), None)
+    check("表单含语音栏", sec is not None and any(i["key"] == "voice" for i in sec["items"]))
+    check("语音栏在检索之后", [s["title"] for s in W._form_sections()].index("语音")
+          == [s["title"] for s in W._form_sections()].index("检索") + 1)
+
+    tmp = tempfile.mkdtemp()
+    old = W.REPO_DIR
+    old_pip, old_step, old_smoke = W.run_pip_step, W.run_step, W._voice_smoke
+    W.REPO_DIR = tmp
+    calls = []
+    try:
+        sdk = Path(tmp) / "extras" / "voice-wakeup" / "voice-wakeup-sdk"
+        sdk.mkdir(parents=True)
+        vals = W._default_values()
+        W._load_existing(vals)
+        check("重跑带回已装语音状态", vals["voice"] is True)
+
+        (Path(tmp) / "extras").rename(Path(tmp) / "extras_bak")
+        vals = W._default_values()
+        W._load_existing(vals)
+        check("未装语音时为否", vals["voice"] is False)
+
+        W.run_pip_step = lambda *a, **k: calls.append(("pip", a)) or True
+        W.run_step = lambda *a, **k: calls.append(("step", a)) or True
+        W._voice_smoke = lambda: calls.append(("smoke",)) or True
+
+        check("缺 SDK 包时跳过且不装依赖", W.step_install_voice() is True and not calls, calls)
+
+        tarball = Path(tmp) / "Skills" / "voice-wakeup" / "voice-wakeup-sdk.tar.gz"
+        tarball.parent.mkdir(parents=True)
+        tarball.write_bytes(b"x")
+        check("解包 + 依赖 + 冒烟",
+              W.step_install_voice() is True
+              and any(c[0] == "step" for c in calls)
+              and any(c[0] == "pip" and "requirements-voice.txt" in " ".join(map(str, c[1]))
+                      for c in calls)
+              and ("smoke",) in calls, calls)
+        check("不触发模型下载（无 ensure_models 调用点）",
+              not any(len(c) > 1 and "download" in " ".join(map(str, c[1]))
+                      for c in calls), calls)
+    finally:
+        W.REPO_DIR = old
+        W.run_pip_step, W.run_step, W._voice_smoke = old_pip, old_step, old_smoke
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # 7. 非 TTY 回退：同样强制
 # ---------------------------------------------------------------------------
@@ -516,7 +567,7 @@ def test_fallback():
 
     # 顺序：厂商 → API Key(空) → embedding → systemd → qq → harunet → proxy
     #       → 初始探索方向 → API Key 重试：bad → good
-    answers = ["", "", "", "", "", "", "", "先检查摄像头", "bad", "good"]
+    answers = ["", "", "", "", "", "", "", "", "", "先检查摄像头", "bad", "good"]
     feed("\n".join(answers) + "\n")
     old_out = sys.stdout
     try:
@@ -528,7 +579,7 @@ def test_fallback():
     check("非 TTY 可填写初始探索方向", values["initial_exploration"] == "先检查摄像头")
     check("空 key 与坏 key 都被拦下", calls == ["bad", "good"], calls)
 
-    feed("\n\n\n\n\n\n\n\n\n\n\n\n")
+    feed("\n" * 15)
     try:
         sys.stdout = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", write_through=True)
         W._form_fallback(W._form_sections(), W._default_values(), on_verify=verify)
@@ -618,6 +669,7 @@ def _run_all():
     test_verify_provider()
     test_load_existing()
     test_bootstrap_exploration_config()
+    test_voice_install()
     test_fallback()
     test_install_draft_and_launcher()
     print("\n" + "=" * 60)

@@ -1,0 +1,4 @@
+sherpa-onnx
+pypinyin
+sounddevice
+numpy

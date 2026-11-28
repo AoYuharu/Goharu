@@ -40,6 +40,8 @@ metadata:
 
 **目录约定**：解包后的 `voice-wakeup-sdk/` 目录本身就是 models_root——kws_model、sense-voice-asr、silero-vad 都在其下，`VoiceListener.from_models_root("解包目录/voice-wakeup-sdk")` 开箱即用。
 
+> **Goharu 内约定**：在 Goharu 仓库里 models_root 固定为 `extras/voice-wakeup/voice-wakeup-sdk`（不是 `~/voice-wakeup`），由 `Gateway/voice_service.py` 的 `MODELS_ROOT` 决定；安装向导把 `Skills/voice-wakeup/voice-wakeup-sdk.tar.gz` 解到这里。
+
 特性：完全离线、CPU 推理、识别延迟 <1s、唤醒词运行时热更新（中文自动转拼音）。
 
 ## 第一部分：KWS 唤醒（必装）

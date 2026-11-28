@@ -9,13 +9,17 @@ layering 说明：Architect 是产品层模块，此处为函数内惰性 import
 
 import json
 import logging
+import time
+from pathlib import Path
 
 from Tools.registry import registry
-from Tools.config_proxy import write_config
+from Tools.config_proxy import get_config, write_config
 
 logger = logging.getLogger(__name__)
 
 _VALID_KINDS = ("guardian", "audit", "introspect", "explore")
+_RESTART_MARKER = (Path(__file__).resolve().parent.parent.parent
+                   / "runtime_memory" / "architect" / "restart_resume.json")
 
 
 def _coerce_scalar(value):
@@ -93,6 +97,45 @@ async def MessageHero(message: str, to: str = "hero") -> str:
     return json.dumps({"status": "ok", "sent": sent}, ensure_ascii=False)
 
 
+async def RequestRestart(reason: str = "") -> str:
+    """请求安全重启网关（唯一合规入口；绝不直接执行 restart 命令）。
+
+    先写 runtime_memory/architect/restart_resume.json（reason/时间/语音开关），
+    再交给 Gateway 注入的重启 hook 调度；返回 scheduled/restart_required/unwired。
+    """
+    try:
+        from Architect.hub import get_default_hub
+    except ImportError:
+        return json.dumps(
+            {"error": "Architect 子系统不可用（宿主未装配 Architect 模块）"},
+            ensure_ascii=False)
+
+    voice = {}
+    try:
+        cfg = get_config()
+        voice = {
+            "mic_consent": bool(cfg.get("voice.mic_consent", False)),
+            "asr_enabled": bool(cfg.get("voice.asr_enabled", False)),
+            "wakeup_enabled": bool(cfg.get("voice.wakeup_enabled", False)),
+        }
+    except Exception as exc:
+        logger.warning("RequestRestart: 读取语音配置失败: %s", exc)
+
+    marker = {"reason": str(reason or ""), "requested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+              "voice": voice}
+    try:
+        _RESTART_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        _RESTART_MARKER.write_text(
+            json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        return json.dumps({"error": f"写重启标记失败: {exc}"}, ensure_ascii=False)
+
+    result = get_default_hub().request_restart(reason)
+    result["resume_marker"] = str(_RESTART_MARKER)
+    logger.info("RequestRestart: reason=%s result=%s", reason, result.get("status"))
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
 async def SetConfig(key: str, value: str) -> str:
     """修改 config.yaml 的某个配置项（点分路径）并写回磁盘。
 
@@ -156,6 +199,25 @@ Changes take effect for components that read config at call time (the GitHub upd
         "required": ["key", "value"],
     },
     handler=SetConfig,
+    group="agent",
+)
+
+
+registry.register(
+    name="RequestRestart",
+    description="""Request a safe Gateway restart (the ONLY legal restart path for Architect).
+
+Writes runtime_memory/architect/restart_resume.json (reason + time + voice flags), then hands the request to the Gateway's restart hook. Never runs restart/shutdown/reboot commands itself.
+
+Use after SetConfig changes that need a process restart (e.g. enabling voice wakeup). Tell the user first via MessageHero(to="user"), then call this. After the restart, verify voice/listener state before claiming success.""",
+    arguments_schema={
+        "type": "object",
+        "properties": {
+            "reason": {"type": "string",
+                       "description": "Why the restart is needed (shown in the resume marker)"},
+        },
+    },
+    handler=RequestRestart,
     group="agent",
 )
 

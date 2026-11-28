@@ -40,6 +40,71 @@ def _henv(suffix: str) -> str:
             or os.environ.get(f"AGENTNET_{suffix}") or "")
 
 
+def _request_rpc_shutdown(port: int) -> bool:
+    """向本机守护发 gateway.shutdown（supervisor 模式下只做优雅退出）。"""
+    if not port:
+        return False
+    import json
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=2) as sock:
+            payload = {"jsonrpc": "2.0", "id": "arch-restart",
+                       "method": "gateway.shutdown"}
+            sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        return True
+    except OSError as exc:
+        logger.warning("restart: RPC shutdown failed: %s", exc)
+        return False
+
+
+def _gateway_restart_hook(reason: str) -> dict:
+    """RequestRestart 的 Gateway 钩子：写标记 → 调度重启（绝不在此直接 restart）。
+
+    - 有 supervisor（systemd 等）：RPC 请求优雅退出，由 supervisor 拉起；
+    - 无 supervisor：spawn 脱离会话的 `goharu gateway restart --delay 3`。
+    """
+    import json
+    import sys
+    import time
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    marker = repo / "runtime_memory" / "gateway.restarting"
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(
+            {"reason": str(reason or ""),
+             "requested_at": time.strftime("%Y-%m-%d %H:%M:%S")},
+            ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        return {"status": "error", "error": f"写重启标记失败: {exc}"}
+
+    if os.environ.get("INVOCATION_ID") or os.environ.get("GOHARU_SUPERVISED"):
+        port = int(config.get("gateway.rpc_port", 8791) or 0)
+        ok = _request_rpc_shutdown(port)
+        return {"status": "restart_required" if ok else "error",
+                "mode": "supervisor", "marker": str(marker),
+                **({} if ok else {"error": "RPC 停止请求发送失败"})}
+
+    script = repo / "goharu_cli.py"
+    cmd = [sys.executable, str(script), "gateway", "restart", "--delay", "3"]
+    kwargs: dict = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = (subprocess.CREATE_NO_WINDOW
+                                   | subprocess.CREATE_NEW_PROCESS_GROUP)
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(cmd, cwd=str(repo), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env={**os.environ, "PYTHONIOENCODING": "utf-8"}, **kwargs)
+    except Exception as exc:
+        return {"status": "error", "error": f"拉起重启进程失败: {exc}"}
+    return {"status": "scheduled", "mode": "spawned", "delay_seconds": 3,
+            "marker": str(marker)}
+
+
 def _hcfg(key: str, default=None):
     """HaruNet 配置键：harunet.<key> 优先，旧节 agentnet.<key> 兼容。"""
     v = config.get(f"harunet.{key}")
@@ -380,6 +445,8 @@ class SessionManager:
                     confirm_fn=confirmation_manager.request,
                     on_update_done=default_session._start_processing,
                 )
+                # 安全重启：RequestRestart 工具 → 写标记 + 调度重启
+                get_default_hub().set_restart_hook(_gateway_restart_hook)
                 # 统一错误 hook：证据读取 + 状态回写 + 修复护栏（直接改生产代码）
                 repair_cfg = config.get("architect_hub.repair", {}) or {}
                 guard = None
@@ -401,8 +468,6 @@ class SessionManager:
                 )
                 # 拉式唤醒源：定期检查 GitHub 新提交（audit 流把关）
                 if config.get("architect_hub.upgrade.enabled", False):
-                    from Architect.upgrader import GitUpdateSource
-                    up_cfg = config.get("architect_hub.upgrade", {})
                     from Architect.connectivity import (
                         AutoProxyResolver, DEFAULT_PROXY_CANDIDATES,
                     )

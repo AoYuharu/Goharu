@@ -5,6 +5,7 @@ identity 缺失时同步完成 L1→L5 哑探测、HaruNet 最小注册和 ident
 gateway 通过 daemon 线程调用，启动主链路不被阻塞。
 """
 
+import json
 import logging
 import platform
 import threading
@@ -16,6 +17,7 @@ import yaml
 logger = logging.getLogger(__name__)
 
 DEFAULT_IDENTITY_PATH = "runtime_memory/identity.yaml"
+DEFAULT_RESUME_PATH = "runtime_memory/architect/restart_resume.json"
 
 
 def _initial_exploration(cfg):
@@ -51,19 +53,26 @@ def _platform_readonly_commands():
     if system == "Windows":
         return [
             "powershell -NoProfile -Command \"Get-CimInstance <只读查询>\"",
-            "powershell -NoProfile -Command \"Get-PnpDevice -Class <设备类>\"",
+            "powershell -NoProfile -Command \"Get-PnpDevice -PresentOnly\"",
+            "powershell -NoProfile -Command \"Get-CimInstance Win32_PnPEntity\"",
+            "powershell -NoProfile -Command \"Get-Service / Get-Process（查 RGB 套件）\"",
             "ipconfig /all",
         ]
     if system == "Darwin":
         return [
             "system_profiler <SPUSBDataType/SPCameraDataType/...>",
             "sysctl -n <只读键>",
+            "ioreg -rc AppleHSMonitor（只读）",
             "ioreg -l（只读，按需过滤输出）",
         ]
     return [
         "cat /proc/<只读文件>；cat /sys/<只读文件>",
+        "ls /sys/class/leds/；cat /sys/class/leds/<x>/trigger",
+        "cat /sys/class/leds/<x>/{max_brightness,brightness,color,multi_intensity}",
+        "cat /sys/class/leds/<x>/device/uevent（driver 名）",
+        "ls /sys/class/hwmon/（风扇传感器，只读）",
         "ip -brief addr；ip route show default",
-        "lsusb",
+        "lsusb；gpioinfo（只读枚举）",
         "systemctl status <服务>（仅查询，禁止 start/stop/restart）",
     ]
 
@@ -135,7 +144,8 @@ def bootstrap_if_needed(hub=None, config: dict | None = None,
         from Architect.wake import KIND_EXPLORE, WakeRequest
 
         layered_gaps = _layered_gaps(identity, gaps)
-        hub.request_wake(WakeRequest(
+        runtime = identity.get("runtime", {}) or {}
+        wake_result = hub.request_wake(WakeRequest(
             reason="bootstrap", kind=KIND_EXPLORE, priority=3,
             context={
                 "trigger": "bootstrap_exploration",
@@ -145,6 +155,12 @@ def bootstrap_if_needed(hub=None, config: dict | None = None,
                 "layered_gaps": layered_gaps,
                 "verified_facts": _verified_facts(identity),
                 "initial_exploration": initial_exploration,
+                "voice_suite": {
+                    "voice_sdk_present": runtime.get("voice_sdk_present"),
+                    "voice_deps_ok": runtime.get("voice_deps_ok"),
+                    "voice_asr_model_present": runtime.get("voice_asr_model_present"),
+                },
+                "actuation": identity.get("actuation", {}),
                 "platform_readonly_commands": _platform_readonly_commands(),
                 "instruction": (
                     "执行首次部署只读探索。先阅读 verified_facts 和 identity，"
@@ -155,12 +171,24 @@ def bootstrap_if_needed(hub=None, config: dict | None = None,
                     "不可用标 unavailable，确认不适用标 not_applicable，仍无法确认"
                     "则保留 unknown。每解决一个 unknown 就从 gaps_pending 删除对应"
                     "路径，全部解决后清空。不得在 identity 中保存敏感原始命令输出。"
+                    "LED/硬件探索硬约束：只读枚举 /sys、/dev、hwmon；禁止写 /sys；"
+                    "禁止写 /dev；禁止 tee/gpioset/openrgb/pinctrl/raspi-gpio。只有"
+                    "sysfs leds-class、brightness 可写、trigger 可保存恢复、非"
+                    "regulator/非键盘背光/非锁定键的 LED 才能标 supported，否则"
+                    "unsupported 或 unknown 并写证据。风扇永不作为指示器，永不写 PWM。"
+                    "语音套件只记录状态，不安装、不下载模型、不激活。"
                 ),
             },
-        ))
+        )) or {}
         suffix = ", initial_exploration" if initial_exploration else ""
-        result["steps"]["arch_gapfill"] = (
-            f"dispatched ({len(gaps)} gaps{suffix})")
+        status = wake_result.get("status", "unknown")
+        if status == "dispatched":
+            result["steps"]["arch_gapfill"] = (
+                f"dispatched ({len(gaps)} gaps{suffix})")
+        else:
+            # busy / cooldown / pending 都不能记成已派发
+            result["steps"]["arch_gapfill"] = (
+                f"{status} ({len(gaps)} gaps{suffix})")
     elif should_explore:
         result["steps"]["arch_gapfill"] = "no_hub"
     else:
@@ -183,3 +211,58 @@ def _bootstrap_safe(**kwargs):
         bootstrap_if_needed(**kwargs)
     except Exception as exc:
         logger.warning("bootstrap crashed (non-fatal): %s", exc)
+
+
+def _default_voice_status():
+    """未注入时的默认校验：惰性 import Gateway.voice_service（Architect 顶层不依赖 Gateway）。"""
+    from Gateway import voice_service
+    return {"listener_running": voice_service.listener_running(),
+            "status": voice_service.get_status()}
+
+
+def resume_after_restart(voice_status_fn=None, config: dict | None = None) -> dict | None:
+    """重启后 resume 校验：确认唤醒监听已恢复。
+
+    读取 restart_resume.json；成功则通知用户并删除标记，失败保留标记供 Arch
+    诊断。返回结果 dict；无标记返回 None。
+    """
+    cfg = (config or {}).get("architect_hub", {}).get("bootstrap", {}) \
+        if isinstance(config, dict) else {}
+    path = Path(cfg.get("restart_resume_path", DEFAULT_RESUME_PATH))
+    if not path.exists():
+        return None
+    try:
+        marker = json.loads(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        logger.warning("resume: 读取标记失败（%s）: %s", path, exc)
+        marker = {}
+
+    if voice_status_fn is None:
+        voice_status_fn = _default_voice_status
+    try:
+        status = voice_status_fn() or {}
+    except Exception as exc:
+        logger.warning("resume: 语音状态校验异常: %s", exc)
+        status = {"error": f"{type(exc).__name__}: {exc}"}
+
+    running = bool(status.get("listener_running"))
+    result = {"marker": marker, "listener_running": running, "voice": status,
+              "status": "ready" if running else "not_ready"}
+    if running:
+        _notify("重启完成：语音已就绪（唤醒监听已恢复，说「你好」）")
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning("resume: 删除标记失败: %s", exc)
+        logger.info("resume: 语音监听已恢复，标记已清理")
+    else:
+        logger.warning("resume: 重启后语音监听未恢复，保留标记供 Arch 诊断")
+    return result
+
+
+def _notify(text: str) -> None:
+    try:
+        from Architect.hub import get_default_hub
+        get_default_hub().notify_user(text)
+    except Exception as exc:
+        logger.info("resume: notify_user 不可用（%s），消息落日志: %s", exc, text)

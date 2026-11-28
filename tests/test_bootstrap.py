@@ -13,6 +13,7 @@ import yaml  # noqa: E402
 
 import Architect.probe as probe  # noqa: E402
 import Architect.explore_flow as explore_flow  # noqa: E402
+import Architect.bootstrap as bootstrap_mod  # noqa: E402
 from Architect.bootstrap import bootstrap_if_needed  # noqa: E402
 
 PASS, FAIL = 0, 0
@@ -166,7 +167,9 @@ def _identity():
         "device": {"hostname": "test-host"},
         "os": {"name": "TestOS"},
         "cpu": {"instruction_sets": None},
-        "runtime": {"git": None},
+        "runtime": {"git": None, "voice_sdk_present": True,
+                    "voice_deps_ok": False, "voice_asr_model_present": False},
+        "actuation": {"blink_support": {"status": "unsupported", "interface": None}},
         "probe_report": {
             "L1": {"title": "系统与硬件基础", "fields": {
                 "device.hostname": {"status": "verified", "evidence": "fake"},
@@ -211,6 +214,12 @@ def test_bootstrap_flow():
         check("包含只读与禁止重复约束",
               "不要重复已验证探测" in wake.context["instruction"]
               and "禁止安装软件" in wake.context["instruction"])
+        check("注入语音状态与 LED 线索",
+              wake.context["voice_suite"]["voice_sdk_present"] is True
+              and wake.context["actuation"]["blink_support"]["status"] == "unsupported")
+        check("硬约束含禁止写 /sys /dev",
+              "禁止写 /sys" in wake.context["instruction"]
+              and "gpioset" in wake.context["instruction"])
 
         r2 = bootstrap_if_needed(hub=hub, config=cfg)
         check("幂等：已存在跳过", r2 is None and len(hub.wakes) == 1)
@@ -227,6 +236,117 @@ def test_bootstrap_flow():
         check("无 gaps 有引导仍只唤醒一次", len(hub.wakes) == 2
               and "0 gaps, initial_exploration" in r4["steps"]["arch_gapfill"])
         check("方向任务内容正确", hub.wakes[-1].context["initial_exploration"] == "只检查摄像头")
+
+
+def test_bootstrap_busy_not_dispatched():
+    print("== Arch 忙时不误记 dispatched ==")
+
+    class BusyHub(FakeHub):
+        def request_wake(self, req, background=True):
+            self.wakes.append(req)
+            return {"status": "busy"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        id_path = str(Path(tmp) / "identity.yaml")
+        cfg = {"architect_hub": {"bootstrap": {"identity_path": id_path}}}
+        hub = BusyHub()
+        r = bootstrap_if_needed(hub=hub, config=cfg, force=True,
+                                run_probe_fn=_fake_probe(_identity(), ["cpu.instruction_sets"]))
+        check("busy 状态如实记录", r["steps"]["arch_gapfill"].startswith("busy"),
+              r["steps"]["arch_gapfill"])
+        check("仍尝试过一次派发", len(hub.wakes) == 1)
+
+
+def test_led_probe():
+    print("== LED 只读探测与 blink_support 裁决 ==")
+    names = ("IS_WINDOWS", "IS_MACOS", "glob", "_sys_read", "_is_writable")
+    old = {name: getattr(probe, name) for name in names}
+    old_glob = probe.glob.glob
+    files = {
+        "/sys/class/leds/input3::capslock/brightness": "0",
+        "/sys/class/leds/input3::capslock/trigger": "none",
+        "/sys/class/leds/power/brightness": "0",
+        "/sys/class/leds/power/trigger": "[none]",
+        "/sys/class/leds/power/max_brightness": "1",
+        "/sys/class/leds/reg:red/brightness": "0",
+        "/sys/class/leds/reg:red/trigger": "none",
+        "/sys/class/leds/reg:red/device/uevent": "DRIVER=leds-regulator",
+        "/sys/class/leds/kbd_backlight/brightness": "0",
+        "/sys/class/leds/kbd_backlight/trigger": "none",
+    }
+    try:
+        probe.IS_WINDOWS = probe.IS_MACOS = False
+        probe._sys_read = lambda p: files.get(p)
+        probe._is_writable = lambda p: True
+        probe.glob.glob = lambda pattern: (
+            ["/sys/class/leds/input3::capslock", "/sys/class/leds/power",
+             "/sys/class/leds/reg:red", "/sys/class/leds/kbd_backlight"]
+            if pattern == "/sys/class/leds/*"
+            else ["/sys/class/hwmon/hwmon0/fan1_input"] if "hwmon" in pattern
+            else [])
+
+        r = probe.probe_actuation()
+        by_name = {led["name"]: led for led in r["leds"]}
+        check("锁定键不安全", by_name["input3::capslock"]["safe"] is False)
+        check("键盘背光不安全", by_name["kbd_backlight"]["safe"] is False)
+        check("leds-regulator 不安全", by_name["reg:red"]["safe"] is False)
+        check("普通 LED 安全", by_name["power"]["safe"] is True)
+        check("blink_support 选安全 LED",
+              r["blink_support"]["status"] == "supported"
+              and r["blink_support"]["interface"] == "/sys/class/leds/power")
+        check("风扇只读发现", r["fans"] == ["/sys/class/hwmon/hwmon0/fan1_input"])
+
+        probe.glob.glob = lambda pattern: [] if pattern == "/sys/class/leds/*" else []
+        r = probe.probe_actuation()
+        check("无 LED → unsupported（不是 gap 假象）",
+              r["leds"] == [] and r["blink_support"]["status"] == "unsupported")
+
+        probe.IS_WINDOWS = True
+        probe.glob.glob = old_glob
+        r = probe.probe_actuation()
+        check("Windows LED 字段落 None（unknown，交给 Arch）",
+              r["leds"] is None and r["blink_support"] is None)
+        check("Windows blink 字段判 unknown",
+              probe._field_state("actuation", "blink_support", None, r) == "unknown")
+    finally:
+        for name, value in old.items():
+            setattr(probe, name, value)
+        probe.glob.glob = old_glob
+
+
+def test_resume_after_restart():
+    print("== 重启后 resume 校验 ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        marker = Path(tmp) / "restart_resume.json"
+        cfg = {"architect_hub": {"bootstrap": {"restart_resume_path": str(marker)}}}
+        notified = []
+        old_notify = bootstrap_mod._notify
+        bootstrap_mod._notify = lambda text: notified.append(text)
+        try:
+            check("无标记时返回 None",
+                  bootstrap_mod.resume_after_restart(
+                      voice_status_fn=lambda: {}, config=cfg) is None)
+
+            marker.write_text("{}", encoding="utf-8")
+            r = bootstrap_mod.resume_after_restart(
+                voice_status_fn=lambda: {"listener_running": True}, config=cfg)
+            check("监听已恢复 → ready 且清理标记",
+                  r["status"] == "ready" and not marker.exists(), r)
+            check("成功通知用户语音已就绪", any("语音已就绪" in n for n in notified), notified)
+
+            marker.write_text("{}", encoding="utf-8")
+            notified.clear()
+            r = bootstrap_mod.resume_after_restart(
+                voice_status_fn=lambda: {"listener_running": False}, config=cfg)
+            check("监听未恢复 → not_ready 且保留标记",
+                  r["status"] == "not_ready" and marker.exists(), r)
+
+            r = bootstrap_mod.resume_after_restart(
+                voice_status_fn=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+                config=cfg)
+            check("校验异常不抛穿", r["status"] == "not_ready" and marker.exists())
+        finally:
+            bootstrap_mod._notify = old_notify
 
 
 def test_harunet_register():
@@ -348,6 +468,9 @@ def main():
     test_field_states()
     test_os_specific_communication()
     test_bootstrap_flow()
+    test_bootstrap_busy_not_dispatched()
+    test_led_probe()
+    test_resume_after_restart()
     test_harunet_register()
     test_explore_flow_hard_rule()
     test_explore_flow_best_effort()

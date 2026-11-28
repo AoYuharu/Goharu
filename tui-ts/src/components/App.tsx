@@ -602,6 +602,20 @@ export function App({ mock = false }: { mock?: boolean }) {
       if (p.state === "listening") setVoiceIndicator("🎤 聆听中…");
       else if (p.state === "recognizing") setVoiceIndicator("🎤 识别中…");
     });
+    gw.on("voice.activated", (p) => {
+      setVoiceIndicator(`🎤 语音已激活，说「${p.wake_word}」`);
+      showStatic(`语音已激活，说「${p.wake_word}」`, "success");
+      if (p.indicator && p.indicator.status !== "supported") {
+        showStatic(p.indicator.reason
+          ? `无安全 LED 指示：${p.indicator.reason}`
+          : "本机没有可安全控制的 LED，语音状态改用文字提示", "warning");
+      }
+    });
+    gw.on("voice.indicator", (p) => {
+      if (p.status && p.status !== "supported") {
+        setVoiceIndicator(p.message ?? "LED 指示不可用");
+      }
+    });
     gw.on("voice.download_complete", (p) => {
       setVoiceDownloadPct(null);
       if (p.ok) {

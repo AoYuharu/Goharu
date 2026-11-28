@@ -6,7 +6,7 @@
   goharu tui                  同上
   goharu gateway start        后台拉起网关守护（幂等；已在跑则跳过）
   goharu gateway stop         优雅停网关（RPC gateway.shutdown，兜底按 pid 杀）
-  goharu gateway restart      停 + 起
+  goharu gateway restart [--delay N]  停 + 起（可延迟 N 秒，供 Arch 安全重启）
   goharu gateway status       探活，打印 pid / 是否守护 / sessions
   goharu gateway log [N]      看守护日志末尾 N 行（默认 40）
   goharu upgrade [--check]    比对 GitHub master；默认快进升级，--check 只检查
@@ -36,6 +36,7 @@ VENV_PY = (os.path.join(REPO, "venv", "Scripts", "python.exe")
            if IS_WIN else os.path.join(REPO, "venv", "bin", "python"))
 RUNTIME = os.path.join(REPO, "runtime_memory")
 PIDFILE = os.path.join(RUNTIME, "gateway.pid")
+RESTART_MARKER = os.path.join(RUNTIME, "gateway.restarting")
 LOGFILE = os.path.join(RUNTIME, "logs", "gateway_daemon.log")
 GATEWAY = os.path.join(REPO, "Gateway", "gateway_entry.py")
 DEFAULT_PORT = 8791
@@ -193,6 +194,41 @@ def gateway_stop(wait: int = 15) -> bool:
         return True
     print("[x] 停止失败（网关无响应且无 pidfile）")
     return False
+
+
+def _write_restart_marker(delay: int = 0) -> None:
+    """重启窗口标记：TUI 起来时看到它会等守护而不是自己 bind 成临时网关。"""
+    try:
+        os.makedirs(RUNTIME, exist_ok=True)
+        with open(RESTART_MARKER, "w", encoding="utf-8") as f:
+            json.dump({"requested_at": time.time(), "delay": int(delay or 0)}, f)
+    except OSError as e:
+        print(f"[!] 写重启标记失败: {e}")
+
+
+def _clear_restart_marker() -> None:
+    try:
+        os.remove(RESTART_MARKER)
+    except OSError:
+        pass
+
+
+def gateway_restart(delay: int = 0) -> bool:
+    try:
+        delay = max(0, int(delay or 0))
+    except (TypeError, ValueError):
+        delay = 0
+    _write_restart_marker(delay)
+    if delay:
+        print(f"[+] {delay}s 后重启网关（先写重启标记，避免 TUI 抢绑）…")
+        time.sleep(delay)
+    if not gateway_stop():
+        _clear_restart_marker()
+        return False
+    ok = gateway_start()
+    if not ok:
+        _clear_restart_marker()
+    return ok
 
 
 def gateway_status() -> int:
@@ -749,8 +785,15 @@ def main() -> int:
         if sub == "stop":
             return 0 if gateway_stop() else 1
         if sub == "restart":
-            gateway_stop()
-            return 0 if gateway_start() else 1
+            delay = 0
+            rest = args[2:]
+            if "--delay" in rest:
+                idx = rest.index("--delay")
+                if idx + 1 < len(rest) and rest[idx + 1].isdigit():
+                    delay = int(rest[idx + 1])
+            elif rest and rest[0].isdigit():
+                delay = int(rest[0])
+            return 0 if gateway_restart(delay) else 1
         if sub == "status":
             return gateway_status()
         if sub == "log":

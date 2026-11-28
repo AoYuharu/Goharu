@@ -416,6 +416,107 @@ def test_upgrade(cli):
          cli._restore_upgrade_file) = old
 
 
+def test_restart_delay(cli):
+    print("\n[8] restart --delay 与重启标记")
+    old = cli.gateway_stop, cli.gateway_start, cli.time.sleep, cli.main
+    sleeps, seen = [], {}
+    try:
+        cli.gateway_stop = lambda: True
+        cli.time.sleep = lambda s: sleeps.append(s)
+        try:
+            os.remove(cli.RESTART_MARKER)
+        except OSError:
+            pass
+
+        def good_start():
+            seen["marker_at_start"] = os.path.exists(cli.RESTART_MARKER)
+            try:
+                os.remove(cli.RESTART_MARKER)   # 模拟 daemon 就绪后清标记
+            except OSError:
+                pass
+            return True
+
+        cli.gateway_start = good_start
+        with redirect_stdout(io.StringIO()):
+            ok = cli.gateway_restart(3)
+        check("restart --delay 先等 N 秒", ok and sleeps == [3], sleeps)
+        check("睡眠窗口内标记存在", seen.get("marker_at_start") is True, seen)
+        check("成功启动后标记已清", not os.path.exists(cli.RESTART_MARKER))
+
+        def bad_start():
+            return False
+
+        cli.gateway_start = bad_start
+        with redirect_stdout(io.StringIO()):
+            ok = cli.gateway_restart(0)
+        check("启动失败清理标记", ok is False and not os.path.exists(cli.RESTART_MARKER))
+
+        delays = []
+        cli.gateway_restart = lambda d=0: delays.append(d) or True
+        old_argv = sys.argv
+        try:
+            sys.argv = ["goharu", "gateway", "restart", "--delay", "5"]
+            rc = cli.main()
+            sys.argv = ["goharu", "gateway", "restart", "7"]
+            rc2 = cli.main()
+        finally:
+            sys.argv = old_argv
+        check("main 解析 --delay 5 与位置参数 7",
+              rc == 0 and rc2 == 0 and delays == [5, 7], delays)
+    finally:
+        cli.gateway_stop, cli.gateway_start, cli.time.sleep, cli.main = old
+        try:
+            os.remove(cli.RESTART_MARKER)
+        except OSError:
+            pass
+
+
+def test_gateway_restart_hook():
+    print("\n[9] Gateway 重启钩子（supervisor / spawn）")
+    from Gateway import session_manager as sm
+    from pathlib import Path
+
+    marker = Path(sm.__file__).resolve().parent.parent / "runtime_memory" / "gateway.restarting"
+    old_popen = sm.subprocess.Popen
+    old_shutdown = sm._request_rpc_shutdown
+    saved_env = {k: os.environ.get(k) for k in ("INVOCATION_ID", "GOHARU_SUPERVISED")}
+    calls = []
+
+    class FakeProc:
+        pass
+
+    try:
+        for k in saved_env:
+            os.environ.pop(k, None)
+        sm.subprocess.Popen = lambda *a, **k: calls.append((a, k)) or FakeProc()
+        r = sm._gateway_restart_hook("unit-test")
+        cmd = calls[0][0][0] if calls else []
+        check("无 supervisor → spawn restart --delay",
+              r["status"] == "scheduled" and r["mode"] == "spawned"
+              and "--delay" in cmd, (r, cmd))
+        check("spawn 命令不含 stop 直执行",
+              not any("stop" == str(x) for x in cmd), cmd)
+
+        os.environ["INVOCATION_ID"] = "test-unit"
+        sm._request_rpc_shutdown = lambda port: True
+        calls.clear()
+        r = sm._gateway_restart_hook("unit-test")
+        check("supervisor 分支不重复 Popen",
+              r["status"] == "restart_required" and not calls, (r, calls))
+    finally:
+        sm.subprocess.Popen = old_popen
+        sm._request_rpc_shutdown = old_shutdown
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+
+
 def test_tui_requires_daemon(cli):
     print("\n[8] TUI 只在独立 daemon 就绪后启动")
     old = cli._alive, cli.gateway_start, cli.subprocess.call
@@ -527,6 +628,8 @@ def main():
     test_rpc_serialization_guard()
     test_mcp_http_tuple_compat()
     test_upgrade(cli)
+    test_restart_delay(cli)
+    test_gateway_restart_hook()
     test_tui_requires_daemon(cli)
     test_integration(cli)
     print("\n" + "=" * 60)

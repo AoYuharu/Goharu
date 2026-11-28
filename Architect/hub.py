@@ -99,6 +99,8 @@ class ArchitectHub:
         self._error_status_fn = None
         self._repair_guard = None
         self._repair_cfg = hub_cfg.get("repair", {}) or {}
+        # 安全重启（RequestRestart 工具 → Gateway 装配期注入的钩子）
+        self._restart_hook = None
 
     # ------------------------------------------------------------------
     # 遥测入口（TelemetryChannel 调用）+ 逻辑错误自动唤醒（触发器 ②）
@@ -299,6 +301,32 @@ class ArchitectHub:
         self._message_hero = message_hero
         logger.info("hero bridge wired: notify_user=%s message_hero=%s",
                     bool(notify_user), bool(message_hero))
+
+    def set_restart_hook(self, restart_fn=None):
+        """Gateway 装配期注入安全重启钩子 fn(reason) -> dict。None=未接线。"""
+        self._restart_hook = restart_fn
+        logger.info("restart hook wired: %s", bool(restart_fn))
+
+    def request_restart(self, reason: str = "") -> dict:
+        """请求重构网（只调度，不执行 restart 命令）。
+
+        Returns:
+            {"status": "scheduled"|"restart_required"|"unwired"|"error", ...}
+            restart_required：有 supervisor 时钩子只做优雅退出，由 supervisor 拉起。
+        """
+        if self._restart_hook is None:
+            logger.warning("request_restart: 未接线（独立部署？），需人工重启")
+            return {"status": "unwired", "reason": reason,
+                    "note": "未注入重启钩子；请人工重启网关"}
+        try:
+            result = self._restart_hook(reason) or {}
+            if "status" not in result:
+                result["status"] = "scheduled"
+            return result
+        except Exception as exc:
+            logger.warning("request_restart failed: %s", exc)
+            return {"status": "error", "reason": reason,
+                    "error": f"{type(exc).__name__}: {exc}"}
 
     def notify_user(self, text: str) -> bool:
         """Architect → 用户：推送报告。未接线返回 False（调用方走日志）。"""

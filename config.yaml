@@ -323,6 +323,9 @@ voice:
   wakeup_enabled: false
   asr_enabled: false
   mic_consent: true
+  led_indicator:
+    enabled: true
+    target: auto
 sessions:
 - id: default
   max_messages: 0

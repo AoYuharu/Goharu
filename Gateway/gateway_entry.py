@@ -96,12 +96,54 @@ def write_json(obj: Dict[str, Any]) -> bool:
         return False
 
 
-def emit_voice_event(ev_type: str, payload: Dict[str, Any]):
-    """推送语音相关事件给 TUI（下载进度 / 转写结果 / 状态）。"""
+RESTART_MARKER = project_root / "runtime_memory" / "gateway.restarting"
+
+
+def _restart_window_active(max_age: float = 180.0) -> bool:
+    """重启窗口判断：标记新写 180s 内视为重启中。"""
+    try:
+        return time.time() - RESTART_MARKER.stat().st_mtime < max_age
+    except OSError:
+        return False
+
+
+def _clear_restart_marker():
+    try:
+        RESTART_MARKER.unlink()
+    except OSError:
+        pass
+
+
+_voice_indicator = None
+
+
+def _voice_indicator_instance():
+    global _voice_indicator
+    if _voice_indicator is None:
+        from Gateway.voice_indicator import VoiceIndicator
+        _voice_indicator = VoiceIndicator(emit_event=_write_voice_event)
+    return _voice_indicator
+
+
+def _write_voice_event(ev_type: str, payload: Dict[str, Any]):
     write_json({
         "jsonrpc": "2.0", "method": "event",
         "params": {"type": ev_type, "payload": payload},
     })
+
+
+def emit_voice_event(ev_type: str, payload: Dict[str, Any]):
+    """推送语音相关事件给 TUI（下载进度 / 转写结果 / 状态）。
+
+    同时驱动 LED 指示器；voice.indicator 自身不再回灌，避免递归。
+    """
+    _write_voice_event(ev_type, payload)
+    if ev_type == "voice.indicator":
+        return
+    try:
+        _voice_indicator_instance().handle_event(ev_type, payload)
+    except Exception as exc:
+        logger.warning("voice: indicator dispatch failed: %s", exc)
 
 
 def log_crash(reason: str, exc_info=None):
@@ -1046,6 +1088,18 @@ def main():
     # - 否则**立即独占绑定端口再去做初始化**——消除"守护启动中(25s)
     #   探测失败 → TUI 又起第二个完整 gateway"的竞态（2026-10-31 双实例事故）
     if rpc_port > 0:
+        # TUI 在重启窗口内先等守护就绪，绝不抢绑端口变成临时网关
+        if not daemon_mode and _restart_window_active():
+            logger.info("restart window active — waiting for daemon before binding")
+            wait_deadline = time.time() + 60
+            while time.time() < wait_deadline:
+                if _probe_existing_gateway(rpc_port, timeout=0.5):
+                    break
+                if not _restart_window_active():
+                    break
+                time.sleep(1)
+
+    if rpc_port > 0:
         rpc_server = None
         deadline = time.time() + 60
         while True:
@@ -1154,6 +1208,14 @@ def main():
         except Exception as exc:
             logger.warning("voice: auto-start failed: %s", exc)
 
+        # RequestRestart 后的 resume 校验：确认监听真的恢复，再向用户报"语音已就绪"
+        try:
+            from Architect.bootstrap import resume_after_restart
+            resume_after_restart(
+                config=dict(config.data) if hasattr(config, "data") else {})
+        except Exception as exc:
+            logger.warning("voice: resume check failed (non-fatal): %s", exc)
+
         # Send ready event
         if not write_json({
             "jsonrpc": "2.0",
@@ -1162,6 +1224,8 @@ def main():
         }):
             log_crash("Failed to send gateway.ready event")
             sys.exit(1)
+        if daemon_mode:
+            _clear_restart_marker()
 
         # Start background stdin reader —— 必须先于初始 token 统计：
         # 首次记忆检索要等 embedding 模型冷加载（实测可达 56s），若先算 token
@@ -1238,6 +1302,18 @@ def main():
         # Mark processing as stopped so pending daemon threads don't
         # keep submitting LLM queries during executor shutdown
         _SHUTTING_DOWN = True
+
+        # 释放麦克风与 LED（指示器退出时恢复原 brightness/trigger）
+        try:
+            from Gateway import voice_service
+            voice_service.stop_listener()
+        except Exception as exc:
+            logger.warning("voice: stop_listener on shutdown failed: %s", exc)
+        try:
+            if _voice_indicator is not None:
+                _voice_indicator.close()
+        except Exception as exc:
+            logger.warning("voice: indicator close failed: %s", exc)
 
         # Cleanup gateway：通知常驻根任务自己在 loop 线程里跑 shutdown
         #（AsyncExitStack/MCP 拆除必须发生在进入它的同一任务里，跨任务会报

@@ -34,8 +34,13 @@ def test_registration():
     check("工具含 Write/Edit/run_cmd",
           {"Write", "Edit", "run_cmd", "Read", "Grep", "Glob"} <= set(tools))
     check("工具含 AgentDelegate", "AgentDelegate" in tools)
+    check("工具含 RequestRestart", "RequestRestart" in tools)
     check("CRITICAL_REMINDERS 有 architect",
           "architect" in SubAgentConfig.CRITICAL_REMINDERS)
+    reminder = SubAgentConfig.CRITICAL_REMINDERS["architect"]
+    check("提醒含重启/模型下载/LED 硬约束",
+          "RequestRestart" in reminder and "只按明确指令下载" in reminder
+          and "LED 探测只读" in reminder)
 
 
 def test_command_policy():
@@ -106,6 +111,29 @@ def test_delegate_policy():
     result = asyncio.run(explore_runtime.call_tool(
         "AgentDelegate", {"agent_type": "explore", "task": "递归"}))
     check("Explore 不能继续递归委托", "不允许" in result and len(registry.dispatched) == 1)
+
+    print("== RequestRestart 仅 architect 可用 ==")
+    class RestartEntry:
+        name = "RequestRestart"
+        description = "restart"
+        arguments_schema = {"type": "object", "properties": {}}
+
+    class RestartRegistry(Registry):
+        def get_entry(self, name):
+            return RestartEntry() if name == "RequestRestart" else None
+
+    rr = RestartRegistry()
+    arch_rt = _SubToolRuntime("architect", ["RequestRestart"], rr)
+    check("architect 可调用 RequestRestart",
+          asyncio.run(arch_rt.call_tool("RequestRestart", {"reason": "t"})) == "ok"
+          and len(rr.dispatched) == 1)
+    for agent_type, tools in (("explore", SubAgentConfig.get_allowed_tools("explore")),
+                              ("plan", SubAgentConfig.get_allowed_tools("plan")),
+                              ("verify", SubAgentConfig.get_allowed_tools("verify"))):
+        rt = _SubToolRuntime(agent_type, list(tools) + ["RequestRestart"], rr)
+        result = asyncio.run(rt.call_tool("RequestRestart", {"reason": "越权"}))
+        check(f"{agent_type} 调 RequestRestart 被拒且零 dispatch",
+              "不允许" in result and len(rr.dispatched) == 1)
 
 
 def test_memory_tower_isolation():

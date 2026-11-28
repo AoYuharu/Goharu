@@ -41,6 +41,8 @@ export interface GetHistoryResult { messages: HistoryMessage[] }
 export interface VoiceStatus {
   installed: boolean;
   sdk_available?: boolean;
+  deps_ok?: boolean;
+  deps_error?: string | null;
   mic_available: boolean;
   mic_consent: boolean;
   asr_enabled: boolean;
@@ -51,6 +53,8 @@ export interface VoiceStatus {
   download_running: boolean;
   download_error: string | null;
   models_root: string;
+  listener_running?: boolean;
+  listener_message?: string;
 }
 
 export interface ModelHistoryEntry { model: string; base_url: string; api_key_env?: string }
@@ -248,7 +252,9 @@ export type GatewayEvent =
   | { type: "voice.download_progress"; payload: { downloaded_bytes: number; total_bytes: number; percent: number } }
   | { type: "voice.download_complete"; payload: { ok: boolean; error?: string; status?: VoiceStatus } }
   | { type: "voice.transcript"; payload: { text: string } }
-  | { type: "voice.state"; payload: { state: string } };
+  | { type: "voice.state"; payload: { state: string } }
+  | { type: "voice.activated"; payload: { wake_word: string; message?: string; indicator?: { status: string; interface?: string | null; reason?: string } } }
+  | { type: "voice.indicator"; payload: { status: string; reason?: string; message?: string } };
 
 export type GatewayEventType = GatewayEvent["type"];
 export type GatewayEventPayload<T extends GatewayEventType> =

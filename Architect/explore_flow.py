@@ -75,6 +75,8 @@ def _arch_task_text(round_no: int, context: dict, feedback: str) -> str:
     initial_exploration = _compact(context.get("initial_exploration", ""))
     platform_cmds = context.get("platform_readonly_commands", [])
     instruction = context.get("instruction", "")
+    voice_suite = context.get("voice_suite") or {}
+    actuation = context.get("actuation") or {}
 
     parts = [
         f"首次部署只读探索（第 {round_no} 轮）。先读 identity（{identity_path}），"
@@ -87,6 +89,18 @@ def _arch_task_text(round_no: int, context: dict, feedback: str) -> str:
     if layered_gaps:
         parts.append("分层缺口（需补齐）:\n"
                      + yaml.safe_dump(layered_gaps, allow_unicode=True, sort_keys=False))
+    if voice_suite:
+        parts.append("语音套件状态（只记录，不安装/不下载/不激活）:\n"
+                     + yaml.safe_dump(voice_suite, allow_unicode=True, sort_keys=False))
+    if actuation:
+        parts.append("执行能力线索（LED/GPIO/风扇，只读）:\n"
+                     + yaml.safe_dump(actuation, allow_unicode=True, sort_keys=False))
+        parts.append(
+            "LED 裁决约束：只有 sysfs leds-class + brightness 可写 + trigger 可保存"
+            "恢复 + 非 regulator/非键盘背光/非锁定键才可标 supported；否则 "
+            "unsupported/unknown 并写证据。禁止写 /sys、/dev，禁止 tee/gpioset/"
+            "openrgb/pinctrl/raspi-gpio；风扇永不作为指示器，永不写 PWM。"
+        )
     if initial_exploration:
         parts.append(f"初始探索方向（优先级提示，非必须完成指令）: {initial_exploration}")
     if platform_cmds:

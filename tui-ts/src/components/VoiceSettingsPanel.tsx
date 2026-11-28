@@ -9,7 +9,7 @@ const ON = "#2e7d32";
 const OFF = "#555";
 
 /** Fixed panel height (incl. border) — App relies on this for viewport math. */
-export const VOICE_PANEL_ROWS = 8;
+export const VOICE_PANEL_ROWS = 9;
 
 function toggle(on: boolean, active: boolean): string {
   const label = on ? " 开 " : " 关 ";
@@ -64,6 +64,17 @@ export function VoiceSettingsPanel({
     ? "是否下载语音识别模型（约 229MB）？Enter=下载  Esc=取消"
     : "↑↓ 选择 · Enter 切换 · Esc 关闭";
 
+  // 固定一行状态：依赖错误 > 监听结果 > 麦克风提示
+  const statusLine = !st
+    ? chalk.gray("…")
+    : st.deps_ok === false
+      ? chalk.red(`⚠ ${st.deps_error ?? "语音依赖未安装（pip install -r requirements-voice.txt）"}`)
+      : st.listener_message
+        ? chalk.gray(st.listener_message)
+        : st.mic_available === false
+          ? chalk.yellow("⚠ 未检测到麦克风，请检查设备与权限")
+          : " ";
+
   return (
     <Box
       flexDirection="column"
@@ -75,7 +86,7 @@ export function VoiceSettingsPanel({
     >
       <Text backgroundColor={PANEL_BG}>
         <Text bold color={ACCENT}>🎤 语音设置</Text>
-        <Text dimColor>{st && !st.mic_available ? "  ⚠ 未检测到麦克风" : ""}</Text>
+        <Text dimColor>{st?.listener_running ? "  · 监听中" : ""}</Text>
       </Text>
       <Row
         label="语音识别 (ASR)"
@@ -94,6 +105,7 @@ export function VoiceSettingsPanel({
         right={modelRight}
         active={selIndex === 2}
       />
+      <Text backgroundColor={PANEL_BG}>{statusLine}</Text>
       <Text backgroundColor={PANEL_BG}> </Text>
       <Text dimColor backgroundColor={PANEL_BG}>{footer}</Text>
     </Box>

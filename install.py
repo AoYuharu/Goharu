@@ -423,6 +423,7 @@ def _default_values() -> dict:
     return {
         "provider": 0, "api_key": "", "model": 0, "model_manual": "", "base_url": "",
         "embedding": False,
+        "voice": False,
         "systemd": False,
         "qq": False, "qq_app_id": "", "qq_secret": "",
         "harunet": False, "harunet_url": "ws://159.75.26.204:6000",
@@ -475,6 +476,11 @@ def _form_sections() -> list[dict]:
             {"key": "embedding", "label": "向量检索", "type": "bool",
              "hint": "Enter 切换；开启=装 torch 等重依赖（>2GB）；关闭=FTS5+BM25（功能完整）",
              "suffix": lambda v: [(" " + EMBED_WARNING, "red")]},
+        ]},
+        {"title": "语音", "items": [
+            {"key": "voice", "label": "安装离线语音组件（不含 229MB 识别模型）",
+             "type": "bool",
+             "hint": "Enter 切换；只装 KWS/VAD/tokens 与依赖，识别模型之后在 TUI 语音面板按需下载"},
         ]},
         {"title": "运行", "items": [
             {"key": "systemd", "label": "systemd 无头守护（仅 Linux）", "type": "bool",
@@ -1145,6 +1151,8 @@ def _load_existing(values: dict) -> bool:
     if os.path.exists(cfg_path):
         with open(cfg_path, encoding="utf-8") as f:
             values["initial_exploration"] = _read_bootstrap_exploration(f.read())
+    values["voice"] = os.path.isdir(
+        os.path.join(REPO_DIR, "extras", "voice-wakeup", "voice-wakeup-sdk"))
     return _load_install_draft(values)
 
 
@@ -1312,6 +1320,54 @@ def step_install_deps(with_embedding: bool, proxy: str = "") -> bool:
             return False
     else:
         info("跳过 embedding 重依赖（向量检索降级为 FTS5+BM25）")
+    return True
+
+
+VOICE_SDK_DIR = os.path.join("extras", "voice-wakeup", "voice-wakeup-sdk")
+VOICE_TARBALL = os.path.join("Skills", "voice-wakeup", "voice-wakeup-sdk.tar.gz")
+
+
+def step_install_voice(proxy: str = "") -> bool:
+    """安装轻量语音组件：解包 SDK + pip 依赖 + 冒烟；不下载 229MB 识别模型。"""
+    title("安装语音组件")
+    sdk_dir = os.path.join(REPO_DIR, VOICE_SDK_DIR)
+    if os.path.isdir(os.path.join(sdk_dir, "kws_model")):
+        info("语音 SDK 已解包，跳过解包")
+    else:
+        tarball = os.path.join(REPO_DIR, VOICE_TARBALL)
+        if not os.path.isfile(tarball):
+            warn("未找到 Skills/voice-wakeup/voice-wakeup-sdk.tar.gz，跳过语音组件")
+            return True
+        os.makedirs(os.path.dirname(sdk_dir), exist_ok=True)
+        force = " --force-local" if IS_WIN else ""
+        if not run_step(
+            "解包语音 SDK",
+            f'tar{force} -xzf "{tarball}" -C "{os.path.dirname(sdk_dir)}"',
+        ):
+            return False
+
+    if not run_pip_step("安装语音依赖", "install --progress-bar off -r requirements-voice.txt", proxy):
+        return False
+
+    if not _voice_smoke():
+        return False
+    info("未下载 229MB 识别模型；之后在 TUI 语音面板按需下载")
+    info("语音默认关闭；需要时在 TUI 语音面板或 Arch 明确指令中激活")
+    return True
+
+
+def _voice_smoke() -> bool:
+    """冒烟：sherpa_onnx/pypinyin 必须可导入；sounddevice 缺失只 warn。"""
+    proc = subprocess.run(
+        [_venv_py(), "-c", "import sherpa_onnx, pypinyin; print('voice deps ok')"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if proc.returncode != 0:
+        err("语音依赖冒烟失败：" + (proc.stderr or proc.stdout or "").strip()[-300:])
+        return False
+    sd = subprocess.run([_venv_py(), "-c", "import sounddevice"],
+                        capture_output=True)
+    if sd.returncode != 0:
+        warn("sounddevice 未安装（Linux 可用 arecord 采集，Windows/macOS 需安装）")
     return True
 
 
@@ -1600,6 +1656,10 @@ def main() -> int:
     if not step_install_deps(with_embedding, values.get("proxy", "")):
         err("依赖安装失败，可重跑本向导（已完成步骤会自动跳过）")
         return 1
+
+    if values.get("voice"):
+        if not step_install_voice(values.get("proxy", "")):
+            warn("语音组件安装失败，可稍后重跑向导或手动安装 requirements-voice.txt")
 
     if not step_build_tui():
         warn("TUI 构建失败，可稍后手动: cd tui-ts && npm install && npm run build")

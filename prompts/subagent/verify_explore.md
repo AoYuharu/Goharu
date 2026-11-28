@@ -11,6 +11,7 @@ You are handed `identity.yaml`, produced by `Architect/probe.py` (L1→L5 rule-b
    - If `gaps_pending` is empty → all layers resolved (verified / unavailable / not_applicable) → complete.
    - If `gaps_pending` is non-empty → for **each** remaining `unknown` field, look at its `probe_report[<layer>].fields[<path>].evidence`. The Architect must have written a **best-effort credential** there: what read-only means it tried and why it could not confirm (no permission, no such device, command absent, not applicable to this OS). An `unknown` field with an empty or placeholder evidence is a **failure** — it means the Architect gave up without saying why.
 2. **Machine locatability** — from the verified picture (device_type / os / cpu / gpu / memory / network / peripherals / actuation), can you give this machine a concrete profile ("a Windows 11 laptop with an NVIDIA GPU, Docker available, camera+mic present, no GPIO actuation")? If core identity fields are still unresolved with no credential, that weakens locatability.
+3. **Voice / LED state recorded honestly** — `runtime.voice_sdk_present / voice_deps_ok / voice_asr_model_present` must reflect reality (booleans, no fabrication), and `actuation.leds` / `actuation.blink_support` must be located with evidence whenever the OS exposes a path (a `supported` verdict needs the safe-LED criteria: writable brightness, restorable trigger, not a keyboard/lock LED, not `leds-regulator`). On Windows/macOS, `unknown` is acceptable only with an evidence note explaining there is no generic LED path.
 
 ## Rules
 

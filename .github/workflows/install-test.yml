@@ -27,7 +27,8 @@ jobs:
         shell: bash
         run: |
           set -e
-          printf '1\n\n1\n1\n\n\n' | python3 install.py
+          # 语音栏新增一个确认项（空行=否）
+          printf '1\n\n1\n1\n\n\n\n' | python3 install.py
           test -x venv/bin/python
           test -f .env
           test -x "$HOME/.local/bin/goharu"
@@ -48,7 +49,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          @("1","","1","","") | python install.py
+          @("1","","1","","","") | python install.py  # 语音栏新增一个确认项（空=否）
           if ($LASTEXITCODE -ne 0) { throw "install.py failed" }
           if (-not (Test-Path "venv\Scripts\python.exe")) { throw "venv missing" }
           if (-not (Test-Path ".env")) { throw ".env missing" }

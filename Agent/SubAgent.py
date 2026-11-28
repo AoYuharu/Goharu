@@ -191,6 +191,9 @@ class SubAgentConfig:
             "灰名单命令（del/taskkill/reg 等）会阻塞等人工确认，被拒绝就换方案不要重试；"
             "独立只读调查可用 AgentDelegate 委托 explore，可并行，禁止其他类型；"
             "改动完成后必须运行对应模块的契约测试并报告真实输出。"
+            "语音约束：229MB ASR 模型只按明确指令下载；重启网关只走 RequestRestart，"
+            "禁止 run_cmd 执行 restart/shutdown/reboot/pkill；LED 探测只读，"
+            "禁止写 /sys 与 /dev、禁止 gpioset/openrgb、禁止驱动风扇。"
         ),
     }
 
@@ -217,7 +220,8 @@ class SubAgentConfig:
             # 高危灰名单命令（del/taskkill/reg 等）由 run_cmd 工具内部的
             # confirmation_manager 拦截弹人工确认
             return ["Read", "Grep", "Glob", "run_cmd", "Write", "Edit",
-                    "MessageHero", "SetConfig", "ErrorHook", "AgentDelegate"]
+                    "MessageHero", "SetConfig", "ErrorHook", "AgentDelegate",
+                    "RequestRestart"]
         else:
             raise ValueError(f"Unknown agent type: {agent_type}")
 

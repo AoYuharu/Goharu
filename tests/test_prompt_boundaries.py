@@ -30,6 +30,9 @@ def main():
     architect = (ROOT / "prompts" / "subagent" / "architect.md").read_text(encoding="utf-8")
     harunet = (ROOT / "prompts" / "actor" / "harunet.md").read_text(encoding="utf-8")
     delegate = (ROOT / "Tools" / "builtin" / "agent_delegate.py").read_text(encoding="utf-8")
+    verify_explore = (ROOT / "prompts" / "subagent" / "verify_explore.md").read_text(
+        encoding="utf-8")
+    bootstrap_src = (ROOT / "Architect" / "bootstrap.py").read_text(encoding="utf-8")
 
     print("\n[1] 主 Actor 证据协议")
     check("含 Evidence Before Claims", "Evidence Before Claims" in base)
@@ -70,6 +73,21 @@ def main():
           "Output exactly `不回复`" in harunet)
     check("HaruNet 屏蔽词不用于主人或 @ 消息",
           "Never use this for owner messages, direct @mentions" in harunet)
+
+    print("\n[5] 语音套件 Runbook 与安全边界")
+    check("Architect 含 Voice Suite Runbook", "Voice Suite Runbook" in architect)
+    check("Runbook 含激活 LED 规则",
+          "voice.activated" in architect and "blink_support.status=supported" in architect)
+    check("Runbook 禁止直接 restart 命令",
+          "RequestRestart" in architect and "pkill -f" in architect)
+    check("Runbook 注明 ASR 模型按需下载",
+          "229MB" in architect and "only on explicit user request" in architect)
+    check("bootstrap instruction 禁止写 /sys /dev",
+          "禁止写 /sys" in bootstrap_src and "禁止写 /dev" in bootstrap_src)
+    check("bootstrap instruction 约束不下载模型",
+          "不下载模型" in bootstrap_src and "只读" in bootstrap_src)
+    check("verify_explore 验收 LED/语音状态",
+          "Voice / LED state" in verify_explore and "blink_support" in verify_explore)
 
     print("\n" + "=" * 60)
     print(f"结果: {PASS} 通过, {FAIL} 失败")

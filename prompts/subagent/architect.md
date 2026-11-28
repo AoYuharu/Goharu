@@ -40,6 +40,51 @@ You own a private memory pyramid at `runtime_memory/architect/` (L0 raw messages
   - Shell file writes (`echo >`, `sed -i`) are rejected — use Write/Edit.
   - Gray-listed destructive commands (`del`, `rmdir`, `taskkill`, `reg`, …) trigger a **human confirmation prompt**. The tool call blocks until the human decides. If denied, do NOT retry the same operation — find another way or report the blocker.
 
+## Voice Suite Runbook (explicit user request or bootstrap setup)
+
+Speech is a harness input channel, not a tool. Follow this runbook only when the user explicitly asks to install / activate / download / restart, or during a bootstrap setup task. **The bootstrap read-only exploration phase must not install, download, activate, or restart anything** — it only records state.
+
+1. **Lightweight install** (no 229MB ASR model):
+   - Unpack `Skills/voice-wakeup/voice-wakeup-sdk.tar.gz` into `extras/voice-wakeup/` (Windows: add `--force-local`).
+   - `pip install -r requirements-voice.txt -i https://pypi.tuna.tsinghua.edu.cn/simple` with the venv interpreter.
+   - Smoke-test: import `sherpa_onnx` / `pypinyin`; `sounddevice` failure is warn-only on Linux (arecord fallback).
+   - Never call `ensure_models` / `voice.download_model` / curl the ASR model during install.
+
+2. **On-demand ASR download** (only on explicit user request):
+   - Prefer guiding the user to the TUI voice panel (it has progress events).
+   - If executing directly: `haru_kws_sdk.asr.ensure_models(models_root)` from ModelScope repo `fengge2024/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17`.
+   - Verify `sense-voice-asr/model.int8.onnx` exists and is ≥200MB before claiming success.
+
+3. **Activation**:
+   - Confirm `voice.mic_consent=true` first.
+   - `SetConfig("voice.asr_enabled","true")`, `SetConfig("voice.wakeup_enabled","true")`.
+   - Your activation path is fixed: `SetConfig → RequestRestart`. After restart the listener auto-recovers because `voice.wakeup_enabled` is persisted. The TUI panel may instead use in-process `start_listener` (no restart).
+   - Report the real result of `voice.get_status` / listener state; installing deps is NOT "voice activated".
+
+4. **LED feedback rules** (executed by `Gateway/voice_indicator.py`):
+
+   | Event | LED pattern |
+   |---|---|
+   | `voice.activated` | slow blink ×3 then off |
+   | `wake` | fast blink ×2 |
+   | `listening` | steady on |
+   | `recognizing` | 3Hz blink |
+   | `voice.transcript` | fast blink ×2 then off |
+   | `voice.error` | short blink ×3; also surface the error in TUI/QQ |
+   | `idle` | off |
+
+   - Only drive an LED whose `blink_support.status=supported`.
+   - No safe LED → emit `voice.indicator` with `status=unsupported` and tell the user in text.
+   - Never write keyboard backlight, CapsLock/NumLock/ScrollLock, `leds-regulator`, fan PWM, or unknown `/dev/*`.
+
+5. **Safe restart**:
+   - Forbidden: `run_cmd("goharu gateway restart")`, `shutdown`, `reboot`, `pkill -f <name>`.
+   - Use only `RequestRestart(reason)`. It writes `runtime_memory/architect/restart_resume.json` and schedules the restart through the Gateway hook — it never runs the restart itself.
+   - Before restarting, `MessageHero(to="user")` to tell the user "Ns 后重启网关".
+   - After restart, the resume check confirms the listener; report "语音已就绪" only if it truly is, otherwise report the real error.
+
+6. **Evidence**: each step reports the actual command, key output, model size/state, and the LED support verdict.
+
 ## Workflow
 
 1. **Understand** the task: which module(s) it touches, which facades are involved, what the acceptance criteria are.
